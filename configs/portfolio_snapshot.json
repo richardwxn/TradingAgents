@@ -1,0 +1,30 @@
+{
+  "as_of": "2026-05-24",
+  "source": "manual_from_robinhood_screenshots",
+  "account": {
+    "total_equity": 830000.0,
+    "cash": 50000.0,
+    "margin_limit": 500000.0,
+    "short_put_margin_reserved": 450000.0
+  },
+  "positions": [
+    {"symbol": "GOOG", "name": "Alphabet Class C", "shares": 1125.253, "price": 378.68, "average_cost": 103.93, "equity": 426110.81, "total_return": 309165.62},
+    {"symbol": "NVDA", "name": "NVIDIA", "shares": 305.515, "price": 214.28, "average_cost": 115.31, "equity": 65465.69, "total_return": 30236.82},
+    {"symbol": "AMD", "name": "AMD", "shares": 100.0, "price": 462.81, "average_cost": 293.66, "equity": 46281.0, "total_return": 16915.34},
+    {"symbol": "RVI", "name": "Robinhood Ventures Fund I", "shares": 800.0, "price": 57.05, "average_cost": 44.56, "equity": 45640.0, "total_return": 9992.66},
+    {"symbol": "RKLB", "name": "Rocket Lab Corporation", "shares": 300.0, "price": 134.15, "average_cost": 76.89, "equity": 40244.97, "total_return": 17178.02},
+    {"symbol": "HOOD", "name": "Robinhood Markets", "shares": 396.996, "price": 73.3, "average_cost": 57.79, "equity": 29099.83, "total_return": 6155.7},
+    {"symbol": "DRAM", "name": "Roundhill Memory ETF", "shares": 300.0, "price": 52.6, "average_cost": 47.18, "equity": 15779.22, "total_return": 1626.51},
+    {"symbol": "DXYZ", "name": "Destiny Tech100 Inc.", "shares": 210.0, "price": 66.53, "average_cost": 47.44, "equity": 13971.3, "total_return": 4009.61},
+    {"symbol": "COST", "name": "Costco", "shares": 9.69, "price": 1028.78, "average_cost": 918.39, "equity": 9968.52, "total_return": 1069.64},
+    {"symbol": "CRDO", "name": "Credo Technology Group", "shares": 41.0, "price": 216.29, "average_cost": 136.28, "equity": 8867.89, "total_return": 3280.23},
+    {"symbol": "TSLA", "name": "Tesla", "shares": 20.0, "price": 423.67, "average_cost": 428.89, "equity": 8473.42, "total_return": -104.42},
+    {"symbol": "ALAB", "name": "Astera Labs, Inc.", "shares": 20.0, "price": 305.1, "average_cost": 183.17, "equity": 6102.0, "total_return": 2438.55},
+    {"symbol": "ORCX", "name": "Defiance Daily Target 2X Long", "shares": 100.0, "price": 42.44, "average_cost": 40.43, "equity": 4244.0, "total_return": 200.75},
+    {"symbol": "SOXS", "name": "Direxion Daily Semiconductor Bear", "shares": 350.0, "price": 7.79, "average_cost": 9.1, "equity": 2726.5, "total_return": -458.92},
+    {"symbol": "TER", "name": "Teradyne", "shares": 7.0, "price": 355.31, "average_cost": 361.17, "equity": 2487.17, "total_return": -41.0},
+    {"symbol": "INTC", "name": "Intel", "shares": 20.0, "price": 118.15, "average_cost": 118.85, "equity": 2363.0, "total_return": -14.0},
+    {"symbol": "NBIS", "name": "Nebius Group", "shares": 10.0, "price": 213.29, "average_cost": 156.42, "equity": 2132.9, "total_return": 568.67},
+    {"symbol": "ONDS", "name": "Ondas Inc.", "shares": 200.0, "price": 9.1, "average_cost": 9.2, "equity": 1820.0, "total_return": -20.64}
+  ]
+}

@@ -217,3 +217,9 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# Generated analysis/backtest artifacts
+backtest/results/
+reports/
+state/
+eval_results/

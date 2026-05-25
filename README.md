@@ -253,6 +253,154 @@ ta = TradingAgentsGraph(config=config)
 _, decision = ta.propagate("NVDA", "2026-01-15")
 ```
 
+## Analysis-Only Workflow
+
+### Analysis-Only MVP
+
+If you want a lightweight analysis-only workflow (no order execution logic), run:
+
+```bash
+python analysis_mvp.py --ticker NVDA --date 2026-02-10
+```
+
+This command writes a structured JSON report to `reports/analysis_mvp/` with:
+- thesis and direction (`bullish`, `bearish`, `neutral`)
+- confidence score
+- deeper technical + fundamental feature snapshot
+- abnormal options activity scan (unusual volume/open-interest and notional)
+- weighted factor model output (`model_scoring.factor_scores`, `pillar_scores`, `composite_score`)
+- price range forecast (`price_range_forecast`) for 1w / 1m / 3m with 60/80/95 intervals
+- staged entry/exit guidance (`trade_plan`) with allocation ladders and trigger prices
+- industry/news/event/competitor context blocks
+- optional LLM synthesis (`llm_insights`) for missing cases and additional angles
+- risk flags and invalidation conditions
+
+You can customize the horizon label and output path:
+
+```bash
+python analysis_mvp.py \
+  --ticker AAPL \
+  --date 2026-02-10 \
+  --horizon swing_1_4_weeks \
+  --output-dir reports/analysis_mvp
+```
+
+You can also choose data provider preference and options-flow thresholds:
+
+```bash
+python analysis_mvp.py \
+  --ticker AAPL \
+  --date 2026-02-10 \
+  --data-provider polygon \
+  --min-unusual-option-notional 1000000 \
+  --min-option-volume-oi-ratio 4.0
+```
+
+If using Polygon, set your API key first:
+
+```bash
+export POLYGON_API_KEY=your_key_here
+```
+
+Polygon is the default data provider for the analysis-only UI and CLI. If
+`POLYGON_API_KEY` is not visible to the process, the pipeline will fall back to
+the available free providers and mark the resolved provider in data quality.
+
+For progress output and run logs:
+
+```bash
+python analysis_mvp.py \
+  --ticker NVDA \
+  --date 2026-02-10 \
+  --verbose \
+  --log-file logs/analysis_mvp_nvda.log
+```
+
+Optional competitor + LLM insight run:
+
+```bash
+python analysis_mvp.py \
+  --ticker NVDA \
+  --date 2026-02-10 \
+  --data-provider polygon \
+  --competitors AMD,INTC,AVGO \
+  --enable-llm-insights \
+  --llm-provider openai \
+  --llm-model gpt-5.4-mini
+```
+
+### Hourly Delta Runtime (Config + State)
+
+For low-cost hourly monitoring, use config + sqlite state:
+
+```bash
+python analysis_runtime.py --config configs/analysis_runtime.yaml
+```
+
+Run continuously:
+
+```bash
+python analysis_runtime.py --config configs/analysis_runtime.yaml --loop
+```
+
+This runtime stores state in `state/analysis_state.sqlite`:
+- per-symbol last run time / last price / last signal
+- last composite score and options unusual count snapshots
+- seen news IDs (for delta processing)
+- latest filing accession markers (for SEC filing delta triggers)
+- daily summary cache fields (ready for extension)
+
+It also supports selective LLM usage (`llm.mode: selective`) and limits LLM symbols per run (`runtime.max_symbols_per_run_llm`).
+The analysis output now includes intraday trigger context and SEC filings context in `key_features`.
+Selective LLM gating can use thresholds in `runtime.*` (new headlines, price move, etc.).
+Advanced gating also supports composite-score shifts and options unusual-flow jumps.
+Hard quota controls are available in `runtime.*`:
+- max calls per day/run
+- estimated input/output token budgets per day
+
+### Local Analysis UI
+
+Run a lightweight browser UI for ad hoc analysis:
+
+```bash
+python analysis_ui.py --host 127.0.0.1 --port 8765
+```
+
+Open `http://127.0.0.1:8765` to choose ticker/date/provider, adjust unusual-options thresholds, tune factor weights, and generate JSON + Markdown reports.
+
+### Testing and Model Robustness
+
+Fast correctness tests are local and deterministic:
+
+```bash
+make test
+```
+
+Targeted suites:
+
+```bash
+make test-analysis
+make test-portfolio
+```
+
+`make test-all` runs the fast suite and prints the heavier model-quality follow-ups. Use those follow-ups after changing scoring, factor weights, confidence logic, direction thresholds, report generation, or sizing policy:
+
+```bash
+make model-backtest-override
+make model-backtest-train
+make model-backtest-test
+make portfolio-sim
+make tune-model
+make model-acceptance
+```
+
+The backtest and simulator targets are intentionally manual because they use historical report artifacts and yfinance-backed prices. Treat them as gates:
+- `pytest` / `make test` verifies code correctness.
+- `backtest.py` verifies model-quality changes against forward returns.
+- `portfolio_simulate.py` verifies sizing and policy behavior after transaction costs.
+- `tune_model.py` searches cheap config knobs and writes a leaderboard plus recommended config under `backtest/results/tuning/`.
+- `scripts/check_model_acceptance.py` checks the test-slice bullish hit-rate and portfolio metrics against minimum gates, and can compare a candidate artifact set against a baseline with `--baseline-summary-json` and `--baseline-policy-json`.
+
 ## Contributing
 
 We welcome contributions from the community! Whether it's fixing a bug, improving documentation, or suggesting a new feature, your input helps make this project better. If you are interested in this line of research, please consider joining our open-source financial AI research community [Tauric Research](https://tauric.ai/).

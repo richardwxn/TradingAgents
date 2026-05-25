@@ -1,0 +1,58 @@
+# Cheap-knob tuning config for tune_model.py.
+#
+# This tuner replays existing reports. It does not regenerate historical
+# reports or tune provider / prompt / feature-extraction settings.
+
+seed: 42
+max_random_candidates: 500
+refine_top_n: 25
+refine_variants_per_candidate: 10
+
+report_glob: reports/analysis_mvp/*.json
+base_weights_path: configs/proposed_weights_v1.json
+benchmark: SPY
+horizons: [5, 20, 60]
+
+slices:
+  search:
+    date_from: "2025-11-21"
+    date_to: "2026-02-27"
+  holdout:
+    date_from: "2026-02-28"
+    date_to: "2026-05-22"
+
+bounds:
+  bullish_threshold: [0.10, 0.25]
+  bearish_threshold: [0.15, 0.40]
+  neutral_bands: [0.01, 0.02, 0.03, 0.05]
+  weight_multiplier: [0.50, 1.50]
+  sizing:
+    policies: [equal_weight_bullish, top_n_bullish, confidence_weighted]
+    max_per_name: [0.08, 0.20]
+    max_long_exposure: [0.40, 0.90]
+    top_n: [3, 8]
+    stale_signal_decay: [0.25, 1.00]
+
+gates:
+  min_bullish_20d_count: 30
+  min_avg_long_exposure: 0.10
+  max_drawdown_floor: -0.25
+  require_excess_cagr_positive: true
+  enable_bearish: false
+
+initial_capital: 100000
+cost_per_side_bps: 5
+preserve_zero_weights: true
+
+universe:
+  - NVDA
+  - AMD
+  - AVGO
+  - MU
+  - GLW
+  - NET
+  - RKLB
+  - ALAB
+  - COHR
+  - FIG
+  - LEU
