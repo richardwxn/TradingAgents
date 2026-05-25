@@ -1,0 +1,33 @@
+# Sizing config variant for the simulator A/B run on stale-signal decay.
+# Identical to sizing.yaml except stale_signal_decay is disabled (= 1.0)
+# so we can measure the marginal effect of the decay knob.
+
+policy: confidence_weighted
+
+max_per_name: 0.15
+max_long_exposure: 0.80
+min_position_weight: 0.02
+
+enable_bearish: false
+
+stop_loss_atr_multiple: 1.5
+entry_pullback_to: sma20
+max_entry_pullback_pct: 0.05
+exit_patience_atrs: 1.0
+
+stale_composite_days: 7
+stale_signal_decay: 1.0           # OFF — for A/B vs. sizing.yaml's 0.5
+composite_threshold: 0.15
+
+universe:
+  - NVDA
+  - AMD
+  - AVGO
+  - MU
+  - GLW
+  - NET
+  - RKLB
+  - ALAB
+  - COHR
+  - FIG
+  - LEU

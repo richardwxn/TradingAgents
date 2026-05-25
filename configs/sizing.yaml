@@ -1,0 +1,35 @@
+# Daily signals sizing config (consumed by portfolio/sizing.py → SizingConfig).
+#
+# Defaults are deliberately conservative — long-or-cash, capped per name,
+# bearish suppressed pending Section 15 fix. The portfolio simulator
+# (Section 17) will refine these once policy comparison is complete.
+
+policy: confidence_weighted       # see portfolio/sizing.py for supported values
+
+max_per_name: 0.15                # cap weight in any single name at 15%
+max_long_exposure: 0.80           # cap total long exposure at 80% (rest cash)
+min_position_weight: 0.02         # don't bother with positions under 2% of book
+
+enable_bearish: false             # suppress bearish calls; structural defect (handoff Section 15)
+
+stop_loss_atr_multiple: 1.5       # stop-loss = entry - 1.5 * ATR(14)
+entry_pullback_to: sma20          # buy limit base = min(last_close, SMA20)
+max_entry_pullback_pct: 0.05      # never wait for a pullback deeper than 5% from last_close
+exit_patience_atrs: 1.0           # trim/exit limit = max(last_close, last_close + 1 * ATR)
+
+stale_composite_days: 7           # flag composites older than this many days
+stale_signal_decay: 0.5           # multiply target weight by this when signal age > stale_composite_days (1.0 = no penalty)
+composite_threshold: 0.15         # matches scoring.py direction_for_composite default (v1.1)
+
+universe:
+  - NVDA
+  - AMD
+  - AVGO
+  - MU
+  - GLW
+  - NET
+  - RKLB
+  - ALAB
+  - COHR
+  - FIG
+  - LEU

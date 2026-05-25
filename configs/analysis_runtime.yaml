@@ -1,0 +1,41 @@
+watchlist:
+  - AAPL
+  - MSFT
+  - NVDA
+
+benchmarks:
+  market: SPY
+  sectors:
+    Technology: XLK
+    Financials: XLF
+
+peers:
+  AAPL: [MSFT, GOOGL]
+  NVDA: [AMD, INTC]
+
+runtime:
+  schedule: hourly
+  only_when_market_open: true
+  max_symbols_per_run_llm: 3
+  interval_minutes: 60
+  llm_gate_min_new_headlines: 2
+  llm_gate_price_move_pct: 0.02
+  llm_gate_composite_delta: 0.2
+  llm_gate_options_unusual_jump: 2
+  llm_gate_signal_change_only: true
+  llm_max_calls_per_day: 20
+  llm_max_calls_per_run: 2
+  llm_max_est_input_tokens_per_day: 80000
+  llm_max_est_output_tokens_per_day: 30000
+  llm_est_input_tokens_per_call: 2500
+  llm_est_output_tokens_per_call: 800
+
+llm:
+  provider: openai
+  model_fast: gpt-5.4-mini
+  model_deep: gpt-5.5
+  mode: selective
+
+data_provider: polygon
+output_dir: reports/analysis_runtime
+state_db_path: state/analysis_state.sqlite

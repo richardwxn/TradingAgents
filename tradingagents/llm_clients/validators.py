@@ -6,10 +6,19 @@ Let LLM providers use their own defaults for unspecified params.
 
 VALID_MODELS = {
     "openai": [
-        # GPT-5 series (2025)
+        # Current GPT-5 frontier series
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
         "gpt-5.2",
+        "gpt-5.2-pro",
+        "gpt-5.2-chat-latest",
         "gpt-5.1",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-max",
         "gpt-5",
+        "gpt-5-pro",
         "gpt-5-mini",
         "gpt-5-nano",
         # GPT-4.1 series (2025)
