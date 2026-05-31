@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
+import logging
+import math
 import os
+import threading
 
 import pandas as pd
 import requests
@@ -226,6 +229,197 @@ class FearGreedProvider:
             return round(float(value), 6)
         except (TypeError, ValueError):
             return None
+
+
+# --- VIX-based fear/greed proxy ---
+#
+# Process-shared cache of the ^VIX daily-close series. Loaded once per
+# process; threads share it. Same pattern as RiskFreeRateProvider's
+# `_RATE_SERIES_CACHE`.
+_VIX_SERIES_CACHE: dict[str, dict[str, float]] = {}
+_VIX_SERIES_LOCK = threading.Lock()
+
+
+def _load_vix_series(start: str, logger: logging.Logger) -> dict[str, float]:
+    """Load ^VIX into a date→close dict. Returns {} on failure."""
+    series: dict[str, float] = {}
+    try:
+        hist = yf.Ticker("^VIX").history(start=start)
+        if hist is not None and not hist.empty:
+            closes = hist["Close"].dropna()
+            for ts, value in closes.items():
+                d_str = ts.date().isoformat()
+                try:
+                    series[d_str] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        dates = sorted(series.keys())
+        logger.info(
+            "VIXFearGreedProvider loaded %d ^VIX observations from %s to %s",
+            len(series), dates[0] if dates else "?", dates[-1] if dates else "?",
+        )
+    except Exception as exc:
+        logger.warning(
+            "VIXFearGreedProvider failed to load ^VIX (%s); proxy will "
+            "return unavailable.", exc,
+        )
+    return series
+
+
+def reset_vix_cache() -> None:
+    """Clear the module-level ^VIX cache. For tests."""
+    with _VIX_SERIES_LOCK:
+        _VIX_SERIES_CACHE.clear()
+
+
+class VIXFearGreedProvider:
+    """Fear/greed proxy derived from VIX percentile rank.
+
+    Maps the trailing-window percentile rank of VIX to a CNN-equivalent
+    score in [0, 100], where higher = more greed, lower = more fear:
+
+        cnn_score ≈ (1 - vix_percentile_252d) * 100
+
+    Bucket cuts match `score_fear_greed_regime`:
+      ≤25  → "extreme fear"     (VIX ≥ 95th percentile of trailing year)
+      <45  → "fear"              (75-95th percentile)
+      ~50  → "neutral"           (25-75th)
+      >55  → "greed"             (5-25th)
+      ≥75  → "extreme greed"     (≤ 5th percentile)
+
+    Returns the same dict shape as `FearGreedProvider.get_index` so it
+    can be used as a drop-in fallback. Source field stamps
+    `vix_fear_greed_proxy` so downstream can tell which it got.
+
+    PIT-correct: the percentile is computed using only ^VIX data with
+    `date < as_of_date` (strictly before). A historical run never sees
+    its own day's VIX in the trailing window.
+    """
+
+    SOURCE = "vix_fear_greed_proxy"
+
+    def __init__(
+        self,
+        start: str = "2018-01-01",
+        window_days: int = 252,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._start = start
+        self._window_days = window_days
+        self._logger = logger or logging.getLogger(__name__)
+        self._series: dict[str, float] | None = None
+        self._dates_sorted: list[str] = []
+
+    def _ensure_loaded(self) -> None:
+        if self._series is not None:
+            return
+        with _VIX_SERIES_LOCK:
+            cached = _VIX_SERIES_CACHE.get(self._start)
+            if cached is None:
+                cached = _load_vix_series(self._start, self._logger)
+                _VIX_SERIES_CACHE[self._start] = cached
+        self._series = cached
+        self._dates_sorted = sorted(self._series.keys())
+
+    def get_index(self, as_of_date: str | None = None) -> dict[str, Any]:
+        """Return the same dict shape as `FearGreedProvider.get_index`."""
+        self._ensure_loaded()
+        if not self._series:
+            return self._unavailable("vix_series_unavailable")
+        target = as_of_date or datetime.now(timezone.utc).date().isoformat()
+        # Use the most recent close ≤ target (walks back for weekends/holidays).
+        vix_today = self._latest_close_on_or_before(target)
+        if vix_today is None:
+            return self._unavailable("no_vix_close_on_or_before_target")
+        # Trailing window: VIX closes strictly before target, capped at window_days
+        window = self._trailing_window(target)
+        if len(window) < 20:  # need a meaningful base of comparison
+            return self._unavailable("insufficient_vix_history")
+        pct_rank = self._percentile_of(vix_today, window)
+        # Map percentile → CNN-equivalent score. High VIX percentile = fear → low score.
+        cnn_score = max(0.0, min(100.0, (1.0 - pct_rank) * 100.0))
+        rating = self._rating_for(cnn_score)
+        return {
+            "status": "ok",
+            "pit_status": "pit",
+            "source": self.SOURCE,
+            "score": round(cnn_score, 2),
+            "rating": rating,
+            "timestamp": target,
+            "previous_1_week": None,
+            "previous_1_month": None,
+            "previous_1_year": None,
+            "indicators": {
+                "market_volatility_vix": {
+                    "score": round(cnn_score, 2),
+                    "rating": rating,
+                    "vix_close": round(vix_today, 4),
+                    "vix_window_size": len(window),
+                    "vix_percentile_252d": round(pct_rank, 4),
+                },
+            },
+        }
+
+    # ---------- internals ----------
+
+    def _latest_close_on_or_before(self, target: str) -> float | None:
+        if target in self._series:
+            return self._series[target]
+        # Walk back up to 10 calendar days for weekends/holidays.
+        try:
+            d = datetime.fromisoformat(target).date()
+        except ValueError:
+            return None
+        for _ in range(10):
+            d -= timedelta(days=1)
+            key = d.isoformat()
+            if key in self._series:
+                return self._series[key]
+        return None
+
+    def _trailing_window(self, target: str) -> list[float]:
+        """Closes with date strictly < target, in the trailing window_days."""
+        try:
+            target_d = datetime.fromisoformat(target).date()
+        except ValueError:
+            return []
+        window_start = (
+            target_d - timedelta(days=self._window_days)
+        ).isoformat()
+        return [
+            v for d, v in self._series.items()
+            if window_start <= d < target
+        ]
+
+    @staticmethod
+    def _percentile_of(value: float, sample: list[float]) -> float:
+        """Fraction of sample ≤ value, in [0, 1]."""
+        if not sample:
+            return 0.5
+        count_le = sum(1 for x in sample if x <= value)
+        return count_le / len(sample)
+
+    @staticmethod
+    def _rating_for(score: float) -> str:
+        if score <= 25:
+            return "extreme fear"
+        if score < 45:
+            return "fear"
+        if score >= 75:
+            return "extreme greed"
+        if score > 55:
+            return "greed"
+        return "neutral"
+
+    def _unavailable(self, reason: str) -> dict[str, Any]:
+        return {
+            "status": "unavailable",
+            "pit_status": "unavailable",
+            "source": self.SOURCE,
+            "score": None,
+            "rating": None,
+            "reason": reason,
+        }
 
 
 class FilingsProvider(Protocol):

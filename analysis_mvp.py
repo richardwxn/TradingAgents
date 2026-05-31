@@ -7,6 +7,11 @@ import json
 import logging
 
 from tradingagents.analysis_only import AnalysisOnlyMVP, render_markdown
+from tradingagents.analysis_only.pipeline import AnalysisReport
+from tradingagents.analysis_only.cache import (
+    load_report_if_cache_hit,
+    report_file,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -156,6 +161,16 @@ def parse_args() -> argparse.Namespace:
         default="configs/portfolio_snapshot.json",
         help="Optional JSON portfolio snapshot for position-aware action plans.",
     )
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Ignore an existing matching report cache and rerun analysis.",
+    )
+    parser.add_argument(
+        "--disable-report-cache",
+        action="store_true",
+        help="Do not reuse a previously generated matching JSON report.",
+    )
     return parser.parse_args()
 
 
@@ -206,10 +221,25 @@ def main() -> None:
         verbose=args.verbose,
         logger=logger,
     )
-    report = mvp.run(symbol=args.ticker, as_of_date=args.date)
-    saved_path = mvp.save_report(report, output_dir=Path(args.output_dir))
+    cache_key = mvp.report_cache_key(args.ticker, args.date)
+    report = None
+    saved_path = report_file(args.output_dir, args.ticker, args.date)
+    cache_hit = False
+    if not args.force_refresh and not args.disable_report_cache:
+        report = load_report_if_cache_hit(
+            AnalysisReport,
+            args.output_dir,
+            args.ticker,
+            args.date,
+            cache_key,
+        )
+        cache_hit = report is not None
+    if report is None:
+        report = mvp.run(symbol=args.ticker, as_of_date=args.date)
+        saved_path = mvp.save_report(report, output_dir=Path(args.output_dir))
 
-    print(f"Saved JSON report: {saved_path.resolve()}")
+    action = "Reused cached JSON report" if cache_hit else "Saved JSON report"
+    print(f"{action}: {saved_path.resolve()}")
     if not args.no_markdown:
         md_path = saved_path.with_suffix(".md")
         md_path.write_text(render_markdown(report.to_json_dict()))

@@ -20,10 +20,23 @@ import json
 from typing import Any
 
 
-CRITIC_PROMPT_VERSION = "v1.0"
+CRITIC_PROMPT_VERSION = "v1.1"
 
 # Frozen prompt. Edit only by bumping CRITIC_PROMPT_VERSION; any change
 # invalidates historical backfills.
+#
+# v1.1 (2026-05-25): dropped the `veto` boolean. The v1.0 backfill ran
+# 1,420 critic calls on the corpus and showed veto rate ~65% with
+# vetoed trades *out*performing non-vetoed trades at ret_5d/ret_20d
+# (loss_reduction_ratio negative). The veto bit was anti-signal — the
+# adversarial framing biased gpt-5.4-mini toward vetoing whenever it
+# could find a thread to pull, regardless of decisiveness. The
+# continuous `confidence_adjustment` field already encodes the same
+# information on a calibrated scale; removing the bit costs nothing
+# and stops it from polluting any future sizing logic that consumed
+# it. v1.0 critic blocks on disk remain readable for backwards
+# compatibility; the eval skips veto stats on v1.1 records since the
+# field is absent.
 CRITIC_PROMPT_TEMPLATE = (
     "You are an adversarial buy-side equity research critic. You receive "
     "a structured analysis payload that an analyst has already produced "
@@ -43,13 +56,7 @@ CRITIC_PROMPT_TEMPLATE = (
     "- confidence_adjustment: float in [-0.2, 0.0]. Asymmetric — you "
     "may only LOWER confidence. 0.0 means no change. -0.2 is reserved "
     "for cases where the analyst's evidence is materially "
-    "contradicted by their own snapshot.\n"
-    "- veto: bool. True iff the trade should not be taken at any "
-    "size given the supplied evidence (e.g. binary event in the "
-    "window, data quality flag invalidating the composite, direction "
-    "contradicting all snapshot metrics).\n"
-    "- veto_reason: string or null. Required when veto=true; one "
-    "short sentence stating the single most decisive reason.\n\n"
+    "contradicted by their own snapshot.\n\n"
     "INPUT_JSON:\n{payload_json}"
 )
 
@@ -128,23 +135,31 @@ def build_critic_prompt(report: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 
 def _build_critic_schema():
-    """Local import so the module can be loaded without pydantic at runtime."""
-    from pydantic import BaseModel, Field, model_validator
+    """Local import so the module can be loaded without pydantic at runtime.
+
+    v1.1: dropped the `veto` / `veto_reason` fields. The Pydantic config
+    `extra="ignore"` keeps the schema tolerant of v1.0-trained models
+    that still emit those keys — Pydantic drops them silently rather
+    than raising, so a stale model never blocks a v1.1 backfill.
+    """
+    from pydantic import BaseModel, ConfigDict, Field, model_validator
 
     class CriticOutput(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+
         factor_blindspots: list[str] = Field(default_factory=list, max_length=5)
         invalidation_prob_30d: float = Field(ge=0.0, le=1.0)
         confidence_adjustment: float = Field(ge=-0.2, le=0.0)
-        veto: bool = False
-        veto_reason: str | None = None
 
-        @model_validator(mode="after")
-        def _veto_requires_reason(self):
-            if self.veto and not (self.veto_reason or "").strip():
-                raise ValueError(
-                    "veto_reason must be a non-empty string when veto=true"
-                )
-            return self
+        @model_validator(mode="before")
+        @classmethod
+        def _accept_common_key_typos(cls, data):
+            if isinstance(data, dict):
+                data = dict(data)
+                typo = "invalidiation_prob_30d"
+                if "invalidation_prob_30d" not in data and typo in data:
+                    data["invalidation_prob_30d"] = data[typo]
+            return data
 
     return CriticOutput
 

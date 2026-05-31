@@ -264,3 +264,143 @@ def test_format_daily_report_contains_expected_sections():
     assert "EXIT AMD" in md
     assert "Portfolio snapshot" in md
     assert "long-or-cash" in md  # bearish-suppressed mode label
+
+
+# ---------- earnings-aware sizing (Section 26) ----------
+
+
+def test_earnings_within_window_halves_target():
+    cfg = SizingConfig(
+        max_per_name=0.10, max_long_exposure=0.50,
+        min_position_weight=0.001,
+        pre_earnings_trim_days=3, pre_earnings_size_factor=0.5,
+    )
+    sig = Signal(
+        symbol="NVDA", as_of_date="2026-05-22", direction="bullish",
+        composite=0.5, confidence=0.7, source_path="x",
+        next_earnings_in_calendar_days=2,
+        next_earnings_date="2026-05-26",
+    )
+    signals = {"NVDA": sig}
+    actions, _ = compute_actions(
+        signals=signals, positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
+    )
+    a = actions[0]
+    # Without earnings: max_per_name=0.10 → 10% target.
+    # With earnings adjustment: 10% × 0.5 = 5% → $500 → 3 shares at $150.
+    assert a.target_weight == pytest.approx(0.05, abs=1e-4)
+    assert a.target_shares == 3
+    assert any("Earnings in 2d" in n for n in a.notes)
+
+
+def test_earnings_outside_window_no_adjustment():
+    cfg = SizingConfig(
+        max_per_name=0.10, max_long_exposure=0.50,
+        min_position_weight=0.001,
+        pre_earnings_trim_days=3, pre_earnings_size_factor=0.5,
+    )
+    sig = Signal(
+        symbol="NVDA", as_of_date="2026-05-22", direction="bullish",
+        composite=0.5, confidence=0.7, source_path="x",
+        next_earnings_in_calendar_days=20,
+        next_earnings_date="2026-06-13",
+    )
+    actions, _ = compute_actions(
+        signals={"NVDA": sig}, positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
+    )
+    a = actions[0]
+    assert a.target_weight == pytest.approx(0.10, abs=1e-4)
+    assert not any("Earnings in" in n for n in a.notes)
+
+
+def test_earnings_adjustment_disabled_when_factor_is_one():
+    cfg = SizingConfig(
+        max_per_name=0.10, max_long_exposure=0.50,
+        min_position_weight=0.001,
+        pre_earnings_trim_days=3, pre_earnings_size_factor=1.0,  # disable
+    )
+    sig = Signal(
+        symbol="NVDA", as_of_date="2026-05-22", direction="bullish",
+        composite=0.5, confidence=0.7, source_path="x",
+        next_earnings_in_calendar_days=1,
+        next_earnings_date="2026-05-25",
+    )
+    actions, _ = compute_actions(
+        signals={"NVDA": sig}, positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
+    )
+    assert actions[0].target_weight == pytest.approx(0.10, abs=1e-4)
+
+
+def test_earnings_adjustment_disabled_when_trim_days_zero():
+    cfg = SizingConfig(
+        max_per_name=0.10, max_long_exposure=0.50,
+        min_position_weight=0.001,
+        pre_earnings_trim_days=0, pre_earnings_size_factor=0.5,
+    )
+    sig = Signal(
+        symbol="NVDA", as_of_date="2026-05-22", direction="bullish",
+        composite=0.5, confidence=0.7, source_path="x",
+        next_earnings_in_calendar_days=1,
+        next_earnings_date="2026-05-25",
+    )
+    actions, _ = compute_actions(
+        signals={"NVDA": sig}, positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
+    )
+    assert actions[0].target_weight == pytest.approx(0.10, abs=1e-4)
+
+
+def test_earnings_adjustment_held_position_triggers_trim():
+    """When a held position approaches earnings and the adjustment cuts
+    target weight, the action should classify as TRIM (toward smaller)."""
+    cfg = SizingConfig(
+        max_per_name=0.10, max_long_exposure=0.50,
+        min_position_weight=0.001,
+        pre_earnings_trim_days=3, pre_earnings_size_factor=0.5,
+    )
+    sig = Signal(
+        symbol="NVDA", as_of_date="2026-05-22", direction="bullish",
+        composite=0.5, confidence=0.7, source_path="x",
+        next_earnings_in_calendar_days=2,
+        next_earnings_date="2026-05-26",
+    )
+    # Held 100% of intended (current target was 10%, now adjusted to 5%).
+    # Position $1000 of NVDA already (10% of $10k portfolio).
+    positions = {"NVDA": Position(shares=6, avg_cost=150.0)}
+    actions, _ = compute_actions(
+        signals={"NVDA": sig}, positions=positions,
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
+    )
+    a = actions[0]
+    # Target weight is now 5%, current weight is ~10% → action TRIM.
+    assert a.action == "TRIM"
+    assert any("Earnings in 2d" in n for n in a.notes)
+
+
+def test_earnings_adjustment_no_signal_data_no_change():
+    """When the signal lacks earnings info (older corpus, missing field),
+    the adjustment quietly skips the symbol."""
+    cfg = SizingConfig(
+        max_per_name=0.10, max_long_exposure=0.50,
+        min_position_weight=0.001,
+        pre_earnings_trim_days=3, pre_earnings_size_factor=0.5,
+    )
+    sig = Signal(
+        symbol="NVDA", as_of_date="2026-05-22", direction="bullish",
+        composite=0.5, confidence=0.7, source_path="x",
+        # no earnings info provided
+    )
+    actions, _ = compute_actions(
+        signals={"NVDA": sig}, positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
+    )
+    assert actions[0].target_weight == pytest.approx(0.10, abs=1e-4)

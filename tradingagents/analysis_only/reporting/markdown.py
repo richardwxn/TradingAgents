@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable
+import html
 import json
 
 
@@ -990,10 +991,26 @@ def _render_tradingagents_review(p: dict[str, Any]) -> str:
         return ""
     status = review.get("status")
     if status != "ok":
-        return f"## TradingAgents review\n\n- Status: {status}"
+        lines = ["## TradingAgents review", "", f"- Status: {status}"]
+        if review.get("error"):
+            lines += ["", _html_details("Validation error", str(review.get("error")))]
+        return "\n".join(lines)
     analysis = review.get("analysis") or {}
     lines = ["## TradingAgents review", ""]
     lines.append(f"- Provider: {review.get('provider')} ({review.get('model')})")
+    agreement = _tradingagents_agreement_map(p, review)
+    if agreement:
+        lines += ["", "**Agreement map**", ""]
+        lines.append("| Item | Value |")
+        lines.append("|---|---|")
+        for label, value in agreement:
+            lines.append(f"| {label} | {_escape_pipes(str(value))} |")
+    disagreements = _tradingagents_disagreements(p, review)
+    lines += ["", "**Disagreement highlights**", ""]
+    if disagreements:
+        lines.extend(f"- {item}" for item in disagreements)
+    else:
+        lines.append("- No major model/agent disagreements detected.")
 
     for title, key, lead, body in (
         ("Factor hypotheses", "factor_hypotheses", "name", "rationale"),
@@ -1017,7 +1034,181 @@ def _render_tradingagents_review(p: dict[str, Any]) -> str:
         lines += ["", f"**{title}**", ""]
         for item in items:
             lines.append(f"- **{item.get(lead)}:** {item.get(body)}")
+    room = _render_tradingagents_room(review)
+    if room:
+        lines += ["", room]
     return "\n".join(lines)
+
+
+def _tradingagents_agreement_map(
+    p: dict[str, Any],
+    review: dict[str, Any],
+) -> list[tuple[str, str]]:
+    kf = p.get("key_features") or {}
+    scoring = kf.get("model_scoring") or {}
+    factors = sorted(
+        scoring.get("factor_scores") or [],
+        key=lambda f: abs(f.get("weighted_score") or 0.0),
+        reverse=True,
+    )
+    positive = [f for f in factors if (f.get("weighted_score") or 0.0) > 0]
+    negative = [f for f in factors if (f.get("weighted_score") or 0.0) < 0]
+    analysis = review.get("analysis") or {}
+    ctx = ((review.get("graph_contexts") or [{}])[0]) or {}
+    decision = (kf.get("decision_summary") or {}).get("action") or p.get("direction")
+    main_bull = (
+        (positive[0].get("factor") if positive else None)
+        or (((analysis.get("factor_hypotheses") or [{}])[0]).get("name"))
+        or "n/a"
+    )
+    main_bear = (
+        (negative[0].get("factor") if negative else None)
+        or ((p.get("risk_flags") or ["n/a"])[0])
+        or "n/a"
+    )
+    disagreements = _tradingagents_disagreements(p, review)
+    return [
+        ("Quant direction", str(p.get("direction") or "n/a")),
+        (
+            "Composite / confidence",
+            f"{_fmt_signed(scoring.get('composite_score'))} / {_fmt_num(p.get('confidence'))}",
+        ),
+        ("Analysis action", str(decision or "n/a")),
+        ("Risk judge", str(ctx.get("processed_decision") or "n/a")),
+        ("Main bull evidence", str(main_bull)),
+        ("Main bear concern", str(main_bear)),
+        ("Conflict level", _conflict_level(len(disagreements))),
+    ]
+
+
+def _tradingagents_disagreements(
+    p: dict[str, Any],
+    review: dict[str, Any],
+) -> list[str]:
+    kf = p.get("key_features") or {}
+    scoring = kf.get("model_scoring") or {}
+    decision = (kf.get("decision_summary") or {}).get("action") or p.get("direction")
+    analysis = review.get("analysis") or {}
+    ctx = ((review.get("graph_contexts") or [{}])[0]) or {}
+    quant = _normalize_stance(p.get("direction"))
+    action = _normalize_stance(decision)
+    graph = _normalize_stance(
+        ctx.get("processed_decision") or ctx.get("final_trade_decision")
+    )
+    out: list[str] = []
+    if quant and graph and quant != graph:
+        out.append(
+            f"Quant direction is {quant}, while the TradingAgents graph resolves to {graph}."
+        )
+    if action and graph and action != graph:
+        out.append(
+            f"Analysis action is {action}, but the risk-judged graph decision is {graph}."
+        )
+    composite = _as_float(scoring.get("composite_score"))
+    if composite is not None and composite >= 0.15 and graph == "bearish":
+        out.append("Composite is bullish, but the graph risk process is bearish.")
+    if composite is not None and composite <= -0.15 and graph == "bullish":
+        out.append("Composite is bearish, but the graph risk process is bullish.")
+    factors = scoring.get("factor_scores") or []
+    positive = [f for f in factors if (f.get("weighted_score") or 0.0) > 0]
+    negative = [f for f in factors if (f.get("weighted_score") or 0.0) < 0]
+    if positive and negative:
+        pos = max(positive, key=lambda f: f.get("weighted_score") or 0.0)
+        neg = min(negative, key=lambda f: f.get("weighted_score") or 0.0)
+        out.append(
+            f"Top model support is {pos.get('factor')}, while the largest model drag is {neg.get('factor')}."
+        )
+    high_priority = [
+        f for f in (analysis.get("feature_recommendations") or [])
+        if str(f.get("priority", "")).lower() == "high"
+    ]
+    if len(high_priority) >= 2:
+        out.append(
+            f"{len(high_priority)} high-priority feature gaps were recommended before leaning harder on this setup."
+        )
+    if ctx.get("status") and ctx.get("status") != "ok":
+        out.append(
+            f"TradingAgents graph context is {ctx.get('status')}, so the room transcript is incomplete."
+        )
+    return list(dict.fromkeys(out))[:6]
+
+
+def _normalize_stance(value: Any) -> str:
+    s = str(value or "").lower()
+    if not s or s == "—":
+        return ""
+    if "buy" in s or "bull" in s or "overweight" in s:
+        return "bullish"
+    if "sell" in s or "bear" in s or "underweight" in s:
+        return "bearish"
+    if "hold" in s or "neutral" in s or "watch" in s or "wait" in s:
+        return "neutral"
+    return ""
+
+
+def _conflict_level(count: int) -> str:
+    if count >= 4:
+        return "high"
+    if count >= 2:
+        return "medium"
+    return "low"
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _render_tradingagents_room(review: dict[str, Any]) -> str:
+    contexts = review.get("graph_contexts") or []
+    if not contexts:
+        return ""
+    ctx = contexts[0] or {}
+    status = ctx.get("status", "unknown")
+    reasons = ", ".join(ctx.get("selection_reasons") or [])
+    lines = [
+        "### TradingAgents room",
+        "",
+        f"- **Graph status:** {status}",
+        f"- **Context:** {ctx.get('symbol', '?')} {ctx.get('as_of_date', '?')}",
+        f"- **Selection:** {reasons or 'single report'}",
+        f"- **Graph decision:** {ctx.get('processed_decision') or 'n/a'}",
+    ]
+    if status != "ok":
+        if ctx.get("error"):
+            lines += ["", _html_details("Graph error", str(ctx.get("error")))]
+        return "\n".join(lines)
+
+    invest = ctx.get("investment_debate") or {}
+    risk = ctx.get("risk_debate") or {}
+    sections = [
+        ("Market analyst", ctx.get("market_report")),
+        ("Sentiment analyst", ctx.get("sentiment_report")),
+        ("News analyst", ctx.get("news_report")),
+        ("Fundamentals analyst", ctx.get("fundamentals_report")),
+        ("Bull researcher", invest.get("bull_history")),
+        ("Bear researcher", invest.get("bear_history")),
+        ("Research manager", invest.get("judge_decision")),
+        ("Trader plan", ctx.get("trader_plan")),
+        ("Aggressive risk", risk.get("aggressive_history")),
+        ("Neutral risk", risk.get("neutral_history")),
+        ("Conservative risk", risk.get("conservative_history")),
+        ("Risk judge", risk.get("judge_decision") or ctx.get("final_trade_decision")),
+    ]
+    lines.append("")
+    lines.extend(_html_details(title, text) for title, text in sections)
+    return "\n\n".join(lines)
+
+
+def _html_details(title: str, text: Any) -> str:
+    value = "Not returned." if text is None or text == "" else str(text)
+    return (
+        f"<details><summary>{html.escape(title)}</summary>\n\n"
+        f"<pre>{html.escape(value)}</pre>\n\n"
+        "</details>"
+    )
 
 
 def _render_data_quality(p: dict[str, Any]) -> str:

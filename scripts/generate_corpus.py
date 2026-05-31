@@ -28,15 +28,40 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
-# Phase 1 universe: 12 tech-focused names. All-tech so Phase 2 cross-sectional
-# only differentiates within the sector; that limitation is intentional and
-# documented in the plan. ETFs (QQQ, SMH) dropped — they're benchmarks, not
-# scoring targets. TSM added back as a global-foundry counterweight.
-DEFAULT_TICKERS = [
-    "NVDA", "AMD", "AVGO", "MU", "TSM",
-    "ALAB", "COHR", "FIG", "GLW", "LEU",
-    "NET", "RKLB",
-]
+_UNIVERSE_PATH = _REPO_ROOT / "configs" / "universe.yaml"
+
+
+def load_universe_tickers(path: Path = _UNIVERSE_PATH) -> list[str]:
+    """Load tickers from configs/universe.yaml (core + canary, in order).
+
+    Falls back to the original Phase 1 hardcoded list if the yaml is missing
+    or unparseable so the CLI still works in a stripped environment.
+    """
+    fallback = [
+        "NVDA", "AMD", "AVGO", "MU", "TSM",
+        "ALAB", "COHR", "FIG", "GLW", "LEU",
+        "NET", "RKLB",
+    ]
+    try:
+        import yaml  # local import — keeps yaml optional for the fallback path
+        with path.open() as fh:
+            data = yaml.safe_load(fh) or {}
+        out: list[str] = []
+        for cohort in ("core", "canary"):
+            for t in data.get(cohort, []) or []:
+                t_upper = str(t).strip().upper()
+                if t_upper and t_upper not in out:
+                    out.append(t_upper)
+        return out or fallback
+    except Exception:
+        return fallback
+
+
+# Phase 2 universe (configs/universe.yaml): 24 core tech + 6 cross-sector
+# canaries. Canary tickers appear in the corpus and per-ticker IC table for
+# diagnostic purposes — they do not drive weight tuning. See Section 22 in
+# handoff.md for the protocol.
+DEFAULT_TICKERS = load_universe_tickers()
 
 # 2023-07-14 → 2026-05-22 inclusive = exactly 150 Fridays.
 DEFAULT_START = "2023-07-14"
@@ -61,7 +86,9 @@ def report_path(output_dir: Path, ticker: str, date_str: str) -> Path:
     return output_dir / f"{ticker.upper()}_{date_str}.json"
 
 
-def _generate_one(args: tuple[str, str, str, str, int, bool, str | None, float]) -> dict:
+def _generate_one(
+    args: tuple[str, str, str, str, int, bool, str | None, float, bool],
+) -> dict:
     """Worker: generate a single report. Returns a result dict for the parent
     process to aggregate. Defined at module level so it's picklable.
 
@@ -79,6 +106,7 @@ def _generate_one(args: tuple[str, str, str, str, int, bool, str | None, float])
         force,
         state_store_path,
         pace_seconds,
+        minimal_context,
     ) = args
     if pace_seconds > 0:
         time.sleep(pace_seconds)
@@ -116,6 +144,8 @@ def _generate_one(args: tuple[str, str, str, str, int, bool, str | None, float])
                 verbose=False,
                 logger=logging.getLogger("worker"),
                 state_store_path=state_store_path,
+                enable_news_fetching=not minimal_context,
+                enable_filings_fetching=not minimal_context,
             )
             report = mvp.run(symbol=ticker, as_of_date=date_str)
             mvp.save_report(report, output_dir=output_dir)
@@ -217,6 +247,15 @@ def main() -> int:
             "per second)."
         ),
     )
+    parser.add_argument(
+        "--minimal-context", action="store_true",
+        help=(
+            "Skip news + SEC-filings fetches in each report. Useful for "
+            "backfill runs since `filings_recency_signal` is weight=0 and "
+            "news PIT-filters to near-empty on older dates anyway. Saves "
+            "~0.5-1s per report (~20-40 min on a Phase-2-scale regen)."
+        ),
+    )
     args = parser.parse_args()
 
     if not os.environ.get("POLYGON_API_KEY"):
@@ -241,7 +280,8 @@ def main() -> int:
     # so chronological execution is needed for the trailing window to
     # populate correctly during a first-time backfill.
     state_store_path = args.state_store_path or None
-    jobs: list[tuple[str, str, str, str, int, bool, str | None, float]] = [
+    JobTuple = tuple[str, str, str, str, int, bool, str | None, float, bool]
+    jobs: list[JobTuple] = [
         (
             t,
             d,
@@ -251,12 +291,13 @@ def main() -> int:
             args.force,
             state_store_path,
             args.pace_seconds,
+            args.minimal_context,
         )
         for d in dates
         for t in tickers
     ]
 
-    pending: list[tuple[str, str, str, str, int, bool, str | None, float]] = []
+    pending: list[JobTuple] = []
     already: list[tuple[str, str]] = []
     for job in jobs:
         if report_path(output_dir, job[0], job[1]).exists() and not args.force:

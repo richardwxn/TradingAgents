@@ -85,11 +85,15 @@ def test_bucket_for_score(score, expected):
 @pytest.mark.parametrize(
     "score,rating,expected_score,expected_available",
     [
-        (10.0, "extreme fear", 0.4, True),
-        (35.0, "fear", 0.2, True),
+        # v1.4 (Section 24): inverted from contrarian to momentum-following
+        # for the tech-focused trading universe. Phase 2 cohort IC showed
+        # -0.36 on 24-tech core; the previous contrarian mapping produced
+        # the wrong directional signal for the universe we trade.
+        (10.0, "extreme fear", -0.4, True),
+        (35.0, "fear", -0.2, True),
         (50.0, "neutral", 0.0, True),
-        (65.0, "greed", -0.2, True),
-        (85.0, "extreme greed", -0.4, True),
+        (65.0, "greed", 0.2, True),
+        (85.0, "extreme greed", 0.4, True),
         (None, None, 0.0, False),
     ],
 )
@@ -396,13 +400,28 @@ def test_iv_rank_low_bullish():
 # ---------- factor weights ----------
 
 
-def test_iv_factors_have_zero_weight_initially():
-    for f in (
-        "options_iv_term_structure",
-        "options_iv_skew",
-        "options_iv_rank",
-    ):
+def test_iv_factors_unvalidated_stay_at_zero():
+    # v1.3 (Section 21): term_structure stayed at 0 because its sign is
+    # regime-dependent across the Phase 1 corpus (+0.05 IC at 20d but -0.12
+    # at 60d); skew never crossed the noise floor.
+    for f in ("options_iv_term_structure", "options_iv_skew"):
         assert DEFAULT_FACTOR_WEIGHTS[f] == 0.0
+
+
+def test_iv_rank_promoted_in_v1_3():
+    # v1.3 commits options_iv_rank at 0.04 after Phase 1 IC validated the
+    # placeholder sign: +0.154 IC at 20d (n=597), +0.107 per-ticker median
+    # across 11 tickers with 63.6% sign consistency.
+    assert DEFAULT_FACTOR_WEIGHTS["options_iv_rank"] == 0.04
+
+
+def test_fear_greed_restored_in_v1_4():
+    # v1.4 (Section 24) restored market_fear_greed_regime to 0.05 after the
+    # Phase 2 cohort analysis confirmed the inversion is tech-specific. The
+    # sign of score_fear_greed_regime was flipped (fear → bearish) at the
+    # same time, so the factor now contributes with momentum-following
+    # semantics for the tech / AI / semi universe.
+    assert DEFAULT_FACTOR_WEIGHTS["market_fear_greed_regime"] == 0.05
 
 
 # ---------- cross-sectional normalization ----------

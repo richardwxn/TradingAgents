@@ -18,6 +18,7 @@ from tradingagents.analysis_only.providers import (
     FearGreedProvider,
     PolygonFinancialsProvider,
     SECFilingsProvider,
+    VIXFearGreedProvider,
 )
 from tradingagents.analysis_only.state_store import StateStore, SymbolState
 from tradingagents.analysis_only.scoring import (
@@ -41,6 +42,12 @@ from tradingagents.analysis_only.forecast import (
 from tradingagents.analysis_only.options_iv import (
     compute_iv_history_features,
     compute_iv_surface,
+)
+from tradingagents.analysis_only.cache import (
+    CACHE_SCHEMA_VERSION,
+    DiskCache,
+    report_cache_key,
+    stable_hash,
 )
 
 
@@ -91,12 +98,22 @@ class AnalysisOnlyMVP:
         llm_base_url: str | None = None,
         portfolio_path: str | None = None,
         state_store_path: str | None = None,
+        cache_dir: str | None = None,
+        enable_data_cache: bool = True,
+        enable_news_fetching: bool = True,
+        enable_filings_fetching: bool = True,
         verbose: bool = False,
         logger: logging.Logger | None = None,
     ):
         self.horizon = horizon
         self.data_provider = data_provider.lower()
         self.options_enabled = options_enabled
+        # Skipping news + filings for backfill regens saves ~0.5-1s per
+        # report (the factor `filings_recency_signal` is at weight=0
+        # anyway, and news is mostly empty under PIT filtering for
+        # older dates). Live runs should keep both on.
+        self.enable_news_fetching = enable_news_fetching
+        self.enable_filings_fetching = enable_filings_fetching
         self.min_unusual_option_notional = min_unusual_option_notional
         self.min_option_volume_oi_ratio = min_option_volume_oi_ratio
         self.factor_weights = factor_weights or {}
@@ -122,6 +139,10 @@ class AnalysisOnlyMVP:
         self.polygon_api_key = os.getenv("POLYGON_API_KEY", "").strip()
         self.sec_filings_provider = SECFilingsProvider()
         self.fear_greed_provider = FearGreedProvider()
+        # VIX-based proxy as a PIT-correct historical fallback when CNN F&G
+        # is unavailable (Section 25). CNN has limited historical backfill
+        # and was data_available on only ~36% of the Phase 2 corpus.
+        self.vix_fear_greed_provider = VIXFearGreedProvider(logger=self.logger)
         self.polygon_financials_provider = (
             PolygonFinancialsProvider(api_key=self.polygon_api_key)
             if self.polygon_api_key
@@ -135,9 +156,14 @@ class AnalysisOnlyMVP:
             StateStore(state_store_path) if state_store_path else None
         )
         self._prev_state: SymbolState | None = None
+        self.cache: DiskCache | None = (
+            DiskCache(cache_dir) if enable_data_cache else None
+        )
+        self._active_report_cache_key: str | None = None
 
     def run(self, symbol: str, as_of_date: str) -> AnalysisReport:
         symbol = symbol.upper()
+        self._active_report_cache_key = self.report_cache_key(symbol, as_of_date)
         self._pit_status = {}
         self._prev_state = (
             self._state_store.get_symbol_state(symbol)
@@ -212,8 +238,13 @@ class AnalysisOnlyMVP:
                 "contracts": [],
             }
             self._set_pit("option_strategy_chain", "disabled")
-        self._log("Loading recent news...")
-        news_summary = self._load_news(ticker, as_of_date=as_of_date)
+        if self.enable_news_fetching:
+            self._log("Loading recent news...")
+            news_summary = self._load_news(ticker, as_of_date=as_of_date)
+        else:
+            self._log("News fetch skipped (enable_news_fetching=False).")
+            news_summary = {"count": 0, "items": [], "status": "disabled"}
+            self._set_pit("news", "disabled")
         self._log("Loading intraday trigger context...")
         intraday_context = self._load_intraday_context(
             symbol=symbol,
@@ -226,12 +257,21 @@ class AnalysisOnlyMVP:
             "market_context.fear_greed",
             str(market_context.get("fear_greed_pit_status") or "unavailable"),
         )
-        self._log("Loading filings context...")
-        filings_context = self._load_filings_context(
-            symbol=symbol,
-            as_of_date=as_of_date,
-        )
-        self._set_pit("filings_context", "pit")
+        if self.enable_filings_fetching:
+            self._log("Loading filings context...")
+            filings_context = self._load_filings_context(
+                symbol=symbol,
+                as_of_date=as_of_date,
+            )
+            self._set_pit("filings_context", "pit")
+        else:
+            self._log("Filings fetch skipped (enable_filings_fetching=False).")
+            filings_context = {
+                "status": "disabled",
+                "latest_form": None,
+                "latest_filing_date": None,
+            }
+            self._set_pit("filings_context", "disabled")
         self._log("Building industry and event context...")
         industry_context = self._load_industry_context(
             symbol=symbol,
@@ -309,6 +349,59 @@ class AnalysisOnlyMVP:
         self._log("Analysis complete.")
         return report
 
+    def report_cache_key(self, symbol: str, as_of_date: str) -> str:
+        return report_cache_key(self._report_cache_params(symbol, as_of_date))
+
+    def _report_cache_params(self, symbol: str, as_of_date: str) -> dict[str, Any]:
+        return {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "horizon": self.horizon,
+            "data_provider": self.data_provider,
+            "options_enabled": self.options_enabled,
+            "min_unusual_option_notional": self.min_unusual_option_notional,
+            "min_option_volume_oi_ratio": self.min_option_volume_oi_ratio,
+            "factor_weights": self.factor_weights,
+            "regime_weights_path": self._file_fingerprint(self.regime_weights_path),
+            "confidence_calibration_path": self._file_fingerprint(
+                self.confidence_calibration_path
+            ),
+            "forecast_horizons": self.forecast_horizons,
+            "competitors": self.competitors,
+            "enable_llm_critic": self.enable_llm_critic,
+            "enable_llm_insights": self.enable_llm_insights,
+            "enable_narrative": self.enable_narrative,
+            "enable_tradingagents_review": self.enable_tradingagents_review,
+            "enable_news_fetching": self.enable_news_fetching,
+            "enable_filings_fetching": self.enable_filings_fetching,
+            "llm_provider": self.llm_provider,
+            "llm_model": self.llm_model,
+            "llm_base_url": self.llm_base_url,
+            "portfolio_path": self._file_fingerprint(self.portfolio_path),
+            "cache_schema": CACHE_SCHEMA_VERSION,
+        }
+
+    def _file_fingerprint(self, path: str | None) -> dict[str, Any] | None:
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists():
+            return {"path": str(p), "exists": False}
+        try:
+            return {
+                "path": str(p),
+                "exists": True,
+                "sha256": stable_hash(p.read_text()),
+            }
+        except Exception:
+            stat = p.stat()
+            return {
+                "path": str(p),
+                "exists": True,
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+            }
+
     def _persist_state_for(
         self,
         symbol: str,
@@ -355,6 +448,85 @@ class AnalysisOnlyMVP:
         file_path.write_text(json.dumps(report.to_json_dict(), indent=2))
         return file_path
 
+    def _cache_ttl(
+        self,
+        as_of_date: str,
+        *,
+        live_seconds: int = 900,
+    ) -> int | None:
+        return (
+            live_seconds
+            if self._resolve_pit_mode(as_of_date) == "live"
+            else None
+        )
+
+    def _cache_key(self, kind: str, payload: dict[str, Any]) -> str:
+        return stable_hash(
+            {
+                "schema": CACHE_SCHEMA_VERSION,
+                "kind": kind,
+                "payload": payload,
+            }
+        )
+
+    def _get_cached_json(
+        self,
+        namespace: str,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ttl_seconds: int | None,
+    ) -> Any | None:
+        if self.cache is None:
+            return None
+        return self.cache.get_json(
+            namespace,
+            self._cache_key(kind, payload),
+            ttl_seconds=ttl_seconds,
+        )
+
+    def _set_cached_json(
+        self,
+        namespace: str,
+        kind: str,
+        payload: dict[str, Any],
+        value: Any,
+    ) -> None:
+        if self.cache is None:
+            return
+        self.cache.set_json(namespace, self._cache_key(kind, payload), value)
+
+    def _get_cached_dataframe(
+        self,
+        namespace: str,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ttl_seconds: int | None,
+    ) -> pd.DataFrame | None:
+        if self.cache is None:
+            return None
+        return self.cache.get_dataframe(
+            namespace,
+            self._cache_key(kind, payload),
+            ttl_seconds=ttl_seconds,
+        )
+
+    def _set_cached_dataframe(
+        self,
+        namespace: str,
+        kind: str,
+        payload: dict[str, Any],
+        value: pd.DataFrame,
+    ) -> None:
+        if self.cache is None or value.empty:
+            return
+        self.cache.set_dataframe(
+            namespace,
+            self._cache_key(kind, payload),
+            value,
+        )
+
     def _load_price_data(
         self, symbol: str, as_of_date: str, lookback_days: int
     ) -> pd.DataFrame:
@@ -397,6 +569,24 @@ class AnalysisOnlyMVP:
             return None
         end_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=lookback_days)
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "lookback_days": lookback_days,
+            "start": start_dt.strftime("%Y-%m-%d"),
+            "end": end_dt.strftime("%Y-%m-%d"),
+            "provider": "polygon",
+            "adjusted": True,
+        }
+        cached = self._get_cached_dataframe(
+            "price_data",
+            "daily_bars",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if cached is not None and not cached.empty:
+            self._log("Polygon price source cache hit.")
+            return cached
         url = (
             "https://api.polygon.io/v2/aggs/ticker/"
             f"{symbol}/range/1/day/"
@@ -431,7 +621,14 @@ class AnalysisOnlyMVP:
         )
         data["Date"] = pd.to_datetime(data["Date"], unit="ms", utc=True)
         data["Date"] = data["Date"].dt.tz_localize(None)
-        return data[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        out = data[["Date", "Open", "High", "Low", "Close", "Volume"]]
+        self._set_cached_dataframe(
+            "price_data",
+            "daily_bars",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _load_price_data_openbb(
         self, symbol: str, as_of_date: str, lookback_days: int
@@ -464,6 +661,24 @@ class AnalysisOnlyMVP:
     ) -> pd.DataFrame:
         end_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=lookback_days)
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "lookback_days": lookback_days,
+            "start": start_dt.strftime("%Y-%m-%d"),
+            "end": (end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+            "provider": "yfinance",
+            "adjusted": True,
+        }
+        cached = self._get_cached_dataframe(
+            "price_data",
+            "daily_bars",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if cached is not None and not cached.empty:
+            self._log("yfinance price source cache hit.")
+            return cached
         data = yf.download(
             symbol,
             start=start_dt.strftime("%Y-%m-%d"),
@@ -476,7 +691,14 @@ class AnalysisOnlyMVP:
             raise ValueError(
                 f"No price data found for {symbol} up to {as_of_date}"
             )
-        return self._normalize_price_df(data.reset_index())
+        out = self._normalize_price_df(data.reset_index())
+        self._set_cached_dataframe(
+            "price_data",
+            "daily_bars",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _normalize_price_df(self, df: pd.DataFrame) -> pd.DataFrame:
         rename_map = {c: c.capitalize() for c in df.columns}
@@ -532,6 +754,23 @@ class AnalysisOnlyMVP:
                 "operating_income_qoq_growth", "free_cashflow_qoq_growth",
             )}
 
+        symbol_str = (getattr(ticker, "ticker", "") or "").upper()
+        cache_payload = {
+            "symbol": symbol_str,
+            "as_of_date": as_of_date,
+            "provider": "yfinance_live_snapshot",
+        }
+        cached = self._get_cached_json(
+            "fundamentals",
+            "live_snapshot_fields",
+            cache_payload,
+            ttl_seconds=3600,
+        )
+        if isinstance(cached, dict):
+            self._set_pit("fundamentals", self._live_or_leak(as_of_date))
+            self._set_pit("fundamentals.source", "yfinance_live_snapshot")
+            return {k: self._safe_float(v) for k, v in cached.items()}
+
         try:
             info = ticker.info or {}
         except Exception:
@@ -563,7 +802,14 @@ class AnalysisOnlyMVP:
         fields.update(trend_fields)
         self._set_pit("fundamentals", self._live_or_leak(as_of_date))
         self._set_pit("fundamentals.source", "yfinance_live_snapshot")
-        return {k: self._safe_float(v) for k, v in fields.items()}
+        out = {k: self._safe_float(v) for k, v in fields.items()}
+        self._set_cached_json(
+            "fundamentals",
+            "live_snapshot_fields",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _load_fundamentals_polygon(
         self,
@@ -582,6 +828,22 @@ class AnalysisOnlyMVP:
             return None
 
         symbol_str = getattr(ticker, "ticker", "") or ""
+        cache_payload = {
+            "symbol": symbol_str.upper(),
+            "as_of_date": as_of_date,
+            "spot_close": round(float(spot_close), 6)
+            if self._is_valid(spot_close)
+            else None,
+            "provider": "polygon_financials_pit",
+        }
+        cached = self._get_cached_json(
+            "fundamentals",
+            "polygon_pit_fields",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=3600),
+        )
+        if isinstance(cached, dict):
+            return {k: self._safe_float(v) for k, v in cached.items()}
         try:
             quarterly = provider.fetch_quarterly(
                 symbol=symbol_str,
@@ -873,6 +1135,12 @@ class AnalysisOnlyMVP:
                 )
                 fields["enterprise_value"] = ev
 
+        self._set_cached_json(
+            "fundamentals",
+            "polygon_pit_fields",
+            cache_payload,
+            fields,
+        )
         return fields
 
     @staticmethod
@@ -1042,6 +1310,21 @@ class AnalysisOnlyMVP:
         ticker: Any,
         as_of_date: str,
     ) -> dict[str, Any]:
+        symbol_str = (getattr(ticker, "ticker", "") or "").upper()
+        cache_payload = {
+            "symbol": symbol_str,
+            "as_of_date": as_of_date,
+            "provider": "yfinance_news",
+        }
+        cached = self._get_cached_json(
+            "news",
+            "symbol_news_summary",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if isinstance(cached, dict):
+            self._set_pit("news", str(cached.get("pit_status", "unknown")))
+            return cached
         try:
             raw_news = ticker.news or []
         except Exception:
@@ -1079,18 +1362,43 @@ class AnalysisOnlyMVP:
             status = "live"
         self._set_pit("news", status)
 
-        return {
+        out = {
             "headlines": recent_titles,
             "count": len(filtered),
             "raw_count_before_pit_filter": len(raw_news),
             "items_dropped_missing_timestamp": items_missing_ts,
+            "pit_status": status,
         }
+        self._set_cached_json(
+            "news",
+            "symbol_news_summary",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _load_intraday_context(
         self,
         symbol: str,
         as_of_date: str,
     ) -> dict[str, Any]:
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "provider": self.data_provider,
+        }
+        cached = self._get_cached_json(
+            "intraday",
+            "context",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=300),
+        )
+        if isinstance(cached, dict):
+            self._set_pit(
+                "intraday_context",
+                str(cached.get("pit_status", "unknown")),
+            )
+            return cached
         end_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=7)
         df: pd.DataFrame | None = None
@@ -1184,8 +1492,9 @@ class AnalysisOnlyMVP:
             if len(returns.dropna()) > 10
             else None
         )
-        return {
+        out = {
             "status": "ok",
+            "pit_status": "pit",
             "bars": int(len(df)),
             "latest_close": self._safe_float(latest_close),
             "intraday_rsi_14": self._safe_float(intraday_rsi),
@@ -1204,25 +1513,53 @@ class AnalysisOnlyMVP:
                 else None
             ),
         }
+        self._set_cached_json(
+            "intraday",
+            "context",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _load_filings_context(
         self,
         symbol: str,
         as_of_date: str | None = None,
     ) -> dict[str, Any]:
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "provider": "sec_submissions",
+        }
+        cached = self._get_cached_json(
+            "filings",
+            "latest_filing",
+            cache_payload,
+            ttl_seconds=(
+                self._cache_ttl(as_of_date, live_seconds=3600)
+                if as_of_date
+                else 3600
+            ),
+        )
+        if isinstance(cached, dict):
+            return cached
         latest = self.sec_filings_provider.get_latest_filing(
             symbol,
             as_of_date=as_of_date,
         )
         if not latest:
-            return {"status": "unavailable"}
-        return {
+            out = {"status": "unavailable"}
+            self._set_cached_json("filings", "latest_filing", cache_payload, out)
+            return out
+        out = {
             "status": "ok",
             "latest_form": latest.get("form"),
             "latest_accession": latest.get("accession"),
             "latest_filing_date": latest.get("filing_date"),
             "cik": latest.get("cik"),
         }
+        self._set_cached_json("filings", "latest_filing", cache_payload, out)
+        return out
 
     def _load_market_context(self, as_of_date: str) -> dict[str, Any]:
         spy_ret_20d = self._get_return_days("SPY", as_of_date, 20)
@@ -1233,6 +1570,16 @@ class AnalysisOnlyMVP:
         fear_greed = self.fear_greed_provider.get_index(
             as_of_date=as_of_date,
         )
+        # CNN F&G is current-only for the most part; for historical dates
+        # it usually returns status != "ok". Fall back to the VIX-based
+        # PIT-correct proxy (Section 25) so the fear_greed factor has
+        # data_available=True on the full corpus instead of ~36%.
+        if fear_greed.get("status") != "ok":
+            vix_fg = self.vix_fear_greed_provider.get_index(
+                as_of_date=as_of_date,
+            )
+            if vix_fg.get("status") == "ok":
+                fear_greed = vix_fg
         return {
             "spy_return_20d": self._safe_float(spy_ret_20d),
             "spy_above_50dma": spy_above_50dma,
@@ -1373,6 +1720,24 @@ class AnalysisOnlyMVP:
             industry_context=industry_context,
             competitor_analysis=competitor_analysis,
         )
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "tickers": tickers[:8],
+            "provider": "yfinance_news",
+        }
+        cached = self._get_cached_json(
+            "news",
+            "industry_news_context",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if isinstance(cached, dict):
+            self._set_pit(
+                "industry_news_context",
+                str(cached.get("pit_status", "unknown")),
+            )
+            return cached
         eod_epoch = self._as_of_eod_epoch(as_of_date)
         historical = self._resolve_pit_mode(as_of_date) == "historical"
         headlines: list[dict[str, Any]] = []
@@ -1441,7 +1806,7 @@ class AnalysisOnlyMVP:
         if not historical:
             pit_status = "live"
         self._set_pit("industry_news_context", pit_status)
-        return {
+        out = {
             "status": status,
             "pit_status": pit_status,
             "tickers_scanned": tickers[:8],
@@ -1451,6 +1816,13 @@ class AnalysisOnlyMVP:
             "top_headlines": headlines[:12],
             "semantic_summary": self._industry_news_summary(ranked_themes),
         }
+        self._set_cached_json(
+            "news",
+            "industry_news_context",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _industry_news_tickers(
         self,
@@ -2130,13 +2502,12 @@ class AnalysisOnlyMVP:
         end_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=max(90, days * 4))
         try:
-            data = yf.download(
-                symbol.upper(),
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
-                auto_adjust=True,
-                progress=False,
-                multi_level_index=False,
+            data = self._download_yfinance_daily_cached(
+                symbol=symbol,
+                start_dt=start_dt,
+                end_dt=end_dt + timedelta(days=1),
+                as_of_date=as_of_date,
+                namespace="market_context",
             )
             if data is None or data.empty:
                 return None
@@ -2198,13 +2569,12 @@ class AnalysisOnlyMVP:
         end_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=max(min_rows * 3, 120))
         try:
-            data = yf.download(
-                symbol.upper(),
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
-                auto_adjust=True,
-                progress=False,
-                multi_level_index=False,
+            data = self._download_yfinance_daily_cached(
+                symbol=symbol,
+                start_dt=start_dt,
+                end_dt=end_dt + timedelta(days=1),
+                as_of_date=as_of_date,
+                namespace="close_series",
             )
             if data is None or data.empty:
                 return None
@@ -2225,13 +2595,12 @@ class AnalysisOnlyMVP:
         end_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
         start_dt = end_dt - timedelta(days=14)
         try:
-            data = yf.download(
-                symbol.upper(),
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
-                auto_adjust=True,
-                progress=False,
-                multi_level_index=False,
+            data = self._download_yfinance_daily_cached(
+                symbol=symbol,
+                start_dt=start_dt,
+                end_dt=end_dt + timedelta(days=1),
+                as_of_date=as_of_date,
+                namespace="last_close",
             )
             if data is None or data.empty:
                 return None
@@ -2241,6 +2610,51 @@ class AnalysisOnlyMVP:
             return float(close.iloc[-1])
         except Exception:
             return None
+
+    def _download_yfinance_daily_cached(
+        self,
+        *,
+        symbol: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        as_of_date: str,
+        namespace: str,
+    ) -> pd.DataFrame | None:
+        start = start_dt.strftime("%Y-%m-%d")
+        end = end_dt.strftime("%Y-%m-%d")
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "start": start,
+            "end": end,
+            "provider": "yfinance",
+            "auto_adjust": True,
+            "namespace": namespace,
+        }
+        cached = self._get_cached_dataframe(
+            "yfinance_daily",
+            "download",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if cached is not None and not cached.empty:
+            return cached
+        data = yf.download(
+            symbol.upper(),
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False,
+            multi_level_index=False,
+        )
+        if data is None or data.empty:
+            return data
+        self._set_cached_dataframe(
+            "yfinance_daily",
+            "download",
+            cache_payload,
+            data,
+        )
+        return data
 
     def _map_sector_to_etf(self, sector: str | None) -> str | None:
         if not sector:
@@ -2340,12 +2754,36 @@ class AnalysisOnlyMVP:
         max_expiries: int = 4,
         spot_price: float | None = None,
     ) -> dict[str, Any]:
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "provider": self.data_provider,
+            "max_expiries": max_expiries,
+            "spot_price": round(float(spot_price), 6)
+            if self._is_valid(spot_price)
+            else None,
+            "min_unusual_option_notional": self.min_unusual_option_notional,
+            "min_option_volume_oi_ratio": self.min_option_volume_oi_ratio,
+        }
+        cached = self._get_cached_json(
+            "options",
+            "unusual_flow",
+            cache_payload,
+            ttl_seconds=900,
+        )
+        if isinstance(cached, dict):
+            return cached
         if self.data_provider in ("auto", "polygon") and self.polygon_api_key:
             polygon_snapshot = self._scan_unusual_options_polygon(
                 symbol=symbol,
                 spot_price=spot_price,
             )
             if polygon_snapshot.get("scan_status") == "ok":
+                self._set_cached_json(
+                    "options",
+                    "unusual_flow",
+                    cache_payload,
+                    polygon_snapshot,
+                )
                 return polygon_snapshot
             self._log(
                 "Polygon options scan unavailable; falling back to yfinance."
@@ -2465,6 +2903,12 @@ class AnalysisOnlyMVP:
             "Options scan complete: "
             f"unusual={snapshot['unusual_count']}, "
             f"contracts_scanned={snapshot['contracts_scanned']}"
+        )
+        self._set_cached_json(
+            "options",
+            "unusual_flow",
+            cache_payload,
+            snapshot,
         )
         return snapshot
 
@@ -2666,6 +3110,25 @@ class AnalysisOnlyMVP:
         spot_price: float | None,
     ) -> dict[str, Any]:
         """Reconstruct a PIT-correct historical chain via reference + aggs."""
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "spot_price": round(float(spot_price), 6)
+            if self._is_valid(spot_price)
+            else None,
+            "provider": "polygon_historical_reconstructed",
+            "dte_min": 7,
+            "dte_max": 120,
+            "strike_band": 0.10,
+        }
+        cached = self._get_cached_json(
+            "options",
+            "historical_chain",
+            cache_payload,
+            ttl_seconds=None,
+        )
+        if isinstance(cached, dict):
+            return cached
         if not self.polygon_api_key:
             return {
                 "status": "unavailable",
@@ -2684,7 +3147,7 @@ class AnalysisOnlyMVP:
                 "reason": "Historical options provider unavailable.",
             }
         try:
-            return provider.build_chain(
+            out = provider.build_chain(
                 symbol=symbol,
                 as_of_date=as_of_date,
                 spot=spot_price,
@@ -2692,6 +3155,14 @@ class AnalysisOnlyMVP:
                 dte_max=120,
                 strike_band=0.10,
             )
+            if out.get("status") == "ok":
+                self._set_cached_json(
+                    "options",
+                    "historical_chain",
+                    cache_payload,
+                    out,
+                )
+            return out
         except Exception as exc:
             self._log(
                 f"Historical option chain failed for {symbol} {as_of_date}: {exc}"
@@ -2737,6 +3208,22 @@ class AnalysisOnlyMVP:
         as_of_date: str,
         spot_price: float | None,
     ) -> dict[str, Any]:
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "spot_price": round(float(spot_price), 6)
+            if self._is_valid(spot_price)
+            else None,
+            "provider": "polygon_options_snapshot",
+        }
+        cached = self._get_cached_json(
+            "options",
+            "snapshot_chain",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if isinstance(cached, dict):
+            return cached
         if not self.polygon_api_key:
             return {
                 "status": "unavailable",
@@ -2793,7 +3280,7 @@ class AnalysisOnlyMVP:
                 "contracts": [],
                 "reason": "No usable option contracts in Polygon snapshot.",
             }
-        return {
+        out = {
             "status": "ok",
             "source": "polygon_options_snapshot",
             "pit_status": self._live_or_leak(as_of_date),
@@ -2801,6 +3288,13 @@ class AnalysisOnlyMVP:
             "contracts_scanned": len(all_results),
             "contracts_usable": len(contracts),
         }
+        self._set_cached_json(
+            "options",
+            "snapshot_chain",
+            cache_payload,
+            out,
+        )
+        return out
 
     def _load_option_chain_yfinance(
         self,
@@ -2809,6 +3303,24 @@ class AnalysisOnlyMVP:
         spot_price: float | None,
         max_expiries: int = 12,
     ) -> dict[str, Any]:
+        symbol_str = (getattr(ticker, "ticker", "") or "").upper()
+        cache_payload = {
+            "symbol": symbol_str,
+            "as_of_date": as_of_date,
+            "spot_price": round(float(spot_price), 6)
+            if self._is_valid(spot_price)
+            else None,
+            "max_expiries": max_expiries,
+            "provider": "yfinance_options_live",
+        }
+        cached = self._get_cached_json(
+            "options",
+            "yfinance_chain",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if isinstance(cached, dict):
+            return cached
         try:
             expiries = list(ticker.options or [])
         except Exception as exc:
@@ -2844,7 +3356,7 @@ class AnalysisOnlyMVP:
                     if contract is not None:
                         contracts.append(contract)
         status = "ok" if contracts else "unavailable"
-        return {
+        out = {
             "status": status,
             "source": "yfinance_options_live",
             "pit_status": self._live_or_leak(as_of_date),
@@ -2852,6 +3364,14 @@ class AnalysisOnlyMVP:
             "contracts_scanned": scanned,
             "contracts_usable": len(contracts),
         }
+        if status == "ok":
+            self._set_cached_json(
+                "options",
+                "yfinance_chain",
+                cache_payload,
+                out,
+            )
+        return out
 
     def _normalize_polygon_option_row(
         self,
@@ -4248,6 +4768,11 @@ class AnalysisOnlyMVP:
             "scoring_coverage": round(coverage, 4),
             "as_of_mode": pit_mode,
             "pit_warnings": pit_warnings,
+            "analysis_cache": {
+                "schema": CACHE_SCHEMA_VERSION,
+                "key": self._active_report_cache_key,
+                "source": "fresh",
+            },
         }
 
         critic_block = self._run_llm_critic(

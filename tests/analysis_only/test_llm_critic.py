@@ -97,8 +97,6 @@ def test_critic_schema_rejects_positive_confidence_adjustment():
             "factor_blindspots": [],
             "invalidation_prob_30d": 0.3,
             "confidence_adjustment": 0.05,
-            "veto": False,
-            "veto_reason": None,
         })
 
 
@@ -111,8 +109,6 @@ def test_critic_schema_rejects_too_negative_confidence_adjustment():
             "factor_blindspots": [],
             "invalidation_prob_30d": 0.3,
             "confidence_adjustment": -0.21,
-            "veto": False,
-            "veto_reason": None,
         })
 
 
@@ -125,22 +121,6 @@ def test_critic_schema_rejects_invalidation_prob_out_of_range():
             "factor_blindspots": [],
             "invalidation_prob_30d": 1.2,
             "confidence_adjustment": 0.0,
-            "veto": False,
-            "veto_reason": None,
-        })
-
-
-def test_critic_schema_requires_veto_reason_when_veto_true():
-    schema = llm_critic._build_critic_schema()
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        schema.model_validate({
-            "factor_blindspots": [],
-            "invalidation_prob_30d": 0.4,
-            "confidence_adjustment": -0.1,
-            "veto": True,
-            "veto_reason": None,
         })
 
 
@@ -150,24 +130,33 @@ def test_critic_schema_accepts_well_formed_output():
         "factor_blindspots": ["ignored peer de-rating"],
         "invalidation_prob_30d": 0.35,
         "confidence_adjustment": -0.05,
-        "veto": False,
-        "veto_reason": None,
     })
     assert out.invalidation_prob_30d == 0.35
     assert out.confidence_adjustment == -0.05
-    assert out.veto is False
 
 
-def test_critic_schema_accepts_valid_veto():
+def test_critic_schema_ignores_legacy_veto_fields_from_v1_0_models():
+    """v1.1 must accept v1.0-style payloads (extra=ignore on the model)."""
     schema = llm_critic._build_critic_schema()
     out = schema.model_validate({
         "factor_blindspots": [],
         "invalidation_prob_30d": 0.7,
         "confidence_adjustment": -0.2,
         "veto": True,
-        "veto_reason": "Earnings inside window, composite contradicts snapshot.",
+        "veto_reason": "Earnings inside window",
     })
-    assert out.veto is True
+    assert out.invalidation_prob_30d == 0.7
+    assert not hasattr(out, "veto")
+
+
+def test_critic_schema_accepts_common_invalidation_key_typo():
+    schema = llm_critic._build_critic_schema()
+    out = schema.model_validate({
+        "factor_blindspots": ["missing valuation anchor"],
+        "invalidiation_prob_30d": 0.56,
+        "confidence_adjustment": -0.08,
+    })
+    assert out.invalidation_prob_30d == 0.56
 
 
 def test_critic_schema_rejects_too_many_blindspots():
@@ -179,8 +168,6 @@ def test_critic_schema_rejects_too_many_blindspots():
             "factor_blindspots": ["a", "b", "c", "d", "e", "f"],
             "invalidation_prob_30d": 0.3,
             "confidence_adjustment": 0.0,
-            "veto": False,
-            "veto_reason": None,
         })
 
 
@@ -226,8 +213,6 @@ def test_run_critic_returns_validated_output_on_clean_response(
         "factor_blindspots": ["ignored peer de-rating"],
         "invalidation_prob_30d": 0.35,
         "confidence_adjustment": -0.05,
-        "veto": False,
-        "veto_reason": None,
     }
     _patch_llm(monkeypatch, json.dumps(payload))
     block = llm_critic.run_critic(
@@ -238,7 +223,7 @@ def test_run_critic_returns_validated_output_on_clean_response(
     assert block["prompt_version"] == llm_critic.CRITIC_PROMPT_VERSION
     assert len(block["prompt_hash"]) == 16
     assert block["output"]["confidence_adjustment"] == -0.05
-    assert block["output"]["veto"] is False
+    assert "veto" not in block["output"]
 
 
 def test_run_critic_handles_code_fenced_response(monkeypatch, sample_report):
@@ -246,8 +231,6 @@ def test_run_critic_handles_code_fenced_response(monkeypatch, sample_report):
         "factor_blindspots": [],
         "invalidation_prob_30d": 0.4,
         "confidence_adjustment": 0.0,
-        "veto": False,
-        "veto_reason": None,
     }
     raw = "```json\n" + json.dumps(payload) + "\n```"
     _patch_llm(monkeypatch, raw)
@@ -274,8 +257,6 @@ def test_run_critic_reports_schema_error_on_invalid_payload(
         "factor_blindspots": [],
         "invalidation_prob_30d": 0.3,
         "confidence_adjustment": 0.5,
-        "veto": False,
-        "veto_reason": None,
     }
     _patch_llm(monkeypatch, json.dumps(bad))
     block = llm_critic.run_critic(
@@ -295,14 +276,19 @@ def test_critic_output_or_none_helper():
 # ---------- Phase 7: multi-model disagreement ----------
 
 
-def _critic_out(*, conf=-0.05, inv=0.4, blindspots=None, veto=False):
-    return {
+def _critic_out(*, conf=-0.05, inv=0.4, blindspots=None, veto=None):
+    """Build a critic-output dict. `veto` is optional: v1.1 outputs omit
+    it entirely, v1.0 outputs included it. Pass `veto=True` / `False` to
+    exercise the legacy-disagreement helper code path."""
+    out: dict = {
         "confidence_adjustment": conf,
         "invalidation_prob_30d": inv,
         "factor_blindspots": blindspots or [],
-        "veto": veto,
-        "veto_reason": "x" if veto else None,
     }
+    if veto is not None:
+        out["veto"] = veto
+        out["veto_reason"] = "x" if veto else None
+    return out
 
 
 def test_compute_llm_disagreement_returns_empty_when_under_two_models():

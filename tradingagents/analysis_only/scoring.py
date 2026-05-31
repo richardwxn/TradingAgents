@@ -58,19 +58,33 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     "peer_relative_valuation": 0.06,
     "market_spy_trend": 0.04,
     "market_vix_regime": 0.03,
-    "market_fear_greed_regime": 0.08,
+    # v1.4 (Section 24): restored to 0.05 after Phase 2 cohort IC analysis
+    # confirmed the inversion is real and tech-specific. 24-tech core IC
+    # was -0.36 at 60d with 70% sign consistency (23 evaluable tickers).
+    # Sign of `score_fear_greed_regime` was flipped at the same time
+    # (fear → bearish, greed → bullish — momentum-following for tech).
+    # Weight 0.05 is conservative — lower than the v1's 0.08 since the
+    # signal magnitude is also down from the Section 12 single-regime fit.
+    # Inverts on canaries (+0.18 IC) — usable only because the trading
+    # universe is tech.
+    "market_fear_greed_regime": 0.05,
     "intraday_momentum_rsi": 0.04,
     "intraday_breakout_signal": 0.00,
     "filings_recency_signal": 0.00,
     "options_net_flow": 0.05,
-    # IV-derived factors (added in Section 18). Weight=0 on commit so they
-    # don't move the composite — they're computed, surfaced in the factor
-    # table, and accumulated in iv_history for IC validation on the next
-    # corpus regeneration. Sign conventions are placeholder until IC
-    # confirms direction; see scoring.score_iv_* docstrings.
+    # IV-derived factors (added in Section 18). Two of three stay at 0:
+    # `options_iv_skew` had ~zero IC across horizons; `options_iv_term_structure`
+    # showed regime-dependent sign (+0.05 at 20d, -0.12 at 60d with 82%
+    # per-ticker consistency on the 60d inversion) — too horizon-dependent
+    # to commit either direction without more data.
     "options_iv_term_structure": 0.00,
     "options_iv_skew": 0.00,
-    "options_iv_rank": 0.00,
+    # v1.3 (Section 21): promoted from 0.00 to 0.04 after Phase 1 IC
+    # validated the placeholder sign: low IV rank → bullish forward
+    # returns. Headline IC +0.154 at 20d (n=597); per-ticker median
+    # +0.107, 63.6% sign consistency across 11 tickers. Magnitude
+    # comparable to peer_relative_momentum (weight 0.05).
+    "options_iv_rank": 0.04,
 }
 
 
@@ -103,24 +117,28 @@ def score_fear_greed_regime(
     score: float | None,
     rating: str | None = None,
 ) -> tuple[float, str, bool]:
-    """Small contrarian market-sentiment signal from CNN Fear & Greed.
+    """Momentum-following market sentiment from CNN Fear & Greed.
 
-    Extreme fear is mildly bullish because panic can create contrarian
-    entries; extreme greed is mildly bearish because euphoric broad-market
-    sentiment can raise pullback risk. This stays deliberately weaker than
-    ticker-specific technical/fundamental factors.
+    v1.4 (Section 24): inverted from the original contrarian mapping after
+    Phase 2 cohort IC analysis showed -0.36 IC on the 24-ticker tech cohort
+    at 60d (70% sign consistency across 23 evaluable tickers). For the tech /
+    AI / semi universe the model trades, extreme fear coincides with
+    breakdowns and extreme greed with continuation, not reversals. Note this
+    finding inverts on cross-sector canaries (+0.18 IC at 60d) — the
+    contrarian story still holds for defensives. The signed-for-tech mapping
+    here is intentional given the trading universe.
     """
     if score is None:
         return 0.0, "Fear & Greed index unavailable.", False
     rating_text = (rating or "").strip().lower()
     if score <= 25 or rating_text == "extreme fear":
-        return 0.4, "Extreme fear supports a mild contrarian bid.", True
+        return -0.4, "Extreme fear coincides with tech-sector breakdowns.", True
     if score < 45 or rating_text == "fear":
-        return 0.2, "Fearful sentiment is mildly contrarian bullish.", True
+        return -0.2, "Fearful sentiment is a tech-momentum drag.", True
     if score >= 75 or rating_text == "extreme greed":
-        return -0.4, "Extreme greed raises broad-market pullback risk.", True
+        return 0.4, "Extreme greed supports tech-momentum continuation.", True
     if score > 55 or rating_text == "greed":
-        return -0.2, "Greedy sentiment is a mild risk warning.", True
+        return 0.2, "Greedy sentiment supports tech upside.", True
     return 0.0, "Fear & Greed sentiment is neutral.", True
 
 

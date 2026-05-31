@@ -1,0 +1,106 @@
+# Trading universe for corpus generation + backtest IC analysis.
+#
+# Two cohorts:
+#   - core:    tickers used for weight tuning and live trading. Phase 1
+#              expanded from 12 to 24 tech / semi / AI names to lift
+#              per-ticker IC consistency and capture sub-sector variation.
+#   - canary:  cross-sector diagnostic cohort (4-6 names across financials,
+#              energy, healthcare, staples, utilities, retail). Reports are
+#              generated for these and they appear in the per-ticker IC
+#              table, but they MUST NOT drive weight tuning — they exist
+#              to surface "this factor only worked because tech ripped"
+#              vs "this factor works generically" by comparison.
+#
+# generate_corpus.py loads this file by default. Use --tickers on the CLI
+# to override (e.g. to regen just one name). backtest.py currently treats
+# all records equally; cohort separation in IC analysis is manual via
+# post-processing (see Section 22 in handoff.md).
+#
+# Section 26: `sectors` block provides a sector tag per ticker for the
+# portfolio risk caps. The pipeline's industry_context block populates
+# sector from yfinance which is unreliable under threading. This static
+# map is the authoritative source for daily_signals.py risk caps.
+
+core:
+  # --- existing 12 (Phase 1) ---
+  - NVDA   # Fabless leader, GPU
+  - AMD    # Fabless GPU + CPU
+  - AVGO   # Custom silicon + infra software
+  - MU     # Memory
+  - TSM    # Foundry monopoly
+  - ALAB   # Connectivity silicon
+  - COHR   # Photonics / lasers (AI infra)
+  - FIG    # Financial information / data
+  - GLW    # Specialty glass + fiber (AI infra)
+  - LEU    # Nuclear fuel (AI power)
+  - NET    # Edge / CDN networking
+  - RKLB   # Aerospace / satellites
+  # --- 12 additions ---
+  - AAPL   # Mega-cap consumer hardware
+  - MSFT   # Cloud + AI infra mega-cap
+  - GOOGL  # Ads + cloud + AI compute consumer
+  - META   # Ad-tech + AI compute consumer
+  - ORCL   # Cloud infra catch-up
+  - ARM    # Chip IP licensing
+  - ASML   # Semi equipment monopoly
+  - KLAC   # Semi metrology / process control
+  - ANET   # Hyperscaler-driven networking
+  - PLTR   # AI software
+  - CRWD   # Cyber + AI
+  - MRVL   # Custom silicon / hyperscaler
+  - LITE   # Lumentum — optical components, AI datacenter
+  - AAOI   # Applied Optoelectronics — fiber optics / datacom
+
+# Cross-sector diagnostic cohort. These are NOT for trading; they're a
+# control group to detect when a factor's IC is sector-specific.
+canary:
+  - JPM    # Mega-bank — financials, rates-sensitive
+  - XOM    # Oil/gas major — energy cycle, value-tilt
+  - LLY    # Large pharma — secular growth (GLP-1)
+  - PG     # Consumer staples — pure defensive
+  - NEE    # Utilities — rate-sensitive defensive
+  - COST   # Consumer staples/retail — defensive-growth hybrid
+
+# Authoritative sector tags. Used by portfolio/risk.py for sector
+# concentration caps. The "Semiconductors" bucket carries the bulk of
+# the tech universe so users running with max_sector_exposure=0.50
+# correctly see it as one risk bucket, not split across sub-industries.
+sectors:
+  # Semiconductors (designers + foundry + equipment + IP)
+  NVDA:  Semiconductors
+  AMD:   Semiconductors
+  AVGO:  Semiconductors
+  MU:    Semiconductors
+  TSM:   Semiconductors
+  ALAB:  Semiconductors
+  ARM:   Semiconductors
+  ASML:  Semiconductors
+  KLAC:  Semiconductors
+  MRVL:  Semiconductors
+  # Tech / Software / Cloud
+  AAPL:  Tech-MegaCap
+  MSFT:  Tech-MegaCap
+  GOOGL: Tech-MegaCap
+  META:  Tech-MegaCap
+  ORCL:  Tech-MegaCap
+  PLTR:  Software
+  CRWD:  Software
+  # Networking + infra
+  ANET:  Networking
+  NET:   Networking
+  # AI infra adjacent
+  COHR:  Photonics
+  LITE:  Photonics
+  AAOI:  Photonics
+  GLW:   Specialty-Materials
+  LEU:   Energy-Nuclear
+  # Other
+  FIG:   Financial-Data
+  RKLB:  Aerospace
+  # --- canaries ---
+  JPM:   Financials
+  XOM:   Energy
+  LLY:   Healthcare
+  PG:    Consumer-Staples
+  NEE:   Utilities
+  COST:  Consumer-Discretionary

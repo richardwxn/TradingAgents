@@ -24,6 +24,13 @@ from portfolio.sizing import (
     stop_loss_price,
     trim_limit_price,
 )
+from portfolio.risk import (
+    RiskAdjustment,
+    RiskLimits,
+    apply_all_risk_caps,
+    compute_portfolio_beta,
+    compute_sector_exposure,
+)
 
 
 # ---------- data shapes ----------
@@ -39,6 +46,13 @@ class Signal:
     composite: float | None
     confidence: float | None
     source_path: str
+    # Section 26: surface earnings info + sector label so the daily
+    # signals layer can apply earnings-aware sizing and portfolio-level
+    # risk caps without re-reading the source report JSONs.
+    next_earnings_in_calendar_days: int | None = None
+    next_earnings_date: str | None = None
+    sector: str | None = None
+    industry: str | None = None
 
     def to_sizing_input(self) -> dict[str, Any]:
         return {
@@ -119,8 +133,11 @@ def _load_signal_from_json(path: Path) -> Signal | None:
     as_of = payload.get("as_of_date")
     if not symbol or not as_of:
         return None
-    model_scoring = (payload.get("key_features") or {}).get("model_scoring") or {}
+    kf = payload.get("key_features") or {}
+    model_scoring = kf.get("model_scoring") or {}
     composite = model_scoring.get("composite_score")
+    ec = kf.get("earnings_calendar") or {}
+    ind = kf.get("industry_context") or {}
     return Signal(
         symbol=symbol,
         as_of_date=as_of,
@@ -132,7 +149,22 @@ def _load_signal_from_json(path: Path) -> Signal | None:
             else None
         ),
         source_path=str(path),
+        next_earnings_in_calendar_days=_safe_int(
+            ec.get("next_earnings_in_calendar_days")
+        ),
+        next_earnings_date=ec.get("next_earnings_date"),
+        sector=ind.get("sector"),
+        industry=ind.get("industry"),
     )
+
+
+def _safe_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def load_latest_signals(
@@ -231,6 +263,9 @@ def compute_actions(
     cash: float,
     as_of: date | None = None,
     rebalance_threshold_pp: float = 0.01,
+    risk_limits: RiskLimits | None = None,
+    beta_map: dict[str, float | None] | None = None,
+    correlation_matrix: dict[str, dict[str, float]] | None = None,
 ) -> tuple[list[Action], dict[str, Any]]:
     """Compute per-ticker actions + a portfolio summary.
 
@@ -266,6 +301,64 @@ def compute_actions(
             payload["age_days"] = age_days
             sizing_input[sym] = payload
     target_weights = compute_target_weights(sizing_input, config=config)
+
+    # 1b) Earnings-aware sizing adjustment (Section 26). For each symbol
+    # whose next earnings date is within config.pre_earnings_trim_days
+    # of the cutoff (today), multiply target weight by
+    # pre_earnings_size_factor. Skipped when the config sets the factor
+    # to 1.0 or trim_days to 0.
+    earnings_adjustment_notes: dict[str, str] = {}
+    if (
+        config.pre_earnings_size_factor < 1.0
+        and config.pre_earnings_trim_days > 0
+    ):
+        for sym, sig in signals.items():
+            if sig is None or sig.next_earnings_in_calendar_days is None:
+                continue
+            days = int(sig.next_earnings_in_calendar_days)
+            if 0 <= days <= config.pre_earnings_trim_days:
+                old_w = target_weights.get(sym, 0.0)
+                if old_w <= 0:
+                    continue
+                target_weights[sym] = old_w * config.pre_earnings_size_factor
+                earnings_adjustment_notes[sym] = (
+                    f"Earnings in {days}d ({sig.next_earnings_date}) — "
+                    f"target size reduced to "
+                    f"{config.pre_earnings_size_factor*100:.0f}% "
+                    f"({old_w*100:.1f}% → {target_weights[sym]*100:.1f}%)."
+                )
+
+    # 1c) Portfolio-level risk caps (Section 26). Apply sector,
+    # beta, and correlation caps to the post-earnings target weights.
+    # Trimmed weight becomes uninvested (cash), not redistributed —
+    # consistent with the long-or-cash mode.
+    risk_notes: dict[str, str] = {}
+    risk_diagnostic: dict[str, Any] = {}
+    if risk_limits is not None:
+        sector_map = {
+            sym: (sig.sector if sig is not None else None)
+            for sym, sig in signals.items()
+        }
+        beta_map = beta_map or {}
+        correlation_matrix = correlation_matrix or {}
+        adj = apply_all_risk_caps(
+            target_weights,
+            sector_map=sector_map,
+            beta_map=beta_map,
+            correlation_matrix=correlation_matrix,
+            limits=risk_limits,
+        )
+        target_weights = adj.adjusted_weights
+        risk_notes = adj.notes
+        risk_diagnostic = {
+            "sector_exposure": adj.sector_exposure,
+            "portfolio_beta": adj.portfolio_beta,
+            "limits": {
+                "max_sector_exposure": risk_limits.max_sector_exposure,
+                "max_portfolio_beta": risk_limits.max_portfolio_beta,
+                "max_pair_correlation": risk_limits.max_pair_correlation,
+            },
+        }
 
     # 2) Compute current portfolio value + per-symbol weights.
     total_value, current_weights = compute_portfolio_value(
@@ -332,6 +425,10 @@ def compute_actions(
             notes.append("Bearish signal suppressed (long-or-cash mode, handoff Section 15).")
         if ctx.last_close is None:
             notes.append("Price unavailable from yfinance; targets/limits may be incomplete.")
+        if sym in earnings_adjustment_notes:
+            notes.append(earnings_adjustment_notes[sym])
+        if sym in risk_notes:
+            notes.append(risk_notes[sym])
 
         actions.append(Action(
             symbol=sym,
@@ -400,6 +497,9 @@ def compute_actions(
             1 for a in actions
             if a.signal_age_days is not None and a.signal_age_days > config.stale_composite_days
         ),
+        "risk_diagnostic": risk_diagnostic,
+        "n_earnings_adjusted": len(earnings_adjustment_notes),
+        "n_risk_capped": len(risk_notes),
     }
     return actions, summary
 
@@ -469,6 +569,12 @@ def format_daily_report(
     )
     lines.append("")
 
+    # Portfolio risk section (Section 26) — only when risk caps were active.
+    risk_diag = (summary.get("risk_diagnostic") or {}) if summary else {}
+    if risk_diag:
+        lines.extend(_render_risk_section(risk_diag, summary))
+        lines.append("")
+
     grouped: dict[str, list[Action]] = {}
     for a in actions:
         grouped.setdefault(a.action, []).append(a)
@@ -537,3 +643,239 @@ def _render_action_block(a: Action) -> list[str]:
         pieces.append(f"- _Note: {note}_")
     pieces.append("")
     return pieces
+
+
+# ---------- option position rendering (Section 25) ----------
+
+
+def format_option_positions_section(
+    *,
+    options_by_symbol: dict[str, list],
+    enriched_by_symbol: dict[str, list],
+    book_greeks_by_symbol: dict[str, Any],
+    as_of: date,
+) -> str:
+    """Render the "Option positions" section as markdown.
+
+    Returns an empty string when there are no option positions across any
+    symbol — callers can append unconditionally without inserting an empty
+    section.
+
+    Inputs are keyed by uppercase symbol so they can be assembled
+    incrementally as the daily-signals CLI fetches each symbol's chain.
+    """
+    if not options_by_symbol:
+        return ""
+
+    lines: list[str] = ["## Option positions", ""]
+
+    # Top-of-section book aggregate across all symbols.
+    book_lines = _format_book_aggregate(book_greeks_by_symbol)
+    if book_lines:
+        lines.extend(book_lines)
+        lines.append("")
+
+    for sym in sorted(options_by_symbol.keys()):
+        positions = options_by_symbol[sym]
+        enriched = enriched_by_symbol.get(sym) or []
+        bg = book_greeks_by_symbol.get(sym)
+        lines.extend(_format_symbol_options(sym, positions, enriched, bg, as_of))
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_book_aggregate(book_greeks_by_symbol: dict[str, Any]) -> list[str]:
+    if not book_greeks_by_symbol:
+        return []
+    total_delta = 0.0
+    total_vega = 0.0
+    total_theta = 0.0
+    total_mv = 0.0
+    total_pnl = 0.0
+    have_data = False
+    for bg in book_greeks_by_symbol.values():
+        if bg is None:
+            continue
+        have_data = True
+        if bg.net_share_equivalent_delta is not None:
+            total_delta += bg.net_share_equivalent_delta
+        if bg.net_vega_dollars_per_vol_pt is not None:
+            total_vega += bg.net_vega_dollars_per_vol_pt
+        if bg.net_theta_dollars_per_day is not None:
+            total_theta += bg.net_theta_dollars_per_day
+        if bg.net_option_market_value is not None:
+            total_mv += bg.net_option_market_value
+        if bg.net_option_unrealized_pnl is not None:
+            total_pnl += bg.net_option_unrealized_pnl
+    if not have_data:
+        return []
+    return [
+        "**Book aggregate**",
+        "",
+        f"- Net share-equivalent delta (all symbols): **{total_delta:+,.0f} sh**",
+        f"- Net vega: **{_fmt_money(total_vega)}** per 1% IV move",
+        f"- Net theta: **{_fmt_money(total_theta)}** per day "
+        f"({'time-decay credit' if total_theta > 0 else 'time-decay drag'})",
+        f"- Net option market value: {_fmt_money(total_mv)}",
+        f"- Net option unrealized P&L: **{_fmt_money(total_pnl)}**",
+    ]
+
+
+def _format_symbol_options(
+    symbol: str,
+    positions: list,
+    enriched: list,
+    book_greeks_for_symbol,
+    as_of: date,
+) -> list[str]:
+    lines = [f"### {symbol}"]
+    if book_greeks_for_symbol is not None:
+        bg = book_greeks_for_symbol
+        bg_bits = []
+        if bg.shares:
+            bg_bits.append(f"{bg.shares:,d} shares")
+        if bg.net_share_equivalent_delta is not None:
+            bg_bits.append(f"net Δ {bg.net_share_equivalent_delta:+,.0f} sh")
+        if bg.net_vega_dollars_per_vol_pt is not None:
+            bg_bits.append(f"vega {_fmt_money(bg.net_vega_dollars_per_vol_pt)}/vol-pt")
+        if bg.net_theta_dollars_per_day is not None:
+            bg_bits.append(f"theta {_fmt_money(bg.net_theta_dollars_per_day)}/day")
+        if bg_bits:
+            lines.append("- " + " · ".join(bg_bits))
+
+    if not positions:
+        lines.append("- _(no option contracts)_")
+        return lines
+
+    lines.append("")
+    lines.append(
+        "| Side | Right | Strike | Expiry | DTE | Qty | Avg cost | Mark | Δ | "
+        "Vega | Theta | $ M2M | Unreal P&L |"
+    )
+    lines.append("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    by_key: dict[tuple, Any] = {
+        (e.position.right, e.position.strike, e.position.expiry, e.position.quantity): e
+        for e in enriched
+    }
+    for p in positions:
+        key = (p.right, p.strike, p.expiry, p.quantity)
+        e = by_key.get(key)
+        side = "Long" if p.is_long else "Short"
+        qty_disp = f"{abs(int(p.quantity))} contracts"
+        dte = p.dte(as_of.isoformat())
+        dte_disp = f"{dte}d" if dte is not None else "—"
+
+        def fmt_g(v: float | None, suffix: str = "") -> str:
+            return f"{v:+.3f}{suffix}" if v is not None else "—"
+
+        mark = e.mark if e else None
+        delta = e.delta if e else None
+        vega = e.vega if e else None
+        theta = e.theta if e else None
+        mv = e.market_basis if e else None
+        pnl = e.unrealized_pnl if e else None
+        lines.append(
+            "| {side} | {right} | {strike} | {expiry} | {dte} | {qty} | "
+            "{cost} | {mark} | {delta} | {vega} | {theta} | {mv} | {pnl} |"
+            .format(
+                side=side, right=p.right, strike=f"${p.strike:g}",
+                expiry=p.expiry, dte=dte_disp, qty=qty_disp,
+                cost=_fmt_money(p.avg_cost),
+                mark=_fmt_money(mark),
+                delta=fmt_g(delta),
+                vega=fmt_g(vega),
+                theta=fmt_g(theta),
+                mv=_fmt_money(mv),
+                pnl=_fmt_money(pnl),
+            )
+        )
+
+    # Warnings: short-dated contracts, ITM assignment risk.
+    warnings: list[str] = []
+    for p in positions:
+        dte = p.dte(as_of.isoformat())
+        if dte is None:
+            continue
+        if 0 <= dte <= 7:
+            warnings.append(
+                f"Expiry within {dte}d for {p.right} K=${p.strike:g} "
+                f"{p.expiry} — close, roll, or let expire."
+            )
+        elif dte < 0:
+            warnings.append(
+                f"Already expired: {p.right} K=${p.strike:g} {p.expiry} — "
+                f"remove from ledger."
+            )
+
+    # Premium-buyer stop-out hints.
+    for e in enriched:
+        if not e.position.is_long:
+            continue
+        if e.mark is None:
+            continue
+        if e.position.avg_cost <= 0:
+            continue
+        decay = (e.position.avg_cost - e.mark) / e.position.avg_cost
+        if decay >= 0.50:
+            warnings.append(
+                f"Long {e.position.right} K=${e.position.strike:g} "
+                f"{e.position.expiry} marked {_fmt_money(e.mark)} "
+                f"vs cost {_fmt_money(e.position.avg_cost)} "
+                f"({decay*100:.0f}% premium loss) — consider stop."
+            )
+    if warnings:
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- ⚠️ _{w}_")
+
+    return lines
+
+
+def _render_risk_section(
+    risk_diag: dict[str, Any],
+    summary: dict[str, Any] | None,
+) -> list[str]:
+    """Render the Portfolio risk section (Section 26)."""
+    limits = risk_diag.get("limits") or {}
+    sector_exposure = risk_diag.get("sector_exposure") or {}
+    portfolio_beta = risk_diag.get("portfolio_beta")
+    n_risk_capped = (summary or {}).get("n_risk_capped", 0)
+    n_earnings = (summary or {}).get("n_earnings_adjusted", 0)
+
+    lines = ["## Portfolio risk", ""]
+    lines.append(
+        f"- **Portfolio β (cash-drag included):** "
+        f"{f"{portfolio_beta:.2f}" if portfolio_beta is not None else '—'} "
+        f"(cap: {f"{limits.get('max_portfolio_beta', 0):.2f}"})"
+    )
+    lines.append(
+        f"- **Sector concentration cap:** {_fmt_weight(limits.get('max_sector_exposure'))}; "
+        f"correlation cap: ρ≥{limits.get('max_pair_correlation', 0):.2f}"
+    )
+    if n_earnings:
+        lines.append(
+            f"- **{n_earnings}** name(s) had target weight reduced for "
+            f"approaching earnings (see notes on individual actions)."
+        )
+    if n_risk_capped:
+        lines.append(
+            f"- **{n_risk_capped}** name(s) had target weight reduced by "
+            f"risk caps (see notes on individual actions)."
+        )
+    if sector_exposure:
+        lines.append("")
+        lines.append("**Sector exposure (post-caps):**")
+        lines.append("")
+        for sector, exposure in sorted(
+            sector_exposure.items(), key=lambda kv: -kv[1]
+        ):
+            if exposure <= 0:
+                continue
+            cap = limits.get("max_sector_exposure")
+            at_cap = (
+                cap is not None and exposure >= cap - 1e-4
+            )
+            indicator = " ← at cap" if at_cap else ""
+            lines.append(f"- {sector}: {_fmt_weight(exposure)}{indicator}")
+    return lines

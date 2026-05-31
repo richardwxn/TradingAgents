@@ -319,6 +319,7 @@ class AnalysisRuntime:
                 else self.config.llm.model_fast
             ),
             llm_base_url=self.config.llm.base_url,
+            state_store_path=self.config.state_db_path,
         )
         return runner.run(symbol=symbol, as_of_date=as_of_date)
 
@@ -459,4 +460,3 @@ class AnalysisRuntime:
         seen = self.state.get_seen_news_ids(symbol)
         all_ids = self._extract_news_ids(news_items)
         return [nid for nid in all_ids if nid not in seen]
-

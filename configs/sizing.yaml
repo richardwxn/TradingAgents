@@ -21,6 +21,20 @@ stale_composite_days: 7           # flag composites older than this many days
 stale_signal_decay: 0.5           # multiply target weight by this when signal age > stale_composite_days (1.0 = no penalty)
 composite_threshold: 0.15         # matches scoring.py direction_for_composite default (v1.1)
 
+# Earnings-aware sizing (Section 26). When a name has earnings within
+# pre_earnings_trim_days, scale its target weight by pre_earnings_size_factor.
+# Set the factor to 1.0 or trim_days to 0 to disable.
+pre_earnings_trim_days: 3
+pre_earnings_size_factor: 0.5
+
+# Portfolio-level risk caps (Section 26). Applied after sector/beta math
+# in daily_signals.py via portfolio/risk.py::apply_all_risk_caps. The
+# trimmed weight becomes uninvested (cash), not redistributed.
+risk_limits:
+  max_sector_exposure: 0.50       # no sector > 50% of book
+  max_portfolio_beta: 1.60        # cash-drag-inclusive weighted-avg beta
+  max_pair_correlation: 0.85      # cap correlated secondary names vs the largest holding
+
 universe:
   - NVDA
   - AMD
@@ -33,3 +47,5 @@ universe:
   - COHR
   - FIG
   - LEU
+  - LITE
+  - AAOI

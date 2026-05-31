@@ -24,7 +24,34 @@ def _strip_code_fences(content: str) -> str:
 
 
 def _build_review_schema():
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, field_validator
+
+    def _bounded_string_list(value: Any, max_items: int) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_items = [value]
+        elif isinstance(value, Iterable):
+            raw_items = list(value)
+        else:
+            raw_items = [value]
+        return [
+            str(item).strip()
+            for item in raw_items
+            if str(item).strip()
+        ][:max_items]
+
+    def _bounded_object_list(value: Any, max_items: int) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value[:max_items]
+        if isinstance(value, tuple):
+            return list(value)[:max_items]
+        return [value][:max_items]
+
+    def _lower_label(value: Any) -> str:
+        return str(value).strip().lower()
 
     class FactorHypothesis(BaseModel):
         name: str = Field(min_length=3, max_length=120)
@@ -34,6 +61,22 @@ def _build_review_schema():
         expected_direction: str = Field(pattern="^(bullish|bearish|context|unknown)$")
         validation_test: str = Field(min_length=5, max_length=1000)
 
+        @field_validator("required_data", mode="before")
+        @classmethod
+        def _normalize_required_data(cls, value: Any) -> list[str]:
+            return _bounded_string_list(value, 8)
+
+        @field_validator("expected_direction", mode="before")
+        @classmethod
+        def _normalize_expected_direction(cls, value: Any) -> str:
+            label = _lower_label(value)
+            return {
+                "mixed": "context",
+                "neutral": "context",
+                "conditional": "context",
+                "unclear": "unknown",
+            }.get(label, label)
+
     class CandidateRiskCritique(BaseModel):
         candidate_id: str = Field(min_length=1, max_length=80)
         concern: str = Field(min_length=5, max_length=1000)
@@ -41,6 +84,16 @@ def _build_review_schema():
         failure_mode: str = Field(min_length=5, max_length=1000)
         severity: str = Field(pattern="^(low|medium|high)$")
         mitigation: str = Field(min_length=5, max_length=1000)
+
+        @field_validator("affected_knobs", mode="before")
+        @classmethod
+        def _normalize_affected_knobs(cls, value: Any) -> list[str]:
+            return _bounded_string_list(value, 12)
+
+        @field_validator("severity", mode="before")
+        @classmethod
+        def _normalize_severity(cls, value: Any) -> str:
+            return _lower_label(value)
 
     class OverfitExplanation(BaseModel):
         candidate_id: str = Field(min_length=1, max_length=80)
@@ -56,11 +109,26 @@ def _build_review_schema():
         expected_signal_type: str = Field(min_length=3, max_length=240)
         validation_plan: str = Field(min_length=5, max_length=1000)
 
+        @field_validator("priority", mode="before")
+        @classmethod
+        def _normalize_priority(cls, value: Any) -> str:
+            return _lower_label(value)
+
     class AgentReviewOutput(BaseModel):
         factor_hypotheses: list[FactorHypothesis] = Field(default_factory=list, max_length=8)
         candidate_risk_critiques: list[CandidateRiskCritique] = Field(default_factory=list, max_length=12)
         overfit_explanations: list[OverfitExplanation] = Field(default_factory=list, max_length=12)
         feature_recommendations: list[FeatureRecommendation] = Field(default_factory=list, max_length=8)
+
+        @field_validator("factor_hypotheses", "feature_recommendations", mode="before")
+        @classmethod
+        def _normalize_short_sections(cls, value: Any) -> list[Any]:
+            return _bounded_object_list(value, 8)
+
+        @field_validator("candidate_risk_critiques", "overfit_explanations", mode="before")
+        @classmethod
+        def _normalize_long_sections(cls, value: Any) -> list[Any]:
+            return _bounded_object_list(value, 12)
 
     return AgentReviewOutput
 
@@ -239,16 +307,16 @@ def build_review_prompt(
         "context, but return strict JSON only. Do not give trading advice; "
         "focus on improving the analysis system.\n\n"
         "Required JSON keys:\n"
-        "- factor_hypotheses: list of objects with name, rationale, "
+        "- factor_hypotheses: at most 8 objects with name, rationale, "
         "required_data, proposed_factor_formula, expected_direction "
         "(bullish|bearish|context|unknown), validation_test.\n"
-        "- candidate_risk_critiques: list of objects with candidate_id, "
+        "- candidate_risk_critiques: at most 12 objects with candidate_id, "
         "concern, affected_knobs, failure_mode, severity (low|medium|high), "
         "mitigation. Empty list is allowed when no candidates are provided.\n"
-        "- overfit_explanations: list of objects with candidate_id, evidence, "
+        "- overfit_explanations: at most 12 objects with candidate_id, evidence, "
         "suspected_overfit_mechanism, confidence (0-1), suggested_gate. Empty "
         "list is allowed when no candidates are provided.\n"
-        "- feature_recommendations: list of objects with feature_or_dataset, "
+        "- feature_recommendations: at most 8 objects with feature_or_dataset, "
         "reason, priority (low|medium|high), expected_signal_type, "
         "validation_plan.\n\n"
         "Prefer concise, testable suggestions. Tie critiques to concrete "

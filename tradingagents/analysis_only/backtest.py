@@ -782,6 +782,9 @@ def rebuild_records_with_weights(
             forward_returns=dict(r.forward_returns),
             benchmark_adjusted_returns=dict(r.benchmark_adjusted_returns),
             factor_scores=r.factor_scores,
+            market_context=r.market_context,
+            llm_critic=r.llm_critic,
+            llm_disagreement=r.llm_disagreement,
             source_path=r.source_path,
         )
         rebuilt.append(new_rec)

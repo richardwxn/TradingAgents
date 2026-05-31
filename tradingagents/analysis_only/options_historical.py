@@ -29,14 +29,65 @@ import requests
 import yfinance as yf
 
 from tradingagents.analysis_only.bsm import bs_vega, implied_vol
+from tradingagents.analysis_only.cache import CACHE_SCHEMA_VERSION, DiskCache, stable_hash
+
+
+# Process-shared cache of loaded ^IRX series, keyed by (start, end). Threads
+# spawned from the same process (e.g. ThreadPoolExecutor in scripts/
+# generate_corpus.py) share this dict, so the ^IRX yfinance fetch happens
+# once per (start, end) combination per process — not once per report.
+# Each report job previously paid ~0.5-1s of redundant fetch latency.
+_RATE_SERIES_CACHE: dict[tuple[str, str | None], dict[str, float]] = {}
+_RATE_SERIES_LOCK = threading.Lock()
+
+
+def _load_irx_series(
+    start: str,
+    end: str | None,
+    logger: logging.Logger,
+) -> dict[str, float]:
+    """Load ^IRX into a date→rate dict. Returns an empty dict on failure."""
+    series: dict[str, float] = {}
+    try:
+        ticker = yf.Ticker("^IRX")
+        kwargs: dict[str, Any] = {"start": start}
+        if end:
+            kwargs["end"] = end
+        hist = ticker.history(**kwargs)
+        if hist is not None and not hist.empty:
+            closes = hist["Close"].dropna()
+            for ts, value in closes.items():
+                d_str = ts.date().isoformat()
+                try:
+                    series[d_str] = float(value) / 100.0
+                except (TypeError, ValueError):
+                    continue
+        dates = sorted(series.keys())
+        logger.info(
+            "RiskFreeRateProvider loaded %d ^IRX observations from %s to %s",
+            len(series), dates[0] if dates else "?", dates[-1] if dates else "?",
+        )
+    except Exception as exc:
+        logger.warning(
+            "RiskFreeRateProvider failed to load ^IRX (%s); rate lookups "
+            "will fall back to constant.",
+            exc,
+        )
+    return series
+
+
+def reset_rate_cache() -> None:
+    """Clear the module-level ^IRX cache. For tests."""
+    with _RATE_SERIES_LOCK:
+        _RATE_SERIES_CACHE.clear()
 
 
 class RiskFreeRateProvider:
     """Daily 13-week T-bill yield from yfinance `^IRX`, in absolute terms.
 
     `^IRX` is quoted in percent (e.g. 4.50 = 4.50%). We divide by 100 and
-    cache the full series in memory so per-report lookups are free after
-    the first fetch.
+    cache the full series **at module scope** (see `_RATE_SERIES_CACHE`) so
+    repeated provider construction across reports / threads doesn't refetch.
 
     For dates with no daily observation (weekends, holidays, holes in the
     Yahoo series), we walk back up to 10 trading days to find a valid one.
@@ -49,47 +100,26 @@ class RiskFreeRateProvider:
         fallback_rate: float = 0.045,
         logger: logging.Logger | None = None,
     ) -> None:
-        self._series: dict[str, float] = {}
-        self._dates_sorted: list[str] = []
         self._fallback_rate = fallback_rate
         self._logger = logger or logging.getLogger(__name__)
-        self._lock = threading.Lock()
-        self._loaded = False
         self._start = start or "2020-01-01"
         self._end = end
+        self._dates_sorted: list[str] = []
+        self._series: dict[str, float] = {}
 
     def _ensure_loaded(self) -> None:
-        with self._lock:
-            if self._loaded:
-                return
-            try:
-                ticker = yf.Ticker("^IRX")
-                kwargs: dict[str, Any] = {"start": self._start}
-                if self._end:
-                    kwargs["end"] = self._end
-                hist = ticker.history(**kwargs)
-                if hist is not None and not hist.empty:
-                    closes = hist["Close"].dropna()
-                    for ts, value in closes.items():
-                        d_str = ts.date().isoformat()
-                        try:
-                            self._series[d_str] = float(value) / 100.0
-                        except (TypeError, ValueError):
-                            continue
-                    self._dates_sorted = sorted(self._series.keys())
-                    self._logger.info(
-                        "RiskFreeRateProvider loaded %d ^IRX observations from %s to %s",
-                        len(self._series),
-                        self._dates_sorted[0] if self._dates_sorted else "?",
-                        self._dates_sorted[-1] if self._dates_sorted else "?",
-                    )
-            except Exception as exc:  # yfinance flakes hard sometimes
-                self._logger.warning(
-                    "RiskFreeRateProvider failed to load ^IRX (%s); "
-                    "falling back to constant %.4f",
-                    exc, self._fallback_rate,
+        if self._series:
+            return
+        cache_key = (self._start, self._end)
+        with _RATE_SERIES_LOCK:
+            cached = _RATE_SERIES_CACHE.get(cache_key)
+            if cached is None:
+                cached = _load_irx_series(
+                    self._start, self._end, self._logger,
                 )
-            self._loaded = True
+                _RATE_SERIES_CACHE[cache_key] = cached
+        self._series = cached
+        self._dates_sorted = sorted(self._series.keys())
 
     def rate_for(self, target_date: str) -> float:
         """Return r for `target_date` (ISO). Walks back ≤10 trading days."""
@@ -144,6 +174,8 @@ class PolygonOptionsHistoricalProvider:
         max_workers: int = 8,
         request_timeout: float = 20.0,
         logger: logging.Logger | None = None,
+        cache_dir: str | None = None,
+        enable_cache: bool = True,
     ) -> None:
         if not api_key:
             raise ValueError("POLYGON_API_KEY required for historical options.")
@@ -152,6 +184,7 @@ class PolygonOptionsHistoricalProvider:
         self._max_workers = max_workers
         self._timeout = request_timeout
         self._logger = logger or logging.getLogger(__name__)
+        self._cache = DiskCache(cache_dir) if enable_cache else None
 
     # ---------- public ----------
 
@@ -273,6 +306,17 @@ class PolygonOptionsHistoricalProvider:
         expiration_gte: str, expiration_lte: str,
         strike_gte: float, strike_lte: float,
     ) -> list[dict[str, Any]]:
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "expiration_gte": expiration_gte,
+            "expiration_lte": expiration_lte,
+            "strike_gte": round(float(strike_gte), 6),
+            "strike_lte": round(float(strike_lte), 6),
+        }
+        cached = self._get_cached_json("contracts", cache_payload)
+        if isinstance(cached, list):
+            return cached
         params: dict[str, Any] = {
             "underlying_ticker": symbol.upper(),
             "as_of": as_of_date,
@@ -317,11 +361,19 @@ class PolygonOptionsHistoricalProvider:
             if next_url and "apiKey=" not in next_url:
                 sep = "&" if "?" in next_url else "?"
                 next_url = f"{next_url}{sep}apiKey={self._api_key}"
+        self._set_cached_json("contracts", cache_payload, out)
         return out
 
     def _fetch_contract_agg(
         self, contract_ticker: str, as_of_date: str,
     ) -> dict[str, Any] | None:
+        cache_payload = {
+            "contract_ticker": contract_ticker,
+            "as_of_date": as_of_date,
+        }
+        cached = self._get_cached_json("contract_aggs", cache_payload)
+        if isinstance(cached, dict):
+            return cached
         url = self.AGGS_URL_TMPL.format(contract=contract_ticker, d=as_of_date)
         try:
             resp = requests.get(
@@ -342,7 +394,7 @@ class PolygonOptionsHistoricalProvider:
         volume = int(_safe_float(bar.get("v")) or 0)
         if close is None and vwap is None:
             return None
-        return {
+        out = {
             "close": close,
             "vwap": vwap,
             "volume": volume,
@@ -350,6 +402,43 @@ class PolygonOptionsHistoricalProvider:
             "high": _safe_float(bar.get("h")),
             "low": _safe_float(bar.get("l")),
         }
+        self._set_cached_json("contract_aggs", cache_payload, out)
+        return out
+
+    def _cache_key(self, namespace: str, payload: dict[str, Any]) -> str:
+        return stable_hash(
+            {
+                "schema": CACHE_SCHEMA_VERSION,
+                "kind": f"historical_options_{namespace}",
+                "payload": payload,
+            }
+        )
+
+    def _get_cached_json(
+        self,
+        namespace: str,
+        payload: dict[str, Any],
+    ) -> Any | None:
+        if self._cache is None:
+            return None
+        return self._cache.get_json(
+            f"options_historical_{namespace}",
+            self._cache_key(namespace, payload),
+        )
+
+    def _set_cached_json(
+        self,
+        namespace: str,
+        payload: dict[str, Any],
+        value: Any,
+    ) -> None:
+        if self._cache is None:
+            return
+        self._cache.set_json(
+            f"options_historical_{namespace}",
+            self._cache_key(namespace, payload),
+            value,
+        )
 
     def _build_row(
         self, *, meta: dict[str, Any], agg: dict[str, Any],

@@ -199,6 +199,49 @@ def test_generate_structured_review_validates_llm_output(monkeypatch):
     assert block["analysis"]["factor_hypotheses"][0]["name"] == "earnings revision breadth"
 
 
+def test_generate_structured_review_tolerates_small_llm_format_slips(monkeypatch):
+    payload = _valid_review_payload()
+    payload["factor_hypotheses"][0]["required_data"] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i",
+    ]
+    payload["factor_hypotheses"][0]["expected_direction"] = "Mixed"
+    payload["candidate_risk_critiques"][0]["severity"] = "Medium"
+    payload["feature_recommendations"][0]["priority"] = "High"
+    _patch_llm(monkeypatch, payload)
+
+    block = agent_review.generate_structured_review(
+        graph_contexts=[{"symbol": "AMD", "status": "ok"}],
+    )
+
+    assert block["status"] == "ok"
+    hypothesis = block["analysis"]["factor_hypotheses"][0]
+    assert hypothesis["required_data"] == ["a", "b", "c", "d", "e", "f", "g", "h"]
+    assert hypothesis["expected_direction"] == "context"
+    assert block["analysis"]["candidate_risk_critiques"][0]["severity"] == "medium"
+    assert block["analysis"]["feature_recommendations"][0]["priority"] == "high"
+
+
+def test_generate_structured_review_truncates_extra_feature_recommendations(monkeypatch):
+    payload = _valid_review_payload()
+    payload["feature_recommendations"] = [
+        {
+            **payload["feature_recommendations"][0],
+            "feature_or_dataset": f"feature {i}",
+        }
+        for i in range(10)
+    ]
+    _patch_llm(monkeypatch, payload)
+
+    block = agent_review.generate_structured_review(
+        graph_contexts=[{"symbol": "AMD", "status": "ok"}],
+    )
+
+    assert block["status"] == "ok"
+    features = block["analysis"]["feature_recommendations"]
+    assert len(features) == 8
+    assert features[-1]["feature_or_dataset"] == "feature 7"
+
+
 def test_generate_structured_review_reports_schema_errors(monkeypatch):
     _patch_llm(monkeypatch, {"factor_hypotheses": [{"name": "bad"}]})
     block = agent_review.generate_structured_review(
@@ -250,15 +293,53 @@ def test_markdown_renderer_handles_tradingagents_review_block():
         "confidence": 0.7,
         "thesis": "Test thesis",
         "key_features": {
+            "decision_summary": {"action": "watch"},
+            "model_scoring": {
+                "composite_score": 0.4,
+                "factor_scores": [
+                    {
+                        "factor": "trend_signal",
+                        "weighted_score": 0.08,
+                        "data_available": True,
+                    },
+                    {
+                        "factor": "valuation_risk",
+                        "weighted_score": -0.03,
+                        "data_available": True,
+                    },
+                ],
+            },
             "tradingagents_review": {
                 "enabled": True,
                 "status": "ok",
                 "provider": "openai",
                 "model": "gpt-5.4-mini",
                 "analysis": _valid_review_payload(),
+                "graph_contexts": [
+                    {
+                        "symbol": "NVDA",
+                        "as_of_date": "2026-05-22",
+                        "status": "ok",
+                        "selection_reasons": ["single_report"],
+                        "processed_decision": "HOLD",
+                        "market_report": "Market analyst text",
+                        "investment_debate": {
+                            "bull_history": "Bull text",
+                            "bear_history": "Bear text",
+                            "judge_decision": "Research manager text",
+                        },
+                        "risk_debate": {
+                            "judge_decision": "Risk judge text",
+                        },
+                    }
+                ],
             }
         },
     }
     md = render_markdown(payload)
     assert "## TradingAgents review" in md
     assert "earnings revision breadth" in md
+    assert "**Agreement map**" in md
+    assert "**Disagreement highlights**" in md
+    assert "### TradingAgents room" in md
+    assert "Market analyst text" in md

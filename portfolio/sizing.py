@@ -52,6 +52,14 @@ class SizingConfig:
     composite_threshold: float = 0.15
     top_n: int = 5
     universe: tuple[str, ...] = field(default_factory=tuple)
+    # Earnings-aware sizing (Section 26). When a position has earnings
+    # within `pre_earnings_trim_days` calendar days, its target weight is
+    # multiplied by `pre_earnings_size_factor`. Setting the factor to 1.0
+    # disables the adjustment entirely. Setting trim_days to 0 also
+    # disables. Default: 3 days, 50% size — captures the worst of the
+    # earnings gap window without exiting altogether.
+    pre_earnings_trim_days: int = 3
+    pre_earnings_size_factor: float = 0.5
 
     def __post_init__(self) -> None:
         if self.policy not in SUPPORTED_POLICIES:
@@ -67,6 +75,10 @@ class SizingConfig:
             raise ValueError("min_position_weight must be >= 0")
         if not 0 <= self.stale_signal_decay <= 1:
             raise ValueError("stale_signal_decay must be in [0, 1]")
+        if self.pre_earnings_trim_days < 0:
+            raise ValueError("pre_earnings_trim_days must be >= 0")
+        if not 0 <= self.pre_earnings_size_factor <= 1:
+            raise ValueError("pre_earnings_size_factor must be in [0, 1]")
 
 
 def sizing_config_from_dict(data: dict[str, Any]) -> SizingConfig:
@@ -82,6 +94,7 @@ def sizing_config_from_dict(data: dict[str, Any]) -> SizingConfig:
         "max_entry_pullback_pct", "exit_patience_atrs",
         "stale_composite_days", "stale_signal_decay",
         "composite_threshold", "top_n",
+        "pre_earnings_trim_days", "pre_earnings_size_factor",
     }
     kwargs = {k: v for k, v in data.items() if k in allowed}
     universe = data.get("universe") or ()
