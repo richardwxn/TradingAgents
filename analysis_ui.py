@@ -111,6 +111,15 @@ def make_handler(output_dir: str):
                 job_id = (query.get("job_id") or [""])[0]
                 self._send_json(_best_buy_status(job_id))
                 return
+            if parsed.path == "/report":
+                query = parse_qs(parsed.query)
+                path = (query.get("path") or [""])[0]
+                fmt = (query.get("fmt") or ["md"])[0]
+                try:
+                    self._send_report_file(path, fmt)
+                except Exception as exc:
+                    self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
@@ -163,6 +172,34 @@ def make_handler(output_dir: str):
             encoded = body.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def _send_report_file(self, raw_path: str, fmt: str) -> None:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            else:
+                path = path.resolve()
+            root = Path.cwd().resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError("Report path must be inside the workspace.") from exc
+            if fmt == "md":
+                path = path.with_suffix(".md")
+                content_type = "text/markdown; charset=utf-8"
+            elif fmt == "json":
+                path = path.with_suffix(".json")
+                content_type = "application/json; charset=utf-8"
+            else:
+                raise ValueError("fmt must be md or json.")
+            if not path.exists() or not path.is_file():
+                raise ValueError(f"Report file not found: {path}")
+            encoded = path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
@@ -712,6 +749,8 @@ def _rank_candidate(
         "reason": "; ".join(reason_bits),
         "notes": action.notes,
         "source_path": sig.source_path,
+        "markdown_url": f"/report?fmt=md&path={sig.source_path}",
+        "json_url": f"/report?fmt=json&path={sig.source_path}",
     }
 
 
@@ -1532,6 +1571,8 @@ def _html_page() -> str:
               <span class="data-pill">Limit ${{fmtMoney(c.limit_price)}}</span>
               <span class="data-pill">Stop ${{fmtMoney(c.stop_loss)}}</span>
               <span class="data-pill">Age ${{c.signal_age_days === null || c.signal_age_days === undefined ? '—' : `${{c.signal_age_days}}d`}}</span>
+              ${{c.markdown_url ? `<a class="data-pill" target="_blank" href="${{reportUrl(c.markdown_url)}}">Markdown</a>` : ''}}
+              ${{c.json_url ? `<a class="data-pill" target="_blank" href="${{reportUrl(c.json_url)}}">JSON</a>` : ''}}
               ${{stale ? `<span class="data-pill">${{stale}}</span>` : ''}}
             </div>
             ${{notes.length ? `<ul class="muted-list">${{notes.map(x => `<li>${{escapeHtml(x)}}</li>`).join('')}}</ul>` : ''}}
@@ -1539,6 +1580,12 @@ def _html_page() -> str:
           <div class="rank-score">${{fmtNum(c.rank_score)}}</div>
         </div>
       `;
+    }}
+    function reportUrl(url) {{
+      const [base, query] = String(url || '').split('?');
+      if (!query) return base;
+      const params = new URLSearchParams(query);
+      return `${{base}}?${{params.toString()}}`;
     }}
     function statItem(label, value) {{
       return `<div class="stat-item"><b>${{value}}</b><span>${{escapeHtml(label)}}</span></div>`;
