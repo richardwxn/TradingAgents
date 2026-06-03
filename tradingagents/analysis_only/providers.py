@@ -6,10 +6,22 @@ import logging
 import math
 import os
 import threading
+import time
 
 import pandas as pd
 import requests
 import yfinance as yf
+
+
+class SECFetchError(Exception):
+    """Raised when a SEC EDGAR fetch fails transiently (HTTP error,
+    rate-limit, parse error). Distinct from a successful response that
+    simply contains no matching filings on/before the as_of_date — the
+    latter is represented by `get_latest_filing` returning ``None``.
+
+    Callers (e.g. pipeline cache layer) should treat this as a non-
+    cacheable failure so a future run can retry.
+    """
 
 
 class PriceProvider(Protocol):
@@ -515,6 +527,131 @@ class PolygonPriceProvider:
         return data
 
 
+# --- Polygon daily-aggs cache for market-context symbols ---
+#
+# Process-shared cache of Polygon daily bars keyed by (symbol, start, end).
+# Same pattern as `_VIX_SERIES_CACHE` / `_RATE_SERIES_CACHE`: the first call
+# inside a process pays the network cost; later threads serve the same
+# DataFrame from memory. Used by `pipeline._download_yfinance_daily_cached`
+# to replace the noisy `yf.download("SPY"/"XLK"/...)` path that surfaces
+# Yahoo's "HTTP 401 Invalid Crumb" errors under concurrent regen.
+#
+# Indices like `^VIX` / `^IRX` / `^TNX` are NOT on the Polygon Stocks plan
+# (`I:VIX` returns 403 NOT_AUTHORIZED). Those keep using yfinance — see
+# `is_polygon_supported_symbol`.
+_POLYGON_DAILY_AGGS_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
+_POLYGON_DAILY_AGGS_LOCK = threading.RLock()
+
+
+def is_polygon_supported_symbol(symbol: str) -> bool:
+    """True if `symbol` can be fetched from Polygon's /v2/aggs endpoint.
+
+    The Polygon Stocks plan covers stocks + ETFs but NOT index codes
+    (`^VIX`, `^IRX`, `^TNX`, etc. — these require an Indices plan and
+    return 403 NOT_AUTHORIZED on /v2/aggs). Yahoo-style `^`-prefixed
+    tickers therefore stay on yfinance.
+    """
+    if not symbol:
+        return False
+    return not symbol.startswith("^")
+
+
+def _load_polygon_daily_aggs(
+    symbol: str,
+    start: str,
+    end: str,
+    api_key: str,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    """Fetch adjusted daily aggregates for `symbol` from Polygon.
+
+    Returns a DataFrame with `Date` as the index (matching yfinance's
+    `auto_adjust=True` shape) and `Open/High/Low/Close/Volume` columns,
+    or an empty DataFrame on any failure. `start`/`end` are ISO dates,
+    both inclusive (matching Polygon's path semantics).
+    """
+    if not api_key:
+        return pd.DataFrame()
+    url = (
+        "https://api.polygon.io/v2/aggs/ticker/"
+        f"{symbol.upper()}/range/1/day/{start}/{end}"
+    )
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 50000,
+        "apiKey": api_key,
+    }
+    try:
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        logger.warning(
+            "Polygon daily aggs fetch failed for %s [%s..%s]: %s",
+            symbol, start, end, exc,
+        )
+        return pd.DataFrame()
+    rows = payload.get("results") or []
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows).rename(
+        columns={
+            "t": "Date",
+            "o": "Open",
+            "h": "High",
+            "l": "Low",
+            "c": "Close",
+            "v": "Volume",
+        }
+    )
+    # Polygon timestamps are ms epoch UTC; convert to naive UTC date index
+    # so downstream `data["Close"]` / `.iloc` access matches yfinance.
+    frame["Date"] = pd.to_datetime(frame["Date"], unit="ms", utc=True)
+    frame["Date"] = frame["Date"].dt.tz_localize(None).dt.normalize()
+    frame = frame.set_index("Date").sort_index()
+    # Keep only the OHLCV columns yfinance exposes; drop Polygon-specific
+    # fields (vw, n) to avoid surprising callers.
+    keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in frame.columns]
+    return frame[keep]
+
+
+def fetch_polygon_daily_aggs_cached(
+    symbol: str,
+    start: str,
+    end: str,
+    api_key: str,
+    logger: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Process-shared cached wrapper around `_load_polygon_daily_aggs`.
+
+    Threads spawned from the same process (e.g. corpus-regen worker pool)
+    share a single fetch per (symbol, start, end) tuple. Returns an empty
+    DataFrame on failure — callers should treat as "data unavailable".
+    """
+    log = logger or logging.getLogger(__name__)
+    key = (symbol.upper(), start, end)
+    with _POLYGON_DAILY_AGGS_LOCK:
+        cached = _POLYGON_DAILY_AGGS_CACHE.get(key)
+        if cached is not None:
+            return cached
+    # Fetch outside the lock so concurrent fetches for different keys
+    # don't serialize. We accept the rare double-fetch on the same key.
+    frame = _load_polygon_daily_aggs(symbol, start, end, api_key, log)
+    with _POLYGON_DAILY_AGGS_LOCK:
+        # Only populate cache on success — an empty result might just be
+        # a transient network blip; let the next caller retry.
+        if not frame.empty:
+            _POLYGON_DAILY_AGGS_CACHE[key] = frame
+    return frame
+
+
+def reset_polygon_daily_aggs_cache() -> None:
+    """Clear the module-level Polygon daily aggs cache. For tests."""
+    with _POLYGON_DAILY_AGGS_LOCK:
+        _POLYGON_DAILY_AGGS_CACHE.clear()
+
+
 class YFinancePriceProvider:
     def get_daily_bars(
         self,
@@ -603,6 +740,28 @@ class YFinanceNewsProvider:
         return items[:limit]
 
 
+# Module-level cache for Polygon Financials: each (symbol, timeframe) pair
+# gets fetched once per process. Threadsafe — first caller per key blocks
+# others until the fetch completes. Pattern matches `_RATE_SERIES_CACHE` in
+# this file (Section 23). See plans/screener_and_regen.md Future-work #3.
+#
+# Cache stores the FULL paginated result (up to 100 records — the Polygon
+# per-page max). `_fetch` then client-side filters by `filing_date.lte
+# as_of_date` and slices to the caller's `limit`. For the regen workload
+# (30 tickers × 150 Fridays × 2 calls = 9k HTTP requests) this collapses
+# to ~60 requests (30 tickers × 2 timeframes), saving ~15 minutes of HTTP
+# latency. Live `analysis_mvp.py` runs see no change since they hit each
+# (ticker, timeframe) once anyway.
+_FINANCIALS_ALL_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_FINANCIALS_ALL_LOCK = threading.RLock()
+
+
+def reset_financials_cache() -> None:
+    """Clear the module-level financials cache. Test-only helper."""
+    with _FINANCIALS_ALL_LOCK:
+        _FINANCIALS_ALL_CACHE.clear()
+
+
 class PolygonFinancialsProvider:
     """Point-in-time fundamentals via Polygon /vX/reference/financials.
 
@@ -615,6 +774,12 @@ class PolygonFinancialsProvider:
     """
 
     BASE_URL = "https://api.polygon.io/vX/reference/financials"
+    # Page size for the all-history fetch. Polygon caps at 100. We rely on
+    # the latest 100 filings covering the relevant history for our backtest
+    # window (2023-07 → present); for tickers public > ~25 years this may
+    # truncate the oldest filings, but those are never queried by the
+    # current corpus dates.
+    _ALL_FETCH_LIMIT = 100
 
     def __init__(
         self,
@@ -652,6 +817,44 @@ class PolygonFinancialsProvider:
     ) -> list[dict[str, Any]]:
         return self._fetch(symbol, as_of_date, timeframe="annual", limit=limit)
 
+    def _fetch_all(self, symbol: str, timeframe: str) -> list[dict[str, Any]]:
+        """Fetch (and cache) the full timeframe history for `symbol`.
+
+        Cached per (symbol, timeframe) at module level so all threads sharing
+        this Python process — including the regen worker pool — share results.
+        """
+        cache_key = (symbol.upper(), timeframe)
+        with _FINANCIALS_ALL_LOCK:
+            cached = _FINANCIALS_ALL_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            if not self.api_key:
+                _FINANCIALS_ALL_CACHE[cache_key] = []
+                return []
+            params: dict[str, Any] = {
+                "ticker": symbol.upper(),
+                "timeframe": timeframe,
+                "limit": self._ALL_FETCH_LIMIT,
+                "sort": "period_of_report_date",
+                "order": "desc",
+                "apiKey": self.api_key,
+            }
+            try:
+                response = self.session.get(
+                    self.BASE_URL, params=params, timeout=self.timeout
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:
+                # Negative cache: store the empty list so we don't retry
+                # this (symbol, timeframe) within the same process on
+                # transient failures. Restart-the-process if needed.
+                _FINANCIALS_ALL_CACHE[cache_key] = []
+                return []
+            results = payload.get("results") or []
+            _FINANCIALS_ALL_CACHE[cache_key] = results
+            return results
+
     def _fetch(
         self,
         symbol: str,
@@ -659,36 +862,22 @@ class PolygonFinancialsProvider:
         timeframe: str,
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Fetch and PIT-filter quarterly/ttm/annual statements.
+        """Return up to `limit` filings on/before `as_of_date`, PIT-correct.
 
         Polygon may return forward-looking placeholder records with
         `filing_date=None` (e.g. a future quarter pre-populated for
-        a fiscal year). The server-side `filing_date.lte` filter does
-        NOT exclude these. We must drop them client-side or risk
-        catastrophic look-ahead bias.
+        a fiscal year). We drop those client-side or risk catastrophic
+        look-ahead bias.
+
+        Reads from the module-level all-history cache (`_fetch_all`),
+        filtering and slicing client-side.
         """
         if not self.api_key:
             return []
-        params: dict[str, Any] = {
-            "ticker": symbol.upper(),
-            "filing_date.lte": as_of_date,
-            "timeframe": timeframe,
-            "limit": max(1, min(int(limit), 100)),
-            "sort": "period_of_report_date",
-            "order": "desc",
-            "apiKey": self.api_key,
-        }
-        try:
-            response = self.session.get(
-                self.BASE_URL, params=params, timeout=self.timeout
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception:
-            return []
-        raw = payload.get("results") or []
+        cap = max(1, min(int(limit), self._ALL_FETCH_LIMIT))
+        all_results = self._fetch_all(symbol, timeframe)
         filtered: list[dict[str, Any]] = []
-        for record in raw:
+        for record in all_results:
             filing_date = record.get("filing_date")
             if not filing_date:
                 continue
@@ -701,6 +890,8 @@ class PolygonFinancialsProvider:
                 # period whose final values weren't known.
                 continue
             filtered.append(record)
+            if len(filtered) >= cap:
+                break
         return filtered
 
     @staticmethod
@@ -736,39 +927,78 @@ class PolygonMarketStatusProvider:
 
 
 class SECFilingsProvider:
+    """Fetch SEC EDGAR submissions and pick the latest 10-Q/10-K/8-K
+    filing on/before ``as_of_date``.
+
+    SEC EDGAR requires a User-Agent that identifies the requester with a
+    contact email — anonymous defaults like ``Python-requests/2.x`` and
+    placeholder strings get blocked with HTTP 403 (``Request Rate
+    Threshold Exceeded``). EDGAR also rate-limits to ~10 requests per
+    second per IP. This provider:
+
+    * Builds a compliant User-Agent from ``SEC_USER_AGENT`` (preferred),
+      otherwise from ``SEC_CONTACT_EMAIL`` and ``SEC_CONTACT_NAME``.
+    * Throttles requests to ``MIN_REQUEST_INTERVAL`` between calls.
+    * Retries HTTP 429/5xx with exponential backoff.
+    * Raises ``SECFetchError`` on transient failures so callers can
+      avoid caching error responses.
+    """
+
+    SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+    TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+    RELEVANT_FORMS = {"10-Q", "10-K", "8-K"}
+    MIN_REQUEST_INTERVAL = 0.11  # ~9 req/s, under EDGAR's 10/s ceiling.
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_BASE = 0.5  # seconds; doubles each retry.
+
     def __init__(self, user_agent: str | None = None):
-        self.user_agent = user_agent or os.getenv(
-            "SEC_USER_AGENT",
-            "TradingAgentsResearch/0.1 (contact: local@localhost)",
-        )
+        self.user_agent = user_agent or self._default_user_agent()
         self.headers = {
             "User-Agent": self.user_agent,
             "Accept-Encoding": "gzip, deflate",
+            "Host": "data.sec.gov",
         }
+        # `Host` is overridden per-request because the ticker map lives
+        # on `www.sec.gov` while submissions live on `data.sec.gov`.
         self._ticker_to_cik: dict[str, str] | None = None
+        self._last_request_ts: float = 0.0
+        self._throttle_lock = threading.Lock()
+        self._logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _default_user_agent() -> str:
+        explicit = os.getenv("SEC_USER_AGENT", "").strip()
+        if explicit:
+            return explicit
+        email = os.getenv("SEC_CONTACT_EMAIL", "").strip()
+        name = os.getenv("SEC_CONTACT_NAME", "TradingAgents Research").strip()
+        if email:
+            return f"{name} {email}"
+        # SEC EDGAR requires a contact email; without one the request
+        # gets blocked. Fall back to a generic-but-valid contact so the
+        # request shape is at least compliant. Users should set
+        # `SEC_USER_AGENT` (or `SEC_CONTACT_EMAIL`) to get reliable
+        # service.
+        return "TradingAgents Research contact@tradingagents.local"
 
     def get_latest_filing(
         self,
         symbol: str,
         as_of_date: str | None = None,
     ) -> dict[str, Any] | None:
+        """Return the most recent 10-Q/10-K/8-K filing on/before
+        ``as_of_date``, or ``None`` if the issuer has no such filing in
+        the recent submissions feed.
+
+        Raises ``SECFetchError`` for transient HTTP/parse failures so
+        the caller can avoid caching error responses.
+        """
+
         cik = self._get_cik(symbol)
         if not cik:
             return None
-        submissions_url = (
-            "https://data.sec.gov/submissions/"
-            f"CIK{int(cik):010d}.json"
-        )
-        try:
-            response = requests.get(
-                submissions_url,
-                headers=self.headers,
-                timeout=20,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception:
-            return None
+        submissions_url = self.SUBMISSIONS_URL.format(cik=int(cik))
+        payload = self._fetch_json(submissions_url, host="data.sec.gov")
         recent = payload.get("filings", {}).get("recent", {})
         forms = recent.get("form", []) or []
         accession_numbers = recent.get("accessionNumber", []) or []
@@ -777,7 +1007,7 @@ class SECFilingsProvider:
 
         for idx, form in enumerate(forms):
             f = str(form).upper()
-            if f not in {"10-Q", "10-K", "8-K"}:
+            if f not in self.RELEVANT_FORMS:
                 continue
             filed = filing_dates[idx] if idx < len(filing_dates) else None
             if as_of_date and filed and filed > as_of_date:
@@ -806,14 +1036,14 @@ class SECFilingsProvider:
     def _load_ticker_mapping(self) -> dict[str, str]:
         if self._ticker_to_cik is not None:
             return self._ticker_to_cik
-        url = "https://www.sec.gov/files/company_tickers.json"
         try:
-            response = requests.get(url, headers=self.headers, timeout=20)
-            response.raise_for_status()
-            payload = response.json()
-        except Exception:
-            self._ticker_to_cik = {}
-            return self._ticker_to_cik
+            payload = self._fetch_json(self.TICKER_MAP_URL, host="www.sec.gov")
+        except SECFetchError as exc:
+            # Ticker map can't be cached as empty on transient failure —
+            # that would poison every subsequent call. Re-raise so the
+            # caller decides whether to retry later.
+            self._logger.warning("SEC ticker map fetch failed: %s", exc)
+            raise
         mapping: dict[str, str] = {}
         for _, row in payload.items():
             ticker = str(row.get("ticker", "")).upper()
@@ -822,6 +1052,54 @@ class SECFilingsProvider:
                 mapping[ticker] = cik
         self._ticker_to_cik = mapping
         return mapping
+
+    def _throttle(self) -> None:
+        with self._throttle_lock:
+            now = time.monotonic()
+            wait = self.MIN_REQUEST_INTERVAL - (now - self._last_request_ts)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_ts = time.monotonic()
+
+    def _fetch_json(self, url: str, *, host: str) -> dict[str, Any]:
+        headers = dict(self.headers)
+        headers["Host"] = host
+        last_exc: Exception | None = None
+        for attempt in range(self.MAX_RETRIES):
+            self._throttle()
+            try:
+                response = requests.get(url, headers=headers, timeout=20)
+            except requests.RequestException as exc:
+                last_exc = exc
+                self._sleep_backoff(attempt)
+                continue
+            status = response.status_code
+            if status == 200:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    raise SECFetchError(
+                        f"SEC {url} returned non-JSON body (status 200)"
+                    ) from exc
+            if status == 429 or 500 <= status < 600:
+                last_exc = SECFetchError(
+                    f"SEC {url} returned HTTP {status} (attempt "
+                    f"{attempt + 1}/{self.MAX_RETRIES})"
+                )
+                self._sleep_backoff(attempt)
+                continue
+            # 4xx other than 429 (403 forbidden, 404 not found) — no
+            # point retrying with the same UA.
+            raise SECFetchError(
+                f"SEC {url} returned HTTP {status} (non-retryable)"
+            )
+        raise SECFetchError(
+            f"SEC fetch exhausted retries for {url}: {last_exc}"
+        ) from last_exc
+
+    def _sleep_backoff(self, attempt: int) -> None:
+        delay = self.RETRY_BACKOFF_BASE * (2**attempt)
+        time.sleep(delay)
 
 
 def _fallback_market_open() -> bool:

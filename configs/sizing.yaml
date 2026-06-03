@@ -27,6 +27,14 @@ composite_threshold: 0.15         # matches scoring.py direction_for_composite d
 pre_earnings_trim_days: 3
 pre_earnings_size_factor: 0.5
 
+# TradingAgents review gate. Disabled by default so review attachment can
+# ship before enforcement. When enabled, sizing and tickets consume
+# key_features.tradingagents_review.gate from each analysis report.
+enable_tradingagents_review_gate: false
+tradingagents_review_apply_to_sizing: true
+tradingagents_review_apply_to_tickets: true
+tradingagents_review_top_screener_n: 5
+
 # Portfolio-level risk caps (Section 26). Applied after sector/beta math
 # in daily_signals.py via portfolio/risk.py::apply_all_risk_caps. The
 # trimmed weight becomes uninvested (cash), not redistributed.

@@ -11,6 +11,7 @@ from .pipeline import AnalysisOnlyMVP
 from .providers import (
     PolygonMarketStatusProvider,
     PolygonNewsProvider,
+    SECFetchError,
     SECFilingsProvider,
     YFinanceNewsProvider,
 )
@@ -201,7 +202,12 @@ class AnalysisRuntime:
             if new_ids:
                 due.append(symbol)
                 continue
-            latest_filing = self.filings_provider.get_latest_filing(symbol)
+            try:
+                latest_filing = self.filings_provider.get_latest_filing(symbol)
+            except SECFetchError:
+                # Transient SEC fetch failure — skip the filings gate for
+                # this symbol; news/price gates still applied above.
+                continue
             latest_accession = (
                 str(latest_filing.get("accession"))
                 if latest_filing and latest_filing.get("accession")
@@ -248,7 +254,10 @@ class AnalysisRuntime:
             if len(new_ids) >= self.config.runtime.llm_gate_min_new_headlines:
                 reasons.append("new_headlines")
 
-            latest_filing = self.filings_provider.get_latest_filing(symbol)
+            try:
+                latest_filing = self.filings_provider.get_latest_filing(symbol)
+            except SECFetchError:
+                latest_filing = None
             latest_accession = (
                 str(latest_filing.get("accession"))
                 if latest_filing and latest_filing.get("accession")

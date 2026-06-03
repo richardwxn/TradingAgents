@@ -72,12 +72,15 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     "intraday_breakout_signal": 0.00,
     "filings_recency_signal": 0.00,
     "options_net_flow": 0.05,
-    # IV-derived factors (added in Section 18). Two of three stay at 0:
-    # `options_iv_skew` had ~zero IC across horizons; `options_iv_term_structure`
-    # showed regime-dependent sign (+0.05 at 20d, -0.12 at 60d with 82%
-    # per-ticker consistency on the 60d inversion) — too horizon-dependent
-    # to commit either direction without more data.
-    "options_iv_term_structure": 0.00,
+    # IV-derived factors (added in Section 18). v1.5 (Section 27) commits
+    # options_iv_term_structure with sign INVERTED and weight 0.04 after the
+    # post-regen IC analysis (4863 obs): core 60d IC -0.109 / 80% sign-cons,
+    # canary 60d IC -0.105 — cohorts agree, factor is UNIVERSAL not
+    # tech-specific. The sign flip and weight bump are in lockstep (see
+    # `score_iv_term_structure`); the score function emits negative for
+    # contango and positive for backwardation now, so the weight stays
+    # positive. options_iv_skew remains at 0 — never crossed the noise floor.
+    "options_iv_term_structure": 0.04,
     "options_iv_skew": 0.00,
     # v1.3 (Section 21): promoted from 0.00 to 0.04 after Phase 1 IC
     # validated the placeholder sign: low IV rank → bullish forward
@@ -88,14 +91,64 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 }
 
 
+# Universal factors — sign-agrees across the 24-tech core cohort and the
+# 6-name cross-sector canary cohort in `backtest/results/phase2_cohort/`
+# (handoff.md Section 22). These are the factors safe to score with
+# their as-signed weights on a non-tech ticker. The screener's
+# `--cohort-aware` mode uses this set when scoring non-tech sectors so
+# the composite doesn't bake in tech-specific factor calibration.
+#
+# Membership rule (handoff Section 22 cohort table + the plan Unit 4):
+#   1. Sign-agrees across core/canary at 20d AND 60d in the cohort IC
+#      analysis: market_vix_regime, peer_relative_valuation,
+#      options_iv_term_structure, momentum_rsi.
+#   2. Always-mechanical-direction factors that aren't sector-conditional
+#      (trend / valuation crossovers are mechanical, not sector-fitted):
+#      trend_price_vs_sma20, trend_sma20_vs_sma50,
+#      valuation_forward_vs_trailing_pe.
+# Every name MUST be a key in `DEFAULT_FACTOR_WEIGHTS` — verified by
+# `test_universal_factor_names_subset_of_default_weights`. Unit-1 corpus
+# regen may shift the (1) list at 20d/60d; re-verify against
+# `backtest/results/phase2_v1_4_cohort/cohort_20d.md` post-Unit-1.
+# TODO(unit5): re-verify against post-Unit-1 cohort IC.
+UNIVERSAL_FACTOR_NAMES: frozenset[str] = frozenset({
+    # Cohort sign-agreed (Section 22):
+    "market_vix_regime",
+    "peer_relative_valuation",
+    "options_iv_term_structure",
+    "momentum_rsi",
+    # Mechanical-direction (not sector-fitted):
+    "trend_price_vs_sma20",
+    "trend_sma20_vs_sma50",
+    "valuation_forward_vs_trailing_pe",
+})
+
+
 def resolve_factor_weights(
     overrides: dict[str, float] | None = None,
+    *,
+    cohort: str | None = None,
 ) -> dict[str, float]:
-    """Merge user overrides on top of defaults and renormalize to sum=1."""
+    """Merge user overrides on top of defaults and renormalize to sum=1.
+
+    `cohort`:
+    - ``None`` / ``"tech"`` (default): no behavior change — every factor
+      keeps its weight from `DEFAULT_FACTOR_WEIGHTS` (modulo overrides).
+    - ``"non_tech"``: zero out every factor whose name is NOT in
+      `UNIVERSAL_FACTOR_NAMES`, then renormalize the surviving weights
+      so they sum to 1. Used by the screener's `--cohort-aware` mode
+      to score non-tech sectors with only the cross-sector-validated
+      factor set (handoff.md Section 22).
+    """
     weights = dict(DEFAULT_FACTOR_WEIGHTS)
     for key, value in (overrides or {}).items():
         if key in weights and value is not None and value >= 0:
             weights[key] = float(value)
+    if cohort == "non_tech":
+        weights = {
+            key: (value if key in UNIVERSAL_FACTOR_NAMES else 0.0)
+            for key, value in weights.items()
+        }
     total = sum(weights.values())
     if total <= 0:
         return weights
@@ -202,22 +255,35 @@ def score_iv_term_structure(
 ) -> tuple[float, str, bool]:
     """Score the 30→60d ATM IV term-structure slope.
 
-    Contango (positive slope) is the normal calm-regime shape. Backwardation
-    (front IV > back IV) signals stress and historically aligns with risk-off
-    moves. Returned score is placeholder-signed (positive when contango,
-    negative when backwardated) at low magnitude; IC analysis on a regenerated
-    corpus should confirm or invert the sign.
+    **v1.5 (Section 27): sign inverted from placeholder, weight bumped 0.00 → 0.04.**
+
+    Phase 2 post-regen IC analysis (Section 27, n=4863 obs) shows:
+      - Core 60d IC = -0.109, 80% sign-consistency across 25 tech tickers.
+      - Canary 60d IC = -0.105 → sign-AGREES across cohorts at 60d
+        (this factor is UNIVERSAL, not tech-specific).
+      - Core 20d IC = +0.025 (weak positive, near noise floor).
+      - Core 5d IC ≈ +0.04.
+
+    The original placeholder treated contango as bullish (positive score)
+    and backwardation as bearish. The 60d/cohort-agree evidence inverts
+    that: contango (high IV slope) → low forward returns; backwardation
+    → high forward returns. Probable economic story: contango is the
+    market pricing complacency that mean-reverts; backwardation marks
+    short-term stress that resolves higher.
+
+    Trade-off: small 20d/5d regression (sign was already near-zero there);
+    clear 60d lift. 60d is the calibration anchor per Section 13.
     """
     if slope is None:
         return 0.0, "IV term-structure slope unavailable.", False
     if slope > 0.05:
-        return 0.5, "Steep IV contango — calm vol regime.", True
+        return -0.5, "Steep IV contango — complacency signal (v1.5 inverted).", True
     if slope > 0.02:
-        return 0.25, "Mild IV contango.", True
+        return -0.25, "Mild IV contango — mildly bearish (v1.5 inverted).", True
     if slope < -0.05:
-        return -1.0, "Deep IV backwardation — stress signal.", True
+        return 1.0, "Deep IV backwardation — short-term stress, mean-reversion setup (v1.5 inverted).", True
     if slope < -0.02:
-        return -0.5, "Mild IV backwardation.", True
+        return 0.5, "Mild IV backwardation — bullish reversion bias (v1.5 inverted).", True
     return 0.0, "IV term structure roughly flat.", True
 
 

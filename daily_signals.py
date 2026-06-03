@@ -41,6 +41,7 @@ from portfolio.signals import (
     format_option_positions_section,
     load_latest_signals,
 )
+from portfolio.snapshot import load_positions_payload
 from portfolio.options import (
     book_greeks,
     enrich_with_chain,
@@ -69,14 +70,8 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_positions(path: Path) -> tuple[float, dict[str, Position]]:
     payload = json.loads(path.read_text())
-    cash = float(payload.get("cash") or 0.0)
-    positions: dict[str, Position] = {}
-    for sym, raw in (payload.get("positions") or {}).items():
-        positions[sym.upper()] = Position(
-            shares=float(raw.get("shares") or 0),
-            avg_cost=float(raw.get("avg_cost") or 0.0),
-        )
-    return cash, positions
+    loaded = load_positions_payload(payload)
+    return loaded.cash, loaded.positions
 
 
 def _load_sizing_config(path: Path) -> SizingConfig:

@@ -404,3 +404,77 @@ def test_earnings_adjustment_no_signal_data_no_change():
         config=cfg, cash=10_000.0, as_of=date(2026, 5, 24),
     )
     assert actions[0].target_weight == pytest.approx(0.10, abs=1e-4)
+
+
+# ---------- TradingAgents review gate ----------
+
+
+def test_review_gate_multiplier_reduces_target_weight_when_enabled():
+    cfg = SizingConfig(
+        max_per_name=0.10,
+        max_long_exposure=0.50,
+        min_position_weight=0.001,
+        enable_tradingagents_review_gate=True,
+        tradingagents_review_apply_to_sizing=True,
+    )
+    sig = Signal(
+        "NVDA", "2026-05-22", "bullish", 0.5, 0.7, "x",
+        tradingagents_review_gate={
+            "status": "ok",
+            "risk_veto": False,
+            "sizing_multiplier": 0.5,
+            "ticket_gate": "manual_review",
+            "reason": "Needs human confirmation.",
+            "execution_caveats": ["Two medium risk critiques."],
+        },
+    )
+    actions, summary = compute_actions(
+        signals={"NVDA": sig},
+        positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg,
+        cash=10_000.0,
+        as_of=date(2026, 5, 24),
+    )
+    a = actions[0]
+    assert a.target_weight == pytest.approx(0.05)
+    assert a.review_gate_status == "manual_review"
+    assert a.review_execution_caveats == ["Two medium risk critiques."]
+    assert summary["n_review_gate_adjusted"] == 1
+
+
+def test_review_gate_veto_blocks_buy_but_not_trim_or_exit_intent():
+    cfg = SizingConfig(
+        max_per_name=0.10,
+        max_long_exposure=0.50,
+        min_position_weight=0.001,
+        enable_tradingagents_review_gate=True,
+    )
+    gate = {
+        "status": "ok",
+        "risk_veto": True,
+        "sizing_multiplier": 0.0,
+        "ticket_gate": "block_buy_add",
+        "reason": "Risk process is bearish.",
+    }
+    # New position is reduced to zero and therefore skipped.
+    new_actions, _ = compute_actions(
+        signals={"NVDA": Signal("NVDA", "2026-05-22", "bullish", 0.5, 0.7, "x", tradingagents_review_gate=gate)},
+        positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg,
+        cash=10_000.0,
+        as_of=date(2026, 5, 24),
+    )
+    assert new_actions[0].action == "SKIP"
+
+    # Existing long exposure is still allowed to reduce toward zero.
+    trim_actions, _ = compute_actions(
+        signals={"NVDA": Signal("NVDA", "2026-05-22", "bullish", 0.5, 0.7, "x", tradingagents_review_gate=gate)},
+        positions={"NVDA": Position(shares=10, avg_cost=150.0)},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg,
+        cash=10_000.0,
+        as_of=date(2026, 5, 24),
+    )
+    assert trim_actions[0].action in {"TRIM", "EXIT"}

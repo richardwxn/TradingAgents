@@ -24,6 +24,14 @@ from portfolio.signals import (
     load_latest_signals,
 )
 from portfolio.sizing import SizingConfig, compute_target_weights, sizing_config_from_dict
+from portfolio.execution import (
+    ExecutionBatch,
+    ExecutionTicket,
+    build_execution_batch,
+    execution_config_from_dict,
+    ticket_from_action,
+)
+from portfolio.snapshot import load_positions_payload
 from tradingagents.analysis_only import AnalysisOnlyMVP, render_markdown
 from tradingagents.analysis_only.cache import load_report_if_cache_hit, report_file
 from tradingagents.analysis_only.pipeline import AnalysisReport
@@ -37,7 +45,12 @@ DEFAULT_DATA_PROVIDER = "polygon"
 DEFAULT_PORTFOLIO_PATH = "configs/portfolio_snapshot.json"
 DEFAULT_REPORTS_GLOB = "reports/analysis_mvp/*.json"
 DEFAULT_POSITIONS_PATH = "portfolio/positions.json"
+DEFAULT_ROBINHOOD_SNAPSHOT_PATH = "configs/robinhood_snapshot.json"
 DEFAULT_SIZING_CONFIG = "configs/sizing.yaml"
+DEFAULT_EXECUTION_CONFIG = "configs/execution.yaml"
+DEFAULT_TRADE_TICKETS_DIR = "reports/trade_tickets"
+DEFAULT_TRADE_WORKFLOW_DIR = "reports/trade_workflow"
+DEFAULT_MAX_READY_BUY_TICKETS = 1
 FORECAST_PRESETS: dict[str, dict[str, int]] = {
     "short_term_1_2_weeks": {"2d": 2, "1w": 5, "2w": 10, "1m": 21},
     "swing_1_4_weeks": {"1w": 5, "2w": 10, "1m": 21, "3m": 63},
@@ -142,6 +155,36 @@ def make_handler(output_dir: str):
                 try:
                     payload = self._read_json()
                     response = _run_best_buy(payload, output_dir=output_dir)
+                    self._send_json(response)
+                except Exception as exc:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(limit=8),
+                        },
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                return
+            if self.path == "/api/trade-tickets":
+                try:
+                    payload = self._read_json()
+                    response = _run_trade_tickets(payload)
+                    self._send_json(response)
+                except Exception as exc:
+                    self._send_json(
+                        {
+                            "ok": False,
+                            "error": str(exc),
+                            "traceback": traceback.format_exc(limit=8),
+                        },
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                return
+            if self.path == "/api/robinhood-sync-request":
+                try:
+                    payload = self._read_json()
+                    response = _run_robinhood_sync_request(payload)
                     self._send_json(response)
                 except Exception as exc:
                     self._send_json(
@@ -429,12 +472,41 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
         as_of=as_of,
     )
     by_symbol = {a.symbol: a for a in actions}
+    execution_config = _load_execution_config(Path(DEFAULT_EXECUTION_CONFIG))
+    ticket_by_symbol = {
+        action.symbol: ticket
+        for action in actions
+        if (
+            ticket := ticket_from_action(
+                action,
+                as_of=as_of.isoformat(),
+                config=execution_config,
+            )
+        )
+        is not None
+    }
+    rank_target_weights = compute_target_weights(
+        _sizing_input_from_signals(signals, config=config, as_of=as_of),
+        config=replace(config, stale_signal_decay=1.0),
+    )
     candidates = [
-        _rank_candidate(sym, signals.get(sym), by_symbol.get(sym), reports_by_symbol.get(sym), config)
+        _rank_candidate(
+            sym,
+            signals.get(sym),
+            by_symbol.get(sym),
+            reports_by_symbol.get(sym),
+            config,
+            rank_target_weights.get(sym),
+            ticket_by_symbol.get(sym),
+        )
         for sym in symbols
     ]
     candidates = [c for c in candidates if c is not None]
     candidates.sort(key=lambda c: c["rank_score"], reverse=True)
+    _apply_best_buy_ticket_alignment_to_candidates(
+        candidates,
+        max_ready_buy_tickets=DEFAULT_MAX_READY_BUY_TICKETS,
+    )
     best = candidates[0] if candidates else None
     _update_best_buy_status(
         job_id,
@@ -453,11 +525,564 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
         "candidates": candidates,
         "generated_reports": generated_reports,
         "summary": summary,
+        "positions_source": _positions_source_summary(
+            Path(str(payload.get("positions_path") or DEFAULT_POSITIONS_PATH))
+        ),
         "notes": [
             "Ranking uses the latest cached report on or before the as-of date.",
-            "Risk caps that need live beta/correlation are not applied in this quick picker.",
+            "Ticket status uses the same execution filters as Trade Tickets, but portfolio risk caps that need live beta/correlation are not applied in this quick picker.",
         ],
     }
+
+
+def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
+    as_of_raw = str(payload.get("date") or datetime.now().strftime("%Y-%m-%d"))
+    as_of = datetime.strptime(as_of_raw, "%Y-%m-%d").date()
+    reports_glob = str(payload.get("reports_glob") or DEFAULT_REPORTS_GLOB)
+    positions_path = Path(str(payload.get("positions_path") or DEFAULT_POSITIONS_PATH))
+    sizing_path = Path(str(payload.get("sizing_config") or DEFAULT_SIZING_CONFIG))
+    execution_path = Path(str(payload.get("execution_config") or DEFAULT_EXECUTION_CONFIG))
+    tickets_dir = Path(str(payload.get("tickets_dir") or DEFAULT_TRADE_TICKETS_DIR))
+    workflow_dir = Path(str(payload.get("workflow_dir") or DEFAULT_TRADE_WORKFLOW_DIR))
+    account_hint = str(payload.get("account_hint") or "").strip() or None
+    fetch_current_prices = bool(payload.get("fetch_current_prices", False))
+    run_missing_reports = bool(payload.get("run_missing_reports", False))
+    refresh_stale_reports = bool(payload.get("refresh_stale_reports", False))
+
+    cash, positions = _load_positions(positions_path)
+    positions_source = _positions_source_summary(positions_path)
+    config = _load_sizing_config(sizing_path, [])
+    execution_config = _load_execution_config(execution_path)
+    universe = list(config.universe) or sorted(positions.keys()) or _default_watchlist()
+    if not universe:
+        raise ValueError("No universe configured and no positions held; nothing to ticket.")
+    if not config.universe:
+        config = replace(config, universe=tuple(universe))
+
+    report_paths = [Path(p) for p in glob.glob(reports_glob)]
+    signals = load_latest_signals(report_paths, universe=universe, as_of=as_of)
+    missing_symbols = [sym for sym, sig in signals.items() if sig is None]
+    generated_reports: list[dict[str, Any]] = []
+    if run_missing_reports or refresh_stale_reports:
+        symbols_to_generate: list[tuple[str, str]] = []
+        if run_missing_reports:
+            symbols_to_generate.extend((sym, "missing") for sym in missing_symbols)
+        if refresh_stale_reports:
+            queued = {sym for sym, _reason in symbols_to_generate}
+            symbols_to_generate.extend(
+                (sym, "stale")
+                for sym in _stale_signal_symbols(
+                    signals,
+                    as_of=as_of,
+                    max_age_days=execution_config.max_signal_age_days,
+                )
+                if sym not in queued
+            )
+        report_output_dir = str(
+            payload.get("report_output_dir")
+            or _output_dir_from_reports_glob(reports_glob)
+            or DEFAULT_OUTPUT_DIR
+        )
+        for sym, reason in symbols_to_generate:
+            analysis_payload = _best_buy_analysis_payload(payload, sym, as_of_raw)
+            analysis_payload["force_refresh"] = reason == "stale"
+            result = _run_analysis(analysis_payload, output_dir=report_output_dir)
+            generated_reports.append(
+                {
+                    "symbol": sym,
+                    "reason": reason,
+                    "json_path": result.get("json_path"),
+                    "cache_hit": result.get("cache_hit", False),
+                }
+            )
+        if symbols_to_generate:
+            report_paths = [Path(p) for p in glob.glob(reports_glob)]
+            signals = load_latest_signals(report_paths, universe=universe, as_of=as_of)
+            missing_symbols = [sym for sym, sig in signals.items() if sig is None]
+    _apply_sector_fallback(signals)
+    reports_by_symbol = _load_signal_reports(signals)
+    prices = _price_contexts_for_rank(
+        signals,
+        reports_by_symbol,
+        fetch_current_prices=fetch_current_prices,
+    )
+    for sym in positions:
+        if sym not in prices:
+            prices[sym] = PriceContext(None, None, None)
+
+    risk_limits, beta_map, corr_matrix = _risk_context_for_trade_tickets(
+        sizing_path=sizing_path,
+        universe=universe,
+        fetch_current_prices=fetch_current_prices,
+    )
+    actions, action_summary = compute_actions(
+        signals=signals,
+        positions=positions,
+        prices=prices,
+        config=config,
+        cash=cash,
+        as_of=as_of,
+        risk_limits=risk_limits,
+        beta_map=beta_map,
+        correlation_matrix=corr_matrix,
+    )
+    rank_target_weights = compute_target_weights(
+        _sizing_input_from_signals(signals, config=config, as_of=as_of),
+        config=replace(config, stale_signal_decay=1.0),
+    )
+    by_symbol = {a.symbol: a for a in actions}
+    candidates = [
+        _rank_candidate(
+            sym,
+            signals.get(sym),
+            by_symbol.get(sym),
+            reports_by_symbol.get(sym),
+            config,
+            rank_target_weights.get(sym),
+        )
+        for sym in universe
+    ]
+    candidates = [c for c in candidates if c is not None]
+    candidates.sort(key=lambda c: c["rank_score"], reverse=True)
+    batch = build_execution_batch(
+        actions=actions,
+        as_of=as_of.isoformat(),
+        config=execution_config,
+        source_daily_signals_path=None,
+        account_hint=account_hint,
+        option_strategy_reports=list(reports_by_symbol.values()),
+    )
+    batch = _align_batch_to_best_buy(
+        batch,
+        candidates=candidates,
+        max_ready_buy_tickets=DEFAULT_MAX_READY_BUY_TICKETS,
+    )
+
+    tickets_dir.mkdir(parents=True, exist_ok=True)
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    ticket_json_path = tickets_dir / f"{as_of.isoformat()}.json"
+    ticket_md_path = tickets_dir / f"{as_of.isoformat()}.md"
+    review_prompt_path = workflow_dir / f"{as_of.isoformat()}_codex_review.md"
+    fills_template_path = workflow_dir / f"{as_of.isoformat()}_fills_template.json"
+    ticket_json_path.write_text(json.dumps(batch.to_dict(), indent=2, default=str))
+    ticket_md = _format_trade_ticket_markdown(batch)
+    ticket_md_path.write_text(ticket_md)
+    review_prompt = _format_codex_review_prompt(
+        ticket_path=ticket_json_path,
+        fills_template_path=fills_template_path,
+        account_hint=account_hint,
+    )
+    review_prompt_path.write_text(review_prompt)
+    fills_template = _fills_template(batch)
+    fills_template_path.write_text(json.dumps(fills_template, indent=2))
+
+    return {
+        "ok": True,
+        "as_of": as_of.isoformat(),
+        "reports_glob": reports_glob,
+        "report_coverage": {
+            "report_files_found": len(report_paths),
+            "universe_count": len(universe),
+            "resolved_count": len(universe) - len(missing_symbols),
+            "missing_count": len(missing_symbols),
+            "missing_symbols": missing_symbols,
+            "stale_count": sum(
+                1
+                for row in _report_age_rows(
+                    signals,
+                    universe=universe,
+                    as_of=as_of,
+                    max_age_days=execution_config.max_signal_age_days,
+                )
+                if row["status"] == "stale"
+            ),
+            "max_age_days": execution_config.max_signal_age_days,
+            "report_age_rows": _report_age_rows(
+                signals,
+                universe=universe,
+                as_of=as_of,
+                max_age_days=execution_config.max_signal_age_days,
+            ),
+        },
+        "positions_source": positions_source,
+        "generated_reports": generated_reports,
+        "paths": {
+            "ticket_json": str(ticket_json_path.resolve()),
+            "ticket_markdown": str(ticket_md_path.resolve()),
+            "codex_review": str(review_prompt_path.resolve()),
+            "fills_template": str(fills_template_path.resolve()),
+        },
+        "batch": batch.to_dict(),
+        "best_buy_alignment": {
+            "enabled": True,
+            "max_ready_buy_tickets": DEFAULT_MAX_READY_BUY_TICKETS,
+            "ranked_symbols": [c["symbol"] for c in candidates],
+            "ready_buy_symbols": [
+                t.symbol for t in batch.tickets if t.source_action in {"BUY", "ADD"}
+            ],
+        },
+        "action_summary": action_summary,
+        "ticket_markdown": ticket_md,
+        "codex_review": review_prompt,
+        "fills_template": fills_template,
+        "notes": [
+            "The UI generated broker-gated tickets only.",
+            "Robinhood review and placement still happen through Codex MCP with explicit confirmation.",
+            *(
+                [f"Missing analysis reports for: {', '.join(missing_symbols)}"]
+                if missing_symbols
+                else []
+            ),
+            *(
+                [
+                    f"Stale analysis reports remain for: {', '.join(row['symbol'] for row in _report_age_rows(signals, universe=universe, as_of=as_of, max_age_days=execution_config.max_signal_age_days) if row['status'] == 'stale')}"
+                ]
+                if any(
+                    row["status"] == "stale"
+                    for row in _report_age_rows(
+                        signals,
+                        universe=universe,
+                        as_of=as_of,
+                        max_age_days=execution_config.max_signal_age_days,
+                    )
+                )
+                else []
+            ),
+        ],
+    }
+
+
+def _run_robinhood_sync_request(payload: dict[str, Any]) -> dict[str, Any]:
+    workflow_dir = Path(str(payload.get("workflow_dir") or DEFAULT_TRADE_WORKFLOW_DIR))
+    output_path = Path(str(payload.get("output_path") or DEFAULT_ROBINHOOD_SNAPSHOT_PATH))
+    account_hint = str(payload.get("account_hint") or "").strip() or None
+    request_date = datetime.now().strftime("%Y-%m-%d")
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = workflow_dir / f"{request_date}_robinhood_sync.md"
+    prompt = _format_robinhood_sync_prompt(
+        output_path=output_path,
+        account_hint=account_hint,
+    )
+    prompt_path.write_text(prompt)
+    current_snapshot = _positions_source_summary(output_path)
+    return {
+        "ok": True,
+        "prompt_path": str(prompt_path.resolve()),
+        "output_path": str(output_path),
+        "codex_prompt": prompt,
+        "current_snapshot": current_snapshot,
+        "notes": [
+            "This only creates a Codex handoff request.",
+            "The UI does not call Robinhood MCP directly.",
+        ],
+    }
+
+
+def _align_batch_to_best_buy(
+    batch: ExecutionBatch,
+    *,
+    candidates: list[dict[str, Any]],
+    max_ready_buy_tickets: int,
+) -> ExecutionBatch:
+    """Gate BUY/ADD tickets through the Best Buy ranking lens.
+
+    Rebalance/risk actions (TRIM/EXIT) remain ready when otherwise valid.
+    New buy/add proposals are limited to the top-ranked candidate symbols so
+    the execution-prep view does not spray tiny orders across every bullish
+    name.
+    """
+    if max_ready_buy_tickets <= 0:
+        return batch
+
+    buy_actions = {"BUY", "ADD"}
+    rank_by_symbol = {
+        str(candidate.get("symbol") or "").upper(): idx + 1
+        for idx, candidate in enumerate(candidates)
+        if candidate.get("symbol")
+    }
+    ready_buy_symbols = {
+        ticket.symbol
+        for ticket in batch.tickets
+        if ticket.source_action in buy_actions
+    }
+    selected_buy_symbols = [
+        str(candidate.get("symbol") or "").upper()
+        for candidate in candidates
+        if str(candidate.get("symbol") or "").upper() in ready_buy_symbols
+    ][:max_ready_buy_tickets]
+    selected = set(selected_buy_symbols)
+
+    ready: list[ExecutionTicket] = []
+    blocked: list[ExecutionTicket] = list(batch.blocked_tickets)
+    for ticket in batch.tickets:
+        if ticket.source_action not in buy_actions or ticket.symbol in selected:
+            ready.append(ticket)
+            continue
+        rank = rank_by_symbol.get(ticket.symbol)
+        reason = (
+            "Not selected by Best Buy alignment among executable buy candidates"
+            + (f" (rank #{rank}; top {max_ready_buy_tickets} buy ticket allowed)." if rank else ".")
+        )
+        blocked.append(
+            replace(
+                ticket,
+                status="blocked",
+                blocked_reason=reason,
+                risk_notes=[
+                    *ticket.risk_notes,
+                    "Best Buy alignment gates ready BUY/ADD tickets to the top-ranked candidate(s).",
+                ],
+            )
+        )
+
+    summary = dict(batch.summary)
+    summary.update(
+        {
+            "ready_count": len(ready),
+            "blocked_count": len(blocked),
+            "equity_ready_count": sum(1 for t in ready if t.asset_type == "equity"),
+            "option_intent_count": sum(1 for t in blocked if t.asset_type == "option_intent"),
+            "requires_robinhood_mcp": bool(ready),
+            "best_buy_alignment_enabled": True,
+            "max_ready_buy_tickets": max_ready_buy_tickets,
+        }
+    )
+    return replace(batch, tickets=ready, blocked_tickets=blocked, summary=summary)
+
+
+def _apply_best_buy_ticket_alignment_to_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    max_ready_buy_tickets: int,
+) -> None:
+    buy_actions = {"BUY", "ADD"}
+    selected_symbols = [
+        str(candidate.get("symbol") or "").upper()
+        for candidate in candidates
+        if str(candidate.get("action") or "").upper() in buy_actions
+        and candidate.get("ticket_status") == "ready"
+    ][:max_ready_buy_tickets]
+    selected = set(selected_symbols)
+    for idx, candidate in enumerate(candidates, start=1):
+        symbol = str(candidate.get("symbol") or "").upper()
+        if (
+            str(candidate.get("action") or "").upper() in buy_actions
+            and candidate.get("ticket_status") == "ready"
+            and symbol not in selected
+        ):
+            candidate["ticket_status"] = "blocked"
+            candidate["ticket_reason"] = (
+                f"Not selected by Best Buy alignment among executable buy candidates (rank #{idx}; "
+                f"top {max_ready_buy_tickets} buy ticket allowed)."
+            )
+
+
+def _format_robinhood_sync_prompt(
+    *,
+    output_path: Path,
+    account_hint: str | None,
+) -> str:
+    account_text = (
+        f"Use Robinhood account {account_hint}."
+        if account_hint
+        else "Call `rh.get_accounts`; if there is more than one eligible account, ask me which one to use."
+    )
+    return "\n".join(
+        [
+            "# Codex Robinhood Snapshot Sync Request",
+            "",
+            account_text,
+            "",
+            "Read-only workflow:",
+            "",
+            "1. Call `rh.get_accounts` and select an `agentic_allowed=true` account.",
+            "2. Call `rh.get_portfolio(account_number)`.",
+            "3. Call `rh.get_equity_positions(account_number)`.",
+            f"4. Write a normalized local snapshot to `{output_path}`.",
+            "5. Do not review, place, or cancel any orders.",
+            "",
+            "The snapshot should follow this shape:",
+            "",
+            "```json",
+            "{",
+            '  "as_of": "YYYY-MM-DD",',
+            '  "source": "robinhood_mcp_read_only",',
+            '  "account_number_masked": "****1234",',
+            '  "account": {"total_equity": 0, "cash": 0, "buying_power": 0},',
+            '  "positions": [{"symbol": "NVDA", "shares": 1, "price": 100, "average_cost": 90, "equity": 100}]',
+            "}",
+            "```",
+            "",
+        ]
+    )
+
+
+def _load_execution_config(path: Path):
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        data = {}
+    return execution_config_from_dict(data)
+
+
+def _apply_sector_fallback(signals: dict[str, Any]) -> None:
+    try:
+        from daily_signals import _load_sector_map
+        sector_map = _load_sector_map()
+    except Exception:
+        sector_map = {}
+    if not sector_map:
+        return
+    for sym, sig in list(signals.items()):
+        if sig is None or sig.sector is not None:
+            continue
+        fallback = sector_map.get(sym.upper())
+        if fallback:
+            signals[sym] = replace(sig, sector=fallback)
+
+
+def _risk_context_for_trade_tickets(
+    *,
+    sizing_path: Path,
+    universe: list[str],
+    fetch_current_prices: bool,
+) -> tuple[Any, dict[str, float | None], dict[str, dict[str, float]]]:
+    try:
+        from daily_signals import _load_risk_limits
+        risk_limits = _load_risk_limits(sizing_path)
+    except Exception:
+        risk_limits = None
+    beta_map: dict[str, float | None] = {}
+    corr_matrix: dict[str, dict[str, float]] = {}
+    if risk_limits is not None and fetch_current_prices:
+        try:
+            from daily_signals import fetch_betas_and_correlations
+            beta_map, corr_matrix = fetch_betas_and_correlations(
+                universe,
+                benchmark="SPY",
+                lookback_days=90,
+            )
+        except Exception:
+            beta_map, corr_matrix = {}, {}
+    return risk_limits, beta_map, corr_matrix
+
+
+def _format_trade_ticket_markdown(batch) -> str:
+    lines = [
+        f"# Trade Tickets - {batch.as_of}",
+        "",
+        "These tickets are broker-gated. The UI does not call Robinhood or place orders.",
+        "",
+        "## Summary",
+        "",
+        f"- Ready equity tickets: {batch.summary.get('ready_count', 0)}",
+        f"- Blocked tickets: {batch.summary.get('blocked_count', 0)}",
+        f"- Option intent tickets: {batch.summary.get('option_intent_count', 0)}",
+        "- Execution policy: review with Robinhood MCP, then explicit confirmation before placement",
+        "",
+    ]
+    if batch.tickets:
+        lines.extend([
+            "## Ready For Robinhood Review",
+            "",
+            "| Ticket | Symbol | Side | Qty | Limit | TIF | Source |",
+            "|---|---|---|---:|---:|---|---|",
+        ])
+        for ticket in batch.tickets:
+            lines.append(
+                f"| `{ticket.ticket_id}` | {ticket.symbol} | {ticket.side} | "
+                f"{ticket.quantity} | {_fmt_money(ticket.limit_price)} | "
+                f"{ticket.time_in_force} | {ticket.source_action} |"
+            )
+        lines.append("")
+    else:
+        lines.extend(["## Ready For Robinhood Review", "", "_No ready tickets._", ""])
+
+    if batch.blocked_tickets:
+        lines.extend([
+            "## Blocked Or Intent Only",
+            "",
+            "| Ticket | Asset | Symbol | Side | Source | Reason |",
+            "|---|---|---|---|---|---|",
+        ])
+        for ticket in batch.blocked_tickets:
+            reason = (ticket.blocked_reason or "").replace("|", "\\|")
+            lines.append(
+                f"| `{ticket.ticket_id}` | {ticket.asset_type} | {ticket.symbol} | "
+                f"{ticket.side} | {ticket.source_action} | {reason} |"
+            )
+        lines.append("")
+
+    for ticket in [*batch.tickets, *batch.blocked_tickets]:
+        lines.append(f"### {ticket.ticket_id} - {ticket.symbol}")
+        lines.append(f"- Status: `{ticket.status}`")
+        lines.append(f"- Rationale: {ticket.rationale}")
+        for note in ticket.risk_notes:
+            lines.append(f"- Note: {note}")
+        if ticket.review_gate_status:
+            lines.append(f"- TradingAgents gate: `{ticket.review_gate_status}`")
+        if ticket.review_gate_reason:
+            lines.append(f"- Gate reason: {ticket.review_gate_reason}")
+        for caveat in ticket.review_execution_caveats:
+            lines.append(f"- Gate caveat: {caveat}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _format_codex_review_prompt(
+    *,
+    ticket_path: Path,
+    fills_template_path: Path,
+    account_hint: str | None,
+) -> str:
+    account_text = (
+        f"Use Robinhood account {account_hint}."
+        if account_hint
+        else "Call `rh.get_accounts`; if there are multiple accounts, ask me which one to use."
+    )
+    return "\n".join(
+        [
+            "# Codex Robinhood Review Request",
+            "",
+            f"Review ready equity tickets in `{ticket_path}`.",
+            account_text,
+            "",
+            "Do not place any order until I explicitly confirm.",
+            "",
+            "Workflow:",
+            "",
+            "1. Read the ticket batch JSON.",
+            "2. Use `rh.get_accounts` if the account is not already specified.",
+            "3. For each ready equity ticket, call `rh.get_portfolio`, `rh.get_equity_positions`, `rh.get_equity_quotes`, and `rh.get_equity_tradability`.",
+            "4. Call `rh.review_equity_order` for each ready ticket using the ticket's `time_in_force` exactly.",
+            "5. Present the review output, estimated cost/proceeds, and alerts.",
+            "6. Place only the orders I explicitly approve.",
+            f"7. Record placed/fill details into `{fills_template_path}` for `trade_reconcile.py`.",
+            "8. Run `trade_reconcile.py` after fills settle; only use `--apply-position-update` after reviewing the audit artifact.",
+            "",
+        ]
+    )
+
+
+def _fills_template(batch) -> dict[str, Any]:
+    return {
+        "orders": [
+            {
+                "ticket_id": ticket.ticket_id,
+                "order_id": "",
+                "symbol": ticket.symbol,
+                "side": ticket.side,
+                "filled_quantity": ticket.quantity or "",
+                "average_price": "",
+                "state": "",
+            }
+            for ticket in batch.tickets
+        ]
+    }
+
+
+def _fmt_money(value: float | None) -> str:
+    return "n/a" if value is None else f"${value:,.2f}"
 
 
 def _output_dir_from_reports_glob(reports_glob: str) -> str | None:
@@ -497,6 +1122,61 @@ def _stale_promising_symbols(
     return stale
 
 
+def _signal_age_days(sig: Any, as_of: Any) -> int | None:
+    if sig is None:
+        return None
+    try:
+        sig_date = datetime.strptime(sig.as_of_date, "%Y-%m-%d").date()
+    except Exception:
+        return None
+    return (as_of - sig_date).days
+
+
+def _stale_signal_symbols(
+    signals: dict[str, Any],
+    *,
+    as_of: Any,
+    max_age_days: int,
+) -> list[str]:
+    stale: list[str] = []
+    for sym, sig in signals.items():
+        age = _signal_age_days(sig, as_of)
+        if age is not None and age > max_age_days:
+            stale.append(sym)
+    return stale
+
+
+def _report_age_rows(
+    signals: dict[str, Any],
+    *,
+    universe: list[str] | tuple[str, ...],
+    as_of: Any,
+    max_age_days: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for sym in universe:
+        sig = signals.get(sym)
+        age = _signal_age_days(sig, as_of)
+        if sig is None:
+            status = "missing"
+        elif age is None:
+            status = "unknown"
+        elif age > max_age_days:
+            status = "stale"
+        else:
+            status = "fresh"
+        rows.append(
+            {
+                "symbol": sym,
+                "as_of_date": sig.as_of_date if sig is not None else None,
+                "age_days": age,
+                "status": status,
+                "source_path": sig.source_path if sig is not None else None,
+            }
+        )
+    return rows
+
+
 def _sizing_input_from_signals(
     signals: dict[str, Any],
     *,
@@ -505,13 +1185,7 @@ def _sizing_input_from_signals(
 ) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for sym, sig in signals.items():
-        age_days: int | None = None
-        if sig is not None:
-            try:
-                sig_date = datetime.strptime(sig.as_of_date, "%Y-%m-%d").date()
-                age_days = (as_of - sig_date).days
-            except Exception:
-                age_days = None
+        age_days = _signal_age_days(sig, as_of)
         if sig is None:
             out[sym] = {
                 "direction": "neutral",
@@ -617,14 +1291,33 @@ def _load_positions(path: Path) -> tuple[float, dict[str, Position]]:
         payload = json.loads(path.read_text())
     except Exception:
         return 0.0, {}
-    cash = float(payload.get("cash") or 0.0)
-    positions: dict[str, Position] = {}
-    for sym, raw in (payload.get("positions") or {}).items():
-        positions[str(sym).upper()] = Position(
-            shares=float(raw.get("shares") or 0.0),
-            avg_cost=float(raw.get("avg_cost") or 0.0),
-        )
-    return cash, positions
+    loaded = load_positions_payload(payload)
+    return loaded.cash, loaded.positions
+
+
+def _positions_source_summary(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "path": str(path),
+            "source_type": "unavailable",
+            "error": str(exc),
+            "cash": 0.0,
+            "position_count": 0,
+        }
+    loaded = load_positions_payload(payload)
+    account = loaded.metadata.get("account") or {}
+    return {
+        "path": str(path),
+        "source_type": loaded.metadata.get("source_type"),
+        "source": loaded.metadata.get("source"),
+        "as_of": loaded.metadata.get("as_of"),
+        "cash": loaded.cash,
+        "position_count": len(loaded.positions),
+        "total_equity": loaded.metadata.get("total_equity") or account.get("total_equity"),
+        "visible_positions_equity": loaded.metadata.get("visible_positions_equity"),
+    }
 
 
 def _load_signal_reports(signals: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -672,6 +1365,8 @@ def _rank_candidate(
     action: Any,
     report: dict[str, Any] | None,
     config: SizingConfig,
+    rank_target_weight: float | None = None,
+    ticket: Any = None,
 ) -> dict[str, Any] | None:
     if sig is None or action is None or not report:
         return {
@@ -698,15 +1393,20 @@ def _rank_candidate(
     composite = _safe_float(sig.composite) or 0.0
     confidence = _safe_float(sig.confidence) or 0.0
     conviction = max(0.0, composite) * max(0.0, confidence)
+    rank_target = (
+        float(rank_target_weight)
+        if rank_target_weight is not None
+        else float(action.target_weight)
+    )
     max_name = max(config.max_per_name, 0.01)
-    target_weight_component = min(1.0, max(0.0, action.target_weight / max_name))
+    target_weight_component = min(1.0, max(0.0, rank_target / max_name))
     composite_component = min(1.0, max(0.0, (composite + 0.15) / 0.65))
     upside_component = min(1.0, max(0.0, base_upside / 0.35))
     entry_component, entry_label = _entry_component(current_price, zone_high)
-    action_bonus = {"BUY": 0.08, "ADD": 0.04, "HOLD": -0.02, "SKIP": -0.16, "EXIT": -0.22}.get(action.action, -0.08)
-    stale_penalty = 0.0
-    if action.signal_age_days is not None and action.signal_age_days > config.stale_composite_days:
-        stale_penalty = min(0.25, (action.signal_age_days - config.stale_composite_days) * 0.015)
+    score_action = action.action
+    if rank_target > 0 and action.target_weight <= 0:
+        score_action = "ADD" if action.current_weight > 0 else "BUY"
+    action_bonus = {"BUY": 0.08, "ADD": 0.04, "HOLD": -0.02, "SKIP": -0.16, "EXIT": -0.22}.get(score_action, -0.08)
     score = (
         0.34 * target_weight_component
         + 0.28 * composite_component
@@ -714,14 +1414,15 @@ def _rank_candidate(
         + 0.12 * upside_component
         + 0.10 * entry_component
         + action_bonus
-        - stale_penalty
     )
     rank_score = round(max(0.0, min(100.0, score * 100.0)), 1)
     reason_bits = [
         f"{action.action} by sizing policy",
         f"composite {composite:+.3f}",
-        f"target {action.target_weight * 100:.1f}%",
+        f"rank target {rank_target * 100:.1f}%",
     ]
+    if abs(rank_target - action.target_weight) >= 0.0005:
+        reason_bits.append(f"effective target {action.target_weight * 100:.1f}%")
     if base_upside:
         reason_bits.append(f"base upside {base_upside * 100:.1f}%")
     reason_bits.append(entry_label)
@@ -735,6 +1436,7 @@ def _rank_candidate(
         "conviction": conviction,
         "as_of_date": sig.as_of_date,
         "signal_age_days": action.signal_age_days,
+        "rank_target_weight": rank_target,
         "target_weight": action.target_weight,
         "current_weight": action.current_weight,
         "delta_pp": action.delta_pp,
@@ -751,6 +1453,20 @@ def _rank_candidate(
         "source_path": sig.source_path,
         "markdown_url": f"/report?fmt=md&path={sig.source_path}",
         "json_url": f"/report?fmt=json&path={sig.source_path}",
+        "ticket_status": ticket.status if ticket is not None else "none",
+        "ticket_reason": (
+            ticket.blocked_reason
+            if ticket is not None and ticket.status == "blocked"
+            else (
+                ticket.rationale
+                if ticket is not None
+                else "No executable order from current target/current position."
+            )
+        ),
+        "ticket_id": ticket.ticket_id if ticket is not None else None,
+        "ticket_side": ticket.side if ticket is not None else None,
+        "ticket_quantity": ticket.quantity if ticket is not None else None,
+        "ticket_limit_price": ticket.limit_price if ticket is not None else None,
     }
 
 
@@ -821,6 +1537,11 @@ def _html_page() -> str:
     llm_env_json = json.dumps(_llm_env_status(), sort_keys=True)
     watchlist_text = ", ".join(_default_watchlist())
     today = datetime.now().strftime("%Y-%m-%d")
+    trade_positions_default = (
+        DEFAULT_ROBINHOOD_SNAPSHOT_PATH
+        if Path(DEFAULT_ROBINHOOD_SNAPSHOT_PATH).exists()
+        else DEFAULT_POSITIONS_PATH
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -887,6 +1608,28 @@ def _html_page() -> str:
     .checkrow {{ display: flex; align-items: center; margin-top: 10px; color: #2c373d; font-size: 13px; }}
     .hint {{ color: var(--muted); font-size: 12px; line-height: 1.35; margin: 8px 0 0; }}
     .hint.warn {{ color: var(--warn); }}
+    .side-switch {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      margin-bottom: 14px;
+    }}
+    .side-tab {{
+      width: auto;
+      background: #fff;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      padding: 8px 6px;
+      font-size: 12px;
+      white-space: nowrap;
+    }}
+    .side-tab.active {{
+      background: var(--ink);
+      color: #fff;
+      border-color: var(--ink);
+    }}
+    .side-panel {{ display: none; }}
+    .side-panel.active {{ display: block; }}
     .factor-row {{ display: grid; grid-template-columns: minmax(130px, 1fr) 110px 44px; gap: 8px; align-items: center; margin: 8px 0; }}
     .factor-row span {{ font-size: 12px; overflow-wrap: anywhere; }}
     .factor-row output {{ font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; text-align: right; }}
@@ -982,6 +1725,13 @@ def _html_page() -> str:
     .rank-meta {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }}
     .pill-row {{ display: flex; flex-wrap: wrap; gap: 8px; }}
     .data-pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; font-size: 12px; color: var(--muted); background: #fff; }}
+    .artifact-list {{ display: grid; gap: 8px; margin-top: 10px; }}
+    .artifact-row {{ display: grid; grid-template-columns: minmax(150px, .45fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; border-top: 1px solid var(--line); padding-top: 8px; }}
+    .artifact-row b {{ font-size: 13px; }}
+    .artifact-row span {{ color: var(--muted); font-size: 12px; line-height: 1.35; }}
+    .artifact-row a {{ white-space: nowrap; }}
+    .handoff-box {{ background: #fbfcfd; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
+    .handoff-box p {{ margin: 0 0 10px; color: var(--muted); line-height: 1.45; }}
     .agent-room {{ display: grid; gap: 12px; }}
     .agent-room details {{ border-top: 1px solid var(--line); padding-top: 10px; }}
     .agent-room summary {{ cursor: pointer; font-weight: 750; margin-bottom: 8px; }}
@@ -1022,7 +1772,13 @@ def _html_page() -> str:
   </header>
   <main>
     <aside>
-      <form id="analysis-form">
+      <div class="side-switch" role="tablist" aria-label="Workflow">
+        <button class="side-tab active" data-side-panel="analysis-form" type="button">Analyze</button>
+        <button class="side-tab" data-side-panel="best-buy-form" type="button">Best Buy</button>
+        <button class="side-tab" data-side-panel="trade-ticket-form" type="button">Tickets</button>
+      </div>
+
+      <form id="analysis-form" class="side-panel active">
         <fieldset>
           <legend>Run</legend>
           <div class="grid2">
@@ -1106,7 +1862,7 @@ def _html_page() -> str:
         <button id="run" type="submit">Run Analysis</button>
       </form>
 
-      <form id="best-buy-form">
+      <form id="best-buy-form" class="side-panel">
         <fieldset>
           <legend>Best Buy</legend>
           <label for="watchlist">Care Tickers</label>
@@ -1123,8 +1879,9 @@ def _html_page() -> str:
           </div>
           <label for="best_buy_sizing_config">Sizing Config</label>
           <input id="best_buy_sizing_config" value="{DEFAULT_SIZING_CONFIG}">
-          <label for="best_buy_positions_path">Positions Ledger</label>
-          <input id="best_buy_positions_path" value="{DEFAULT_POSITIONS_PATH}">
+          <label for="best_buy_positions_path">Positions Source</label>
+          <input id="best_buy_positions_path" value="{trade_positions_default}">
+          <p class="hint">Uses the same default account source as Tickets, so ranking and ticket status share the same current holdings.</p>
           <label class="checkrow"><input id="best_buy_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
           <label class="checkrow"><input id="best_buy_run_missing" type="checkbox"> Run analysis for missing reports</label>
           <label class="checkrow"><input id="best_buy_refresh_stale" type="checkbox"> Refresh stale promising reports</label>
@@ -1132,16 +1889,59 @@ def _html_page() -> str:
           <button id="best-buy-run" class="secondary" type="submit">Pick Best Buy</button>
         </fieldset>
       </form>
+
+      <form id="trade-ticket-form" class="side-panel">
+        <fieldset>
+          <legend>Trade Tickets</legend>
+          <div class="grid2">
+            <div>
+              <label for="trade_ticket_date">As Of</label>
+              <input id="trade_ticket_date" type="date" value="{today}">
+            </div>
+            <div>
+              <label for="trade_ticket_reports_glob">Reports Glob</label>
+              <input id="trade_ticket_reports_glob" value="{DEFAULT_REPORTS_GLOB}">
+            </div>
+          </div>
+          <label for="trade_ticket_positions_path">Positions Source</label>
+          <input id="trade_ticket_positions_path" value="{trade_positions_default}">
+          <p class="hint">Use `configs/robinhood_snapshot.json` after a Robinhood sync, or the manual ledger as a fallback.</p>
+          <label for="trade_ticket_sizing_config">Sizing Config</label>
+          <input id="trade_ticket_sizing_config" value="{DEFAULT_SIZING_CONFIG}">
+          <label for="trade_ticket_execution_config">Execution Config</label>
+          <input id="trade_ticket_execution_config" value="{DEFAULT_EXECUTION_CONFIG}">
+          <div class="grid2">
+            <div>
+              <label for="trade_ticket_tickets_dir">Tickets Dir</label>
+              <input id="trade_ticket_tickets_dir" value="{DEFAULT_TRADE_TICKETS_DIR}">
+            </div>
+            <div>
+              <label for="trade_ticket_workflow_dir">Workflow Dir</label>
+              <input id="trade_ticket_workflow_dir" value="{DEFAULT_TRADE_WORKFLOW_DIR}">
+            </div>
+          </div>
+          <label for="trade_ticket_account_hint">Account Hint</label>
+          <input id="trade_ticket_account_hint" placeholder="optional Robinhood account number">
+          <button id="robinhood-sync-request-run" class="secondary" type="button">Request Robinhood Sync</button>
+          <label class="checkrow"><input id="trade_ticket_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
+          <label class="checkrow"><input id="trade_ticket_run_missing" type="checkbox"> Run analysis for missing reports</label>
+          <label class="checkrow"><input id="trade_ticket_refresh_stale" type="checkbox" checked> Refresh stale reports first</label>
+          <p class="hint">Generates broker-gated tickets and a Codex review prompt. The UI never places Robinhood orders.</p>
+          <button id="trade-ticket-run" class="secondary" type="submit">Generate Tickets</button>
+        </fieldset>
+      </form>
     </aside>
     <section>
       <div class="tabs">
         <button class="tab active" data-tab="summary" type="button">Summary</button>
         <button class="tab" data-tab="best-buy" type="button">Best Buy</button>
+        <button class="tab" data-tab="trade-tickets" type="button">Trade Tickets</button>
         <button class="tab" data-tab="markdown" type="button">Markdown</button>
         <button class="tab" data-tab="json" type="button">JSON</button>
       </div>
       <div id="summary"></div>
       <div id="best-buy" class="hidden"></div>
+      <div id="trade-tickets" class="hidden"></div>
       <pre id="markdown" class="hidden"></pre>
       <pre id="json" class="hidden"></pre>
     </section>
@@ -1184,9 +1984,19 @@ def _html_page() -> str:
       btn.addEventListener('click', () => {{
         document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        for (const id of ['summary', 'best-buy', 'markdown', 'json']) {{
+        for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
           document.getElementById(id).classList.toggle('hidden', id !== btn.dataset.tab);
         }}
+      }});
+    }});
+
+    document.querySelectorAll('.side-tab').forEach(btn => {{
+      btn.addEventListener('click', () => {{
+        document.querySelectorAll('.side-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        document.querySelectorAll('.side-panel').forEach(panel => {{
+          panel.classList.toggle('active', panel.id === btn.dataset.sidePanel);
+        }});
       }});
     }});
 
@@ -1252,7 +2062,7 @@ def _html_page() -> str:
       run.disabled = true;
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
       document.querySelector('[data-tab="best-buy"]').classList.add('active');
-      for (const id of ['summary', 'best-buy', 'markdown', 'json']) {{
+      for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
         document.getElementById(id).classList.toggle('hidden', id !== 'best-buy');
       }}
       document.getElementById('best-buy').innerHTML = `
@@ -1304,6 +2114,91 @@ def _html_page() -> str:
         status.textContent = 'Error';
       }} finally {{
         stopBestBuyPolling();
+        run.disabled = false;
+      }}
+    }});
+
+    document.getElementById('trade-ticket-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const status = document.getElementById('status');
+      const run = document.getElementById('trade-ticket-run');
+      status.textContent = 'Generating tickets';
+      run.disabled = true;
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelector('[data-tab="trade-tickets"]').classList.add('active');
+      for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
+        document.getElementById(id).classList.toggle('hidden', id !== 'trade-tickets');
+      }}
+      document.getElementById('trade-tickets').innerHTML = `
+        <div class="dashboard-panel">
+          <h2>Trade ticket generation</h2>
+          <p class="hint">Building broker-gated tickets...</p>
+        </div>
+      `;
+      const payload = {{
+        date: document.getElementById('trade_ticket_date').value,
+        reports_glob: document.getElementById('trade_ticket_reports_glob').value,
+        positions_path: document.getElementById('trade_ticket_positions_path').value,
+        sizing_config: document.getElementById('trade_ticket_sizing_config').value,
+        execution_config: document.getElementById('trade_ticket_execution_config').value,
+        tickets_dir: document.getElementById('trade_ticket_tickets_dir').value,
+        workflow_dir: document.getElementById('trade_ticket_workflow_dir').value,
+        account_hint: document.getElementById('trade_ticket_account_hint').value,
+        fetch_current_prices: document.getElementById('trade_ticket_fetch_prices').checked,
+        run_missing_reports: document.getElementById('trade_ticket_run_missing').checked,
+        refresh_stale_reports: document.getElementById('trade_ticket_refresh_stale').checked
+      }};
+      try {{
+        const res = await fetch('/api/trade-tickets', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload)
+        }});
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Ticket generation failed');
+        renderTradeTickets(data);
+        document.getElementById('markdown').textContent = data.ticket_markdown || '';
+        document.getElementById('json').textContent = JSON.stringify(data.batch || {{}}, null, 2);
+        status.textContent = 'Tickets ready';
+      }} catch (err) {{
+        document.getElementById('trade-tickets').innerHTML = `<div class="error">${{err.message}}</div>`;
+        status.textContent = 'Error';
+      }} finally {{
+        run.disabled = false;
+      }}
+    }});
+
+    document.getElementById('robinhood-sync-request-run').addEventListener('click', async () => {{
+      const status = document.getElementById('status');
+      const run = document.getElementById('robinhood-sync-request-run');
+      status.textContent = 'Preparing sync request';
+      run.disabled = true;
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelector('[data-tab="trade-tickets"]').classList.add('active');
+      for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
+        document.getElementById(id).classList.toggle('hidden', id !== 'trade-tickets');
+      }}
+      const payload = {{
+        workflow_dir: document.getElementById('trade_ticket_workflow_dir').value,
+        output_path: document.getElementById('trade_ticket_positions_path').value || '{DEFAULT_ROBINHOOD_SNAPSHOT_PATH}',
+        account_hint: document.getElementById('trade_ticket_account_hint').value
+      }};
+      try {{
+        const res = await fetch('/api/robinhood-sync-request', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload)
+        }});
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Sync request failed');
+        renderRobinhoodSyncRequest(data);
+        document.getElementById('markdown').textContent = data.codex_prompt || '';
+        document.getElementById('json').textContent = JSON.stringify(data, null, 2);
+        status.textContent = 'Sync request ready';
+      }} catch (err) {{
+        document.getElementById('trade-tickets').innerHTML = `<div class="error">${{err.message}}</div>`;
+        status.textContent = 'Error';
+      }} finally {{
         run.disabled = false;
       }}
     }});
@@ -1515,6 +2410,7 @@ def _html_page() -> str:
       const candidates = data.candidates || [];
       const notes = data.notes || [];
       const generated = data.generated_reports || [];
+      const source = data.positions_source || {{}};
       document.getElementById('best-buy').innerHTML = `
         <div class="dashboard-hero">
           <div class="hero-line">
@@ -1529,10 +2425,20 @@ def _html_page() -> str:
             ${{statItem('Composite', best ? fmtSigned(best.composite) : '—')}}
             ${{statItem('Composite × confidence', best ? fmtSigned(best.conviction) : '—')}}
             ${{statItem('Base upside', best ? fmtPct(best.base_upside_pct) : '—')}}
-            ${{statItem('Target weight', best ? fmtPct(best.target_weight) : '—')}}
+            ${{statItem('Rank target', best ? fmtPct(best.rank_target_weight) : '—')}}
             ${{statItem('Limit', best ? fmtMoney(best.limit_price) : '—')}}
             ${{statItem('Signal age', best && best.signal_age_days !== null ? `${{best.signal_age_days}}d` : '—')}}
           </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Account source</h2>
+          <div class="pill-row">
+            <span class="data-pill">${{escapeHtml(source.source_type === 'snapshot' ? 'Robinhood-style snapshot' : 'Manual ledger')}}</span>
+            <span class="data-pill">Cash ${{fmtMoney(source.cash)}}</span>
+            <span class="data-pill">Positions ${{fmtNum(source.position_count || 0)}}</span>
+            <span class="data-pill">As of ${{escapeHtml(source.as_of || '—')}}</span>
+          </div>
+          <p class="hint">${{escapeHtml(source.path || '')}}</p>
         </div>
         <div class="dashboard-panel">
           <h2>Ranked watchlist</h2>
@@ -1553,6 +2459,247 @@ def _html_page() -> str:
         </div>
       `;
     }}
+    function renderTradeTickets(data) {{
+      const batch = data.batch || {{}};
+      const summary = batch.summary || {{}};
+      const coverage = data.report_coverage || {{}};
+      const source = data.positions_source || {{}};
+      const alignment = data.best_buy_alignment || {{}};
+      const ready = batch.tickets || [];
+      const blocked = batch.blocked_tickets || [];
+      const paths = data.paths || {{}};
+      const notes = data.notes || [];
+      const generated = data.generated_reports || [];
+      document.getElementById('trade-tickets').innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>${{ready.length ? `${{ready.length}} equity ticket${{ready.length === 1 ? '' : 's'}} ready for Robinhood review` : 'No executable tickets ready'}}</h2>
+              <p>Generated broker-gated tickets for ${{escapeHtml(data.as_of || '')}}. The UI prepares files only; Codex handles Robinhood MCP review and placement confirmation.</p>
+            </div>
+            <span class="action-badge ${{ready.length ? 'buy' : 'watch'}}">${{ready.length ? 'review' : 'blocked'}}</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Ready equity', fmtNum(summary.ready_count || 0))}}
+            ${{statItem('Blocked', fmtNum(summary.blocked_count || 0))}}
+            ${{statItem('Option intents', fmtNum(summary.option_intent_count || 0))}}
+            ${{statItem('Missing reports', fmtNum(coverage.missing_count || 0))}}
+            ${{statItem('Stale reports', fmtNum(coverage.stale_count || 0))}}
+            ${{statItem('Refreshed', fmtNum(generated.length))}}
+            ${{statItem('Needs RH MCP', summary.requires_robinhood_mcp ? 'yes' : 'no')}}
+            ${{statItem('Buy gate', alignment.enabled ? `top ${{fmtNum(alignment.max_ready_buy_tickets || 0)}}` : 'off')}}
+          </div>
+        </div>
+
+        ${{renderReportCoverage(coverage)}}
+        ${{renderGeneratedReports(generated)}}
+        ${{renderPositionsSource(source)}}
+
+        <div class="dashboard-panel">
+          <h2>Workflow handoff</h2>
+          <div class="handoff-box">
+            <p>The table below is the human view. The audit files are saved so Codex can review the same ticket batch, record broker responses, and reconcile fills later.</p>
+            <div class="artifact-list">
+              ${{artifactRow('Order proposal data', 'Structured source-of-truth for the ready and blocked ticket batch.', paths.ticket_json, 'json')}}
+              ${{artifactRow('Readable ticket report', 'Markdown summary of the same proposed and blocked orders.', paths.ticket_markdown, 'md')}}
+              ${{artifactRow('Codex review prompt', 'Exact handoff text to ask Codex to run Robinhood MCP review without placing orders.', paths.codex_review, 'md')}}
+              ${{artifactRow('Fill log template', 'Blank post-trade form for order IDs, filled quantities, average prices, and final states.', paths.fills_template, 'json')}}
+            </div>
+          </div>
+          ${{notes.length ? `<ul class="muted-list">${{notes.map(x => `<li>${{escapeHtml(x)}}</li>`).join('')}}</ul>` : ''}}
+        </div>
+
+        <div class="dashboard-panel">
+          <h2>Ready equity tickets</h2>
+          ${{alignment.enabled ? `<p class="hint">BUY/ADD tickets are aligned to Best Buy: only the top ${{fmtNum(alignment.max_ready_buy_tickets || 0)}} buy candidate becomes ready. TRIM/EXIT tickets still surface independently.</p>` : ''}}
+          ${{ready.length ? tradeTicketTable(ready, true) : '<p class="hint">No ready equity tickets. Check blocked reasons below.</p>'}}
+        </div>
+
+        <div class="dashboard-panel">
+          <h2>Blocked or intent only</h2>
+          ${{blocked.length ? tradeTicketTable(blocked, false) : '<p class="hint">No blocked tickets.</p>'}}
+        </div>
+
+        <div class="dashboard-panel">
+          <h2>Codex review prompt</h2>
+          <pre>${{escapeHtml(data.codex_review || '')}}</pre>
+        </div>
+      `;
+    }}
+    function renderRobinhoodSyncRequest(data) {{
+      const snap = data.current_snapshot || {{}};
+      document.getElementById('trade-tickets').innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>Robinhood sync request is ready</h2>
+              <p>This did not call Robinhood. It wrote a Codex handoff prompt that asks Codex to perform a read-only MCP sync and refresh the local snapshot.</p>
+            </div>
+            <span class="action-badge watch">sync</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Current snapshot cash', fmtMoney(snap.cash))}}
+            ${{statItem('Current positions', fmtNum(snap.position_count || 0))}}
+            ${{statItem('Current equity', fmtMoney(snap.total_equity))}}
+            ${{statItem('As of', escapeHtml(snap.as_of || '—'))}}
+          </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Next step</h2>
+          <div class="handoff-box">
+            <p>Ask Codex to run the prompt below. After Codex writes the snapshot, generate trade tickets again so sizing uses the refreshed account data.</p>
+            <div class="artifact-list">
+              ${{artifactRow('Sync request prompt', 'Read-only Codex handoff for Robinhood MCP portfolio and position sync.', data.prompt_path, 'md')}}
+              ${{artifactRow('Snapshot output path', 'Local file the Trade Tickets workflow will use as the positions source.', data.output_path, 'json')}}
+            </div>
+          </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Codex sync prompt</h2>
+          <pre>${{escapeHtml(data.codex_prompt || '')}}</pre>
+        </div>
+      `;
+    }}
+    function renderPositionsSource(source) {{
+      if (!source || source.source_type === 'unavailable') {{
+        return `
+          <div class="dashboard-panel">
+            <h2>Account source</h2>
+            <p class="hint warn">Positions source unavailable. Ticket sizing will use empty cash/positions.</p>
+          </div>
+        `;
+      }}
+      const sourceType = source.source_type === 'snapshot' ? 'Robinhood-style snapshot' : 'Manual ledger';
+      return `
+        <div class="dashboard-panel">
+          <h2>Account source</h2>
+          <div class="pill-row">
+            <span class="data-pill">${{escapeHtml(sourceType)}}</span>
+            <span class="data-pill">Cash ${{fmtMoney(source.cash)}}</span>
+            <span class="data-pill">Positions ${{fmtNum(source.position_count || 0)}}</span>
+            <span class="data-pill">Equity ${{fmtMoney(source.total_equity)}}</span>
+            <span class="data-pill">As of ${{escapeHtml(source.as_of || '—')}}</span>
+          </div>
+          <p class="hint">${{escapeHtml(source.path || '')}}</p>
+        </div>
+      `;
+    }}
+    function renderReportCoverage(coverage) {{
+      const missing = coverage.missing_symbols || [];
+      const stale = (coverage.report_age_rows || []).filter(row => row.status === 'stale');
+      const rows = coverage.report_age_rows || [];
+      if (!coverage || (!coverage.report_files_found && !missing.length)) {{
+        return `
+          <div class="dashboard-panel">
+            <h2>Report coverage</h2>
+            <p class="hint warn">No matching analysis report files were found. Generate analysis reports first, then regenerate trade tickets.</p>
+          </div>
+        `;
+      }}
+      if (!missing.length) {{
+        return `
+          <div class="dashboard-panel">
+            <h2>Report coverage</h2>
+            <div class="pill-row">
+              <span class="data-pill">Reports found: ${{fmtNum(coverage.report_files_found || 0)}}</span>
+              <span class="data-pill">Resolved: ${{fmtNum(coverage.resolved_count || 0)}}/${{fmtNum(coverage.universe_count || 0)}}</span>
+              <span class="data-pill">Stale: ${{fmtNum(stale.length)}}</span>
+              <span class="data-pill">Freshness gate: ${{fmtNum(coverage.max_age_days || 0)}}d</span>
+            </div>
+            ${{stale.length ? `<p class="hint warn">Some reports are still older than the execution freshness gate. Refresh those symbols or widen the report glob to the folder that contains the newer run.</p>` : ''}}
+            ${{rows.length ? reportAgeTable(rows) : ''}}
+          </div>
+        `;
+      }}
+      return `
+        <div class="dashboard-panel">
+          <h2>Reports needed</h2>
+          <p class="hint warn">${{missing.length}} symbol${{missing.length === 1 ? '' : 's'}} have no cached analysis report on or before this date, so they cannot produce actionable tickets yet.</p>
+          <div class="pill-row">
+            ${{missing.map(sym => `<span class="data-pill">${{escapeHtml(sym)}}</span>`).join('')}}
+          </div>
+          ${{rows.length ? reportAgeTable(rows) : ''}}
+        </div>
+      `;
+    }}
+    function renderGeneratedReports(generated) {{
+      if (!generated || !generated.length) return '';
+      return `
+        <div class="dashboard-panel">
+          <h2>Reports refreshed</h2>
+          <div class="artifact-list">
+            ${{generated.map(item => `
+              <div class="artifact-row">
+                <b>${{escapeHtml(item.symbol || '')}}</b>
+                <span>${{escapeHtml(item.reason || 'generated')}}${{item.cache_hit ? ' - cache hit' : ''}}<br>${{escapeHtml(item.json_path || '')}}</span>
+                ${{item.json_path ? `<a class="data-pill" target="_blank" href="/report?fmt=json&path=${{encodeURIComponent(item.json_path)}}">Open</a>` : ''}}
+              </div>
+            `).join('')}}
+          </div>
+        </div>
+      `;
+    }}
+    function reportAgeTable(rows) {{
+      const visible = rows.filter(row => row.status !== 'fresh').concat(rows.filter(row => row.status === 'fresh').slice(0, 8));
+      return `
+        <table>
+          <thead><tr><th>Symbol</th><th>Status</th><th>Report date</th><th>Age</th><th>Source</th></tr></thead>
+          <tbody>
+            ${{visible.map(row => `
+              <tr>
+                <td>${{escapeHtml(row.symbol || '')}}</td>
+                <td>${{escapeHtml(row.status || '')}}</td>
+                <td>${{escapeHtml(row.as_of_date || '—')}}</td>
+                <td>${{row.age_days === null || row.age_days === undefined ? '—' : `${{fmtNum(row.age_days)}}d`}}</td>
+                <td>${{row.source_path ? `<a target="_blank" href="/report?fmt=json&path=${{encodeURIComponent(row.source_path)}}">${{escapeHtml(row.source_path)}}</a>` : '—'}}</td>
+              </tr>
+            `).join('')}}
+          </tbody>
+        </table>
+      `;
+    }}
+    function artifactRow(label, description, path, fmt) {{
+      if (!path) return '';
+      const href = `/report?fmt=${{encodeURIComponent(fmt)}}&path=${{encodeURIComponent(path)}}`;
+      return `
+        <div class="artifact-row">
+          <b>${{escapeHtml(label)}}</b>
+          <span>${{escapeHtml(description)}}<br>${{escapeHtml(path)}}</span>
+          <a class="data-pill" target="_blank" href="${{href}}">Open</a>
+        </div>
+      `;
+    }}
+    function tradeTicketTable(tickets, ready) {{
+      const rows = tickets.map(t => `
+        <tr>
+          <td><code>${{escapeHtml(t.ticket_id)}}</code></td>
+          <td>${{escapeHtml(t.asset_type || '')}}</td>
+          <td>${{escapeHtml(t.symbol || '')}}</td>
+          <td>${{escapeHtml(t.side || '')}}</td>
+          <td>${{ticketQuantityLabel(t)}}</td>
+          <td>${{fmtMoney(t.limit_price)}}</td>
+          <td>${{escapeHtml(t.time_in_force || '')}}</td>
+          <td>${{escapeHtml(t.source_action || '')}}</td>
+          <td>${{ready ? escapeHtml(t.rationale || '') : escapeHtml(t.blocked_reason || '')}}</td>
+        </tr>
+      `).join('');
+      return `
+        <table>
+          <thead><tr><th>Ticket</th><th>Asset</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Limit</th><th>TIF</th><th>Source</th><th>${{ready ? 'Rationale' : 'Reason'}}</th></tr></thead>
+          <tbody>${{rows}}</tbody>
+        </table>
+      `;
+    }}
+    function ticketQuantityLabel(t) {{
+      const qty = t.quantity || '—';
+      const raw = t.details && t.details.raw_delta_shares !== null && t.details.raw_delta_shares !== undefined
+        ? Math.abs(Number(t.details.raw_delta_shares))
+        : null;
+      if (raw !== null && Number.isFinite(raw)) {{
+        return `${{escapeHtml(qty)}} <span class="hint">(frac ${{raw.toFixed(3)}})</span>`;
+      }}
+      return escapeHtml(qty);
+    }}
     function rankRow(c) {{
       const stale = c.signal_age_days !== null && c.signal_age_days !== undefined && c.signal_age_days > 7 ? 'Stale' : '';
       const notes = (c.notes || []).slice(0, 2);
@@ -1565,10 +2712,12 @@ def _html_page() -> str:
           <div>
             <strong>${{escapeHtml(c.reason || '')}}</strong>
             <div class="rank-meta">
-              <span class="data-pill">Target ${{fmtPct(c.target_weight)}}</span>
+              <span class="data-pill">Rank target ${{fmtPct(c.rank_target_weight)}}</span>
+              ${{targetDiffers(c) ? `<span class="data-pill">Effective ${{fmtPct(c.target_weight)}}</span>` : ''}}
               <span class="data-pill">C×C ${{fmtSigned(c.conviction)}}</span>
               <span class="data-pill">Δ ${{fmtPct(c.delta_pp)}}</span>
               <span class="data-pill">Limit ${{fmtMoney(c.limit_price)}}</span>
+              <span class="data-pill">Ticket ${{escapeHtml(ticketLabel(c))}}</span>
               <span class="data-pill">Stop ${{fmtMoney(c.stop_loss)}}</span>
               <span class="data-pill">Age ${{c.signal_age_days === null || c.signal_age_days === undefined ? '—' : `${{c.signal_age_days}}d`}}</span>
               ${{c.markdown_url ? `<a class="data-pill" target="_blank" href="${{reportUrl(c.markdown_url)}}">Markdown</a>` : ''}}
@@ -1576,16 +2725,30 @@ def _html_page() -> str:
               ${{stale ? `<span class="data-pill">${{stale}}</span>` : ''}}
             </div>
             ${{notes.length ? `<ul class="muted-list">${{notes.map(x => `<li>${{escapeHtml(x)}}</li>`).join('')}}</ul>` : ''}}
+            ${{c.ticket_reason ? `<p class="hint">${{escapeHtml(c.ticket_reason)}}</p>` : ''}}
           </div>
           <div class="rank-score">${{fmtNum(c.rank_score)}}</div>
         </div>
       `;
+    }}
+    function ticketLabel(c) {{
+      if (!c || !c.ticket_status || c.ticket_status === 'none') return 'no order';
+      if (c.ticket_status === 'ready') {{
+        const qty = c.ticket_quantity ? ` ${{c.ticket_quantity}} sh` : '';
+        return `ready${{qty}}`;
+      }}
+      return 'blocked';
     }}
     function reportUrl(url) {{
       const [base, query] = String(url || '').split('?');
       if (!query) return base;
       const params = new URLSearchParams(query);
       return `${{base}}?${{params.toString()}}`;
+    }}
+    function targetDiffers(c) {{
+      const rankTarget = Number(c.rank_target_weight || 0);
+      const effective = Number(c.target_weight || 0);
+      return Math.abs(rankTarget - effective) >= 0.0005;
     }}
     function statItem(label, value) {{
       return `<div class="stat-item"><b>${{value}}</b><span>${{escapeHtml(label)}}</span></div>`;
