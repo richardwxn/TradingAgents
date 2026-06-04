@@ -1,0 +1,25 @@
+# Broker-gated execution defaults.
+#
+# The repository generates auditable tickets only. Codex uses the Robinhood
+# MCP tools for live account reads, order review, explicit confirmation, and
+# placement.
+
+enabled_asset_types:
+  - equity
+  - option_intent
+
+default_order_type: limit
+# Robinhood GTC equity orders persist beyond the current trading day.
+time_in_force: gtc
+market_hours: regular_hours
+
+require_fresh_signal: true
+max_signal_age_days: 7
+min_abs_delta_shares: 1
+allow_fractional: false
+
+# Current Robinhood MCP tools support equity placement only. Option strategy
+# tickets are intentionally blocked review/intention records.
+options_mode: intent_only
+
+tradingagents_review_apply_to_tickets: true

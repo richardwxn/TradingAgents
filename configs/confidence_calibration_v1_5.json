@@ -1,0 +1,122 @@
+{
+  "fallback": false,
+  "fit": [
+    {
+      "hit_rate": 0.0,
+      "n_obs": 1,
+      "x_lower": -0.6819,
+      "x_upper": -0.6819
+    },
+    {
+      "hit_rate": 0.090909,
+      "n_obs": 11,
+      "x_lower": -0.6555,
+      "x_upper": -0.5834
+    },
+    {
+      "hit_rate": 0.161187,
+      "n_obs": 2798,
+      "x_lower": -0.5767,
+      "x_upper": 0.1992
+    },
+    {
+      "hit_rate": 0.5,
+      "n_obs": 2,
+      "x_lower": 0.1993,
+      "x_upper": 0.1997
+    },
+    {
+      "hit_rate": 0.705,
+      "n_obs": 200,
+      "x_lower": 0.2002,
+      "x_upper": 0.2612
+    },
+    {
+      "hit_rate": 0.726619,
+      "n_obs": 139,
+      "x_lower": 0.2616,
+      "x_upper": 0.3143
+    },
+    {
+      "hit_rate": 0.733333,
+      "n_obs": 90,
+      "x_lower": 0.3146,
+      "x_upper": 0.3619
+    },
+    {
+      "hit_rate": 0.742857,
+      "n_obs": 35,
+      "x_lower": 0.3625,
+      "x_upper": 0.3845
+    },
+    {
+      "hit_rate": 0.823529,
+      "n_obs": 34,
+      "x_lower": 0.3852,
+      "x_upper": 0.4111
+    },
+    {
+      "hit_rate": 0.826923,
+      "n_obs": 52,
+      "x_lower": 0.4116,
+      "x_upper": 0.4498
+    },
+    {
+      "hit_rate": 0.849315,
+      "n_obs": 73,
+      "x_lower": 0.4501,
+      "x_upper": 0.5839
+    },
+    {
+      "hit_rate": 0.875,
+      "n_obs": 8,
+      "x_lower": 0.5844,
+      "x_upper": 0.6153
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.6274,
+      "x_upper": 0.6274
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.6274,
+      "x_upper": 0.6274
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.6335,
+      "x_upper": 0.6335
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.6614,
+      "x_upper": 0.6614
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.6904,
+      "x_upper": 0.6904
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.6959,
+      "x_upper": 0.6959
+    },
+    {
+      "hit_rate": 1.0,
+      "n_obs": 1,
+      "x_lower": 0.7582,
+      "x_upper": 0.7582
+    }
+  ],
+  "method": "isotonic_pav",
+  "n_observations": 3450,
+  "version": 1
+}

@@ -10,6 +10,7 @@ from tradingagents.analysis_only.scoring import (
     REGIME_CHOP,
     REGIME_TREND_ON,
     REGIME_UNKNOWN,
+    UNIVERSAL_FACTOR_NAMES,
     apply_isotonic_calibration,
     brier_score,
     bucket_for_score,
@@ -59,6 +60,72 @@ def test_unknown_keys_ignored():
     weights = resolve_factor_weights({"not_a_real_factor": 5.0})
     assert "not_a_real_factor" not in weights
     assert math.isclose(sum(weights.values()), 1.0, abs_tol=1e-4)
+
+
+# ---------- UNIVERSAL_FACTOR_NAMES + cohort-aware resolve_factor_weights ----------
+
+
+def test_universal_factor_names_are_all_in_default_weights():
+    # Every universal factor must be a recognized weight key — otherwise
+    # cohort-aware re-scoring would silently zero-out the wrong factor set.
+    missing = UNIVERSAL_FACTOR_NAMES - set(DEFAULT_FACTOR_WEIGHTS.keys())
+    assert missing == set(), (
+        f"UNIVERSAL_FACTOR_NAMES contains factors not in "
+        f"DEFAULT_FACTOR_WEIGHTS: {missing}"
+    )
+
+
+def test_universal_factor_names_nonempty():
+    # Sanity: the universal set should not be empty (else cohort=non_tech
+    # would zero out all weights and produce divide-by-zero composites).
+    assert len(UNIVERSAL_FACTOR_NAMES) >= 1
+
+
+def test_resolve_factor_weights_cohort_default_no_change():
+    base = resolve_factor_weights()
+    assert resolve_factor_weights(cohort=None) == base
+    assert resolve_factor_weights(cohort="tech") == base
+
+
+def test_resolve_factor_weights_cohort_non_tech_zeros_non_universal():
+    weights = resolve_factor_weights(cohort="non_tech")
+    # Every non-universal factor must be zero.
+    for name in DEFAULT_FACTOR_WEIGHTS:
+        if name not in UNIVERSAL_FACTOR_NAMES:
+            assert weights[name] == 0.0, (
+                f"non-universal factor {name} should be zeroed under "
+                f"cohort=non_tech, got {weights[name]}"
+            )
+    # Every universal factor that had a positive default weight should
+    # have a positive weight after renormalization.
+    for name in UNIVERSAL_FACTOR_NAMES:
+        if DEFAULT_FACTOR_WEIGHTS[name] > 0:
+            assert weights[name] > 0
+
+
+def test_resolve_factor_weights_cohort_non_tech_renormalizes_to_one():
+    weights = resolve_factor_weights(cohort="non_tech")
+    assert math.isclose(sum(weights.values()), 1.0, abs_tol=1e-4)
+
+
+def test_resolve_factor_weights_cohort_non_tech_respects_overrides():
+    # Overrides apply first, then the non_tech zeroing.
+    weights = resolve_factor_weights(
+        {"momentum_rsi": 0.5},  # universal — should survive at higher weight
+        cohort="non_tech",
+    )
+    # momentum_rsi (universal) gets the override-bumped weight and survives.
+    assert weights["momentum_rsi"] > 0
+    # market_spy_trend (non-universal) is zeroed even if defaulted >0.
+    assert weights["market_spy_trend"] == 0.0
+    assert math.isclose(sum(weights.values()), 1.0, abs_tol=1e-4)
+
+
+def test_resolve_factor_weights_unknown_cohort_value_no_change():
+    # An unrecognized cohort value falls back to tech-equivalent (no zeroing).
+    base = resolve_factor_weights()
+    weird = resolve_factor_weights(cohort="some_unknown_label")
+    assert weird == base
 
 
 # ---------- bucket_for_score ----------
@@ -318,14 +385,15 @@ def test_iv_term_unavailable_when_slope_missing():
     assert score == 0.0
 
 
-def test_iv_term_steep_contango_positive():
+def test_iv_term_steep_contango_negative_in_v1_5():
+    # v1.5 (Section 27): contango now scores negative (complacency signal).
     score, _, _ = score_iv_term_structure(0.08)
-    assert score == 0.5
+    assert score == -0.5
 
 
-def test_iv_term_mild_contango_quarter_positive():
+def test_iv_term_mild_contango_quarter_negative_in_v1_5():
     score, _, _ = score_iv_term_structure(0.03)
-    assert score == 0.25
+    assert score == -0.25
 
 
 def test_iv_term_flat_zero():
@@ -333,14 +401,15 @@ def test_iv_term_flat_zero():
     assert score == 0.0
 
 
-def test_iv_term_mild_backwardation_negative():
+def test_iv_term_mild_backwardation_positive_in_v1_5():
+    # v1.5: backwardation now scores positive (mean-reversion bullish).
     score, _, _ = score_iv_term_structure(-0.03)
-    assert score == -0.5
+    assert score == 0.5
 
 
-def test_iv_term_deep_backwardation_strongly_negative():
+def test_iv_term_deep_backwardation_strongly_positive_in_v1_5():
     score, _, _ = score_iv_term_structure(-0.08)
-    assert score == -1.0
+    assert score == 1.0
 
 
 # ---------- score_iv_skew ----------
@@ -400,12 +469,17 @@ def test_iv_rank_low_bullish():
 # ---------- factor weights ----------
 
 
-def test_iv_factors_unvalidated_stay_at_zero():
-    # v1.3 (Section 21): term_structure stayed at 0 because its sign is
-    # regime-dependent across the Phase 1 corpus (+0.05 IC at 20d but -0.12
-    # at 60d); skew never crossed the noise floor.
-    for f in ("options_iv_term_structure", "options_iv_skew"):
-        assert DEFAULT_FACTOR_WEIGHTS[f] == 0.0
+def test_iv_skew_stays_at_zero_in_v1_5():
+    # options_iv_skew has never crossed the noise floor. Stays at 0.
+    assert DEFAULT_FACTOR_WEIGHTS["options_iv_skew"] == 0.0
+
+
+def test_iv_term_structure_promoted_in_v1_5():
+    # v1.5 (Section 27): post-regen IC analysis shows options_iv_term_structure
+    # is cohort-universal at 60d (core IC -0.109, canary -0.105; cohorts agree).
+    # Sign inverted in score_iv_term_structure (contango → negative score),
+    # weight promoted 0.00 → 0.04 to match the IC magnitude.
+    assert DEFAULT_FACTOR_WEIGHTS["options_iv_term_structure"] == 0.04
 
 
 def test_iv_rank_promoted_in_v1_3():

@@ -1471,10 +1471,72 @@ def test_regime_walk_forward_ships_regime_when_enough_samples():
         min_n=10,
         min_abs_ic=0.0,
         min_samples_per_regime=100,
+        require_regime_ic_ge_global=False,
     )
     assert timeline
     any_chop_used = any("chop" in step.regimes_used for step in timeline)
     assert any_chop_used
+
+
+def test_regime_walk_forward_falls_back_when_ic_lift_too_small():
+    dates = _weekly_dates("2023-07-14", 130)
+    recs = []
+    for i, d in enumerate(dates):
+        for sym_idx in range(12):
+            score = ((sym_idx + i) % 5 - 2) * 0.4
+            ret = score * 0.05
+            recs.append(_wf_record_with_regime(
+                f"S{sym_idx}", d, score, ret, "chop",
+            ))
+    _, timeline = regime_walk_forward_backtest(
+        recs,
+        refit_freq_weeks=4,
+        train_window_weeks=52,
+        gap_weeks=4,
+        first_refit_after_weeks=26,
+        min_n=10,
+        min_abs_ic=0.0,
+        min_samples_per_regime=100,
+        min_regime_ic_lift=0.5,
+    )
+    assert timeline
+    assert any("chop" in step.regimes_fellback_to_global for step in timeline)
+    assert any(
+        "regime_ic_lift" in step.regime_skip_reasons.get("chop", "")
+        for step in timeline
+    )
+
+
+def test_regime_walk_forward_only_ships_eligible_regimes():
+    dates = _weekly_dates("2023-07-14", 130)
+    recs = []
+    for i, d in enumerate(dates):
+        for sym_idx in range(12):
+            regime = "trend_on" if sym_idx % 2 == 0 else "chop"
+            score = ((sym_idx + i) % 5 - 2) * 0.4
+            ret = score * 0.05
+            recs.append(_wf_record_with_regime(
+                f"S{sym_idx}", d, score, ret, regime,
+            ))
+    _, timeline = regime_walk_forward_backtest(
+        recs,
+        refit_freq_weeks=4,
+        train_window_weeks=52,
+        gap_weeks=4,
+        first_refit_after_weeks=26,
+        min_n=10,
+        min_abs_ic=0.0,
+        min_samples_per_regime=100,
+        require_regime_ic_ge_global=False,
+        eligible_regimes=["chop"],
+    )
+    assert timeline
+    assert any("trend_on" in step.regimes_fellback_to_global for step in timeline)
+    assert all("trend_on" not in step.regimes_used for step in timeline)
+    assert any(
+        step.regime_skip_reasons.get("trend_on") == "regime_not_eligible"
+        for step in timeline
+    )
 
 
 def test_regime_walk_forward_timeline_serializes():
@@ -1499,7 +1561,9 @@ def test_regime_walk_forward_timeline_serializes():
             "anchor_date", "train_start", "train_end_exclusive",
             "score_end_exclusive", "n_train_total", "n_train_by_regime",
             "n_score_total", "n_score_by_regime", "global_weights",
-            "regime_weights", "regimes_used", "regimes_fellback_to_global",
+            "global_ic", "regime_weights", "regime_ics",
+            "regime_ic_lifts", "regime_skip_reasons", "regimes_used",
+            "regimes_fellback_to_global",
         ):
             assert k in first
         import json as _json

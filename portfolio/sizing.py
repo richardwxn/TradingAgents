@@ -60,6 +60,12 @@ class SizingConfig:
     # earnings gap window without exiting altogether.
     pre_earnings_trim_days: int = 3
     pre_earnings_size_factor: float = 0.5
+    # TradingAgents review gate controls (advisory by default in report
+    # generation, applied here only when enabled in sizing.yaml).
+    enable_tradingagents_review_gate: bool = False
+    tradingagents_review_apply_to_sizing: bool = True
+    tradingagents_review_apply_to_tickets: bool = True
+    tradingagents_review_top_screener_n: int = 5
 
     def __post_init__(self) -> None:
         if self.policy not in SUPPORTED_POLICIES:
@@ -79,6 +85,8 @@ class SizingConfig:
             raise ValueError("pre_earnings_trim_days must be >= 0")
         if not 0 <= self.pre_earnings_size_factor <= 1:
             raise ValueError("pre_earnings_size_factor must be in [0, 1]")
+        if self.tradingagents_review_top_screener_n < 0:
+            raise ValueError("tradingagents_review_top_screener_n must be >= 0")
 
 
 def sizing_config_from_dict(data: dict[str, Any]) -> SizingConfig:
@@ -95,6 +103,10 @@ def sizing_config_from_dict(data: dict[str, Any]) -> SizingConfig:
         "stale_composite_days", "stale_signal_decay",
         "composite_threshold", "top_n",
         "pre_earnings_trim_days", "pre_earnings_size_factor",
+        "enable_tradingagents_review_gate",
+        "tradingagents_review_apply_to_sizing",
+        "tradingagents_review_apply_to_tickets",
+        "tradingagents_review_top_screener_n",
     }
     kwargs = {k: v for k, v in data.items() if k in allowed}
     universe = data.get("universe") or ()

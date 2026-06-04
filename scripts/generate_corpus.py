@@ -87,7 +87,10 @@ def report_path(output_dir: Path, ticker: str, date_str: str) -> Path:
 
 
 def _generate_one(
-    args: tuple[str, str, str, str, int, bool, str | None, float, bool],
+    args: tuple[
+        str, str, str, str, int, bool, str | None, float, bool, bool,
+        str | None, str | None,
+    ],
 ) -> dict:
     """Worker: generate a single report. Returns a result dict for the parent
     process to aggregate. Defined at module level so it's picklable.
@@ -106,7 +109,10 @@ def _generate_one(
         force,
         state_store_path,
         pace_seconds,
-        minimal_context,
+        skip_news,
+        skip_filings,
+        confidence_calibration_path,
+        regime_weights_path,
     ) = args
     if pace_seconds > 0:
         time.sleep(pace_seconds)
@@ -144,8 +150,15 @@ def _generate_one(
                 verbose=False,
                 logger=logging.getLogger("worker"),
                 state_store_path=state_store_path,
-                enable_news_fetching=not minimal_context,
-                enable_filings_fetching=not minimal_context,
+                enable_news_fetching=not skip_news,
+                enable_filings_fetching=not skip_filings,
+                # Plumb the Phase-4 / Phase-5 config paths through so the
+                # regen output reflects calibrated confidence + regime-
+                # conditional weights when the artifacts exist on disk.
+                # Section 28 smoke discovered the pipeline ignored both
+                # in regen-mode because these were missing here.
+                confidence_calibration_path=confidence_calibration_path,
+                regime_weights_path=regime_weights_path,
             )
             report = mvp.run(symbol=ticker, as_of_date=date_str)
             mvp.save_report(report, output_dir=output_dir)
@@ -250,13 +263,58 @@ def main() -> int:
     parser.add_argument(
         "--minimal-context", action="store_true",
         help=(
-            "Skip news + SEC-filings fetches in each report. Useful for "
-            "backfill runs since `filings_recency_signal` is weight=0 and "
-            "news PIT-filters to near-empty on older dates anyway. Saves "
-            "~0.5-1s per report (~20-40 min on a Phase-2-scale regen)."
+            "Skip BOTH news AND SEC-filings fetches in each report. "
+            "Equivalent to passing `--skip-news --skip-filings`. Kept for "
+            "backward compatibility; prefer the individual flags below "
+            "when you want one but not the other (e.g. filings IC "
+            "measurement needs `--skip-news` only)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-news", action="store_true",
+        help=(
+            "Skip news fetches only. News PIT-filters to near-empty on "
+            "older dates anyway, so this is safe for historical regens."
+        ),
+    )
+    parser.add_argument(
+        "--skip-filings", action="store_true",
+        help=(
+            "Skip SEC-filings fetches only. Disables data input for "
+            "`filings_recency_signal`. Pass this for backfills where the "
+            "factor isn't being measured; OMIT IT when you need to "
+            "validate `filings_recency_signal` IC on a regenerated corpus."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-calibration-path",
+        default="configs/confidence_calibration.json",
+        help=(
+            "Path to the Phase-5 isotonic confidence calibration JSON. "
+            "When present, the pipeline uses calibrated `confidence` "
+            "instead of the heuristic formula. Pass an empty string to "
+            "force heuristic. Default matches `analysis_mvp.py` so regen "
+            "output is consistent with single-shot reports."
+        ),
+    )
+    parser.add_argument(
+        "--regime-weights-path",
+        default="configs/regime_weights.json",
+        help=(
+            "Path to the Phase-4 regime-conditional factor weights JSON. "
+            "When present, the pipeline applies per-regime weights at "
+            "inference; missing regimes fall back to `DEFAULT_FACTOR_WEIGHTS`. "
+            "File doesn't need to exist — pipeline silently falls back."
         ),
     )
     args = parser.parse_args()
+    # `--minimal-context` is the legacy bundled flag — expand it into the
+    # individual skip flags so the rest of the code only checks the
+    # specific knobs. See plan Future-work #3b / Section 27 deferred:
+    # we want to be able to enable filings independently when measuring
+    # the `filings_recency_signal` factor IC.
+    skip_news = args.skip_news or args.minimal_context
+    skip_filings = args.skip_filings or args.minimal_context
 
     if not os.environ.get("POLYGON_API_KEY"):
         print(
@@ -280,7 +338,16 @@ def main() -> int:
     # so chronological execution is needed for the trailing window to
     # populate correctly during a first-time backfill.
     state_store_path = args.state_store_path or None
-    JobTuple = tuple[str, str, str, str, int, bool, str | None, float, bool]
+    # Phase-4 / Phase-5 config paths: pass None when missing so the pipeline
+    # falls back to default weights / heuristic confidence. When present,
+    # workers pick them up so regen output reflects production-grade
+    # calibration and regime-aware weights.
+    cal_path = args.confidence_calibration_path or None
+    regime_path = args.regime_weights_path or None
+    JobTuple = tuple[
+        str, str, str, str, int, bool, str | None, float, bool, bool,
+        str | None, str | None,
+    ]
     jobs: list[JobTuple] = [
         (
             t,
@@ -291,7 +358,10 @@ def main() -> int:
             args.force,
             state_store_path,
             args.pace_seconds,
-            args.minimal_context,
+            skip_news,
+            skip_filings,
+            cal_path,
+            regime_path,
         )
         for d in dates
         for t in tickers

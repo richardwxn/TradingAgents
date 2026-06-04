@@ -250,6 +250,46 @@ def test_generate_structured_review_reports_schema_errors(monkeypatch):
     assert block["status"] == "llm_schema_validation_error"
 
 
+def test_normalize_review_gate_allows_agreeing_bullish_review():
+    block = {
+        "status": "ok",
+        "graph_contexts": [{"processed_decision": "Buy", "status": "ok"}],
+        "analysis": _valid_review_payload(),
+    }
+    gate = agent_review.normalize_review_gate(
+        block,
+        report_context={"direction": "bullish"},
+    )
+    assert gate["status"] == "ok"
+    assert gate["agree_with_signal"] is True
+    assert gate["risk_veto"] is False
+    assert gate["ticket_gate"] == "allow"
+
+
+def test_normalize_review_gate_vetoes_bullish_when_graph_is_bearish():
+    block = {
+        "status": "ok",
+        "graph_contexts": [{"processed_decision": "Sell", "status": "ok"}],
+        "analysis": {"candidate_risk_critiques": []},
+    }
+    gate = agent_review.normalize_review_gate(
+        block,
+        report_context={"direction": "bullish"},
+    )
+    assert gate["agree_with_signal"] is False
+    assert gate["risk_veto"] is True
+    assert gate["sizing_multiplier"] == 0.0
+    assert gate["ticket_gate"] == "block_buy_add"
+
+
+def test_normalize_review_gate_unavailable_is_noop():
+    gate = agent_review.normalize_review_gate({"status": "runtime_error"})
+    assert gate["status"] == "runtime_error"
+    assert gate["risk_veto"] is False
+    assert gate["sizing_multiplier"] == 1.0
+    assert gate["ticket_gate"] == "allow"
+
+
 def test_run_tuning_agent_review_writes_valid_block_without_real_graph(monkeypatch):
     _patch_llm(monkeypatch, _valid_review_payload())
 
@@ -314,6 +354,17 @@ def test_markdown_renderer_handles_tradingagents_review_block():
                 "status": "ok",
                 "provider": "openai",
                 "model": "gpt-5.4-mini",
+                "gate": {
+                    "status": "ok",
+                    "agree_with_signal": False,
+                    "risk_veto": True,
+                    "confidence_adjustment": -0.10,
+                    "sizing_multiplier": 0.0,
+                    "ticket_gate": "block_buy_add",
+                    "missing_evidence": ["estimate revisions"],
+                    "execution_caveats": ["Risk judge disagrees."],
+                    "reason": "TradingAgents risk review vetoes new long exposure.",
+                },
                 "analysis": _valid_review_payload(),
                 "graph_contexts": [
                     {
@@ -338,6 +389,8 @@ def test_markdown_renderer_handles_tradingagents_review_block():
     }
     md = render_markdown(payload)
     assert "## TradingAgents review" in md
+    assert "**Review gate**" in md
+    assert "block_buy_add" in md
     assert "earnings revision breadth" in md
     assert "**Agreement map**" in md
     assert "**Disagreement highlights**" in md

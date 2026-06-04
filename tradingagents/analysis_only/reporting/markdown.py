@@ -998,6 +998,10 @@ def _render_tradingagents_review(p: dict[str, Any]) -> str:
     analysis = review.get("analysis") or {}
     lines = ["## TradingAgents review", ""]
     lines.append(f"- Provider: {review.get('provider')} ({review.get('model')})")
+    gate_lines = _render_tradingagents_gate(review.get("gate") or {})
+    if gate_lines:
+        lines += ["", "**Review gate**", ""]
+        lines.extend(gate_lines)
     agreement = _tradingagents_agreement_map(p, review)
     if agreement:
         lines += ["", "**Agreement map**", ""]
@@ -1038,6 +1042,32 @@ def _render_tradingagents_review(p: dict[str, Any]) -> str:
     if room:
         lines += ["", room]
     return "\n".join(lines)
+
+
+def _render_tradingagents_gate(gate: dict[str, Any]) -> list[str]:
+    if not gate:
+        return []
+    missing = gate.get("missing_evidence") or []
+    caveats = gate.get("execution_caveats") or []
+    lines = [
+        "| Item | Value |",
+        "|---|---|",
+        f"| Agree with signal | {_escape_pipes(str(gate.get('agree_with_signal')))} |",
+        f"| Risk veto | {_escape_pipes(str(gate.get('risk_veto')))} |",
+        f"| Sizing multiplier | {_escape_pipes(str(gate.get('sizing_multiplier')))} |",
+        f"| Ticket gate | {_escape_pipes(str(gate.get('ticket_gate')))} |",
+        f"| Confidence adjustment | {_escape_pipes(str(gate.get('confidence_adjustment')))} |",
+        f"| Reason | {_escape_pipes(str(gate.get('reason') or ''))} |",
+    ]
+    if missing:
+        lines.append(
+            f"| Missing evidence | {_escape_pipes('; '.join(str(x) for x in missing[:4]))} |"
+        )
+    if caveats:
+        lines.append(
+            f"| Execution caveats | {_escape_pipes('; '.join(str(x) for x in caveats[:4]))} |"
+        )
+    return lines
 
 
 def _tradingagents_agreement_map(

@@ -17,8 +17,11 @@ from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.analysis_only.providers import (
     FearGreedProvider,
     PolygonFinancialsProvider,
+    SECFetchError,
     SECFilingsProvider,
     VIXFearGreedProvider,
+    fetch_polygon_daily_aggs_cached,
+    is_polygon_supported_symbol,
 )
 from tradingagents.analysis_only.state_store import StateStore, SymbolState
 from tradingagents.analysis_only.scoring import (
@@ -102,6 +105,8 @@ class AnalysisOnlyMVP:
         enable_data_cache: bool = True,
         enable_news_fetching: bool = True,
         enable_filings_fetching: bool = True,
+        enable_intraday_context: bool = True,
+        enable_peer_competitor_analysis: bool = True,
         verbose: bool = False,
         logger: logging.Logger | None = None,
     ):
@@ -114,6 +119,12 @@ class AnalysisOnlyMVP:
         # older dates). Live runs should keep both on.
         self.enable_news_fetching = enable_news_fetching
         self.enable_filings_fetching = enable_filings_fetching
+        # Skipping intraday-context (hourly bars over a 7-day window) and
+        # peer-competitor analysis (yfinance per-peer .info fetches) is
+        # the screener-mode lever — disabling both drops a per-report
+        # ~10-20s of network time. Live runs keep both on.
+        self.enable_intraday_context = enable_intraday_context
+        self.enable_peer_competitor_analysis = enable_peer_competitor_analysis
         self.min_unusual_option_notional = min_unusual_option_notional
         self.min_option_volume_oi_ratio = min_option_volume_oi_ratio
         self.factor_weights = factor_weights or {}
@@ -245,11 +256,21 @@ class AnalysisOnlyMVP:
             self._log("News fetch skipped (enable_news_fetching=False).")
             news_summary = {"count": 0, "items": [], "status": "disabled"}
             self._set_pit("news", "disabled")
-        self._log("Loading intraday trigger context...")
-        intraday_context = self._load_intraday_context(
-            symbol=symbol,
-            as_of_date=as_of_date,
-        )
+        if self.enable_intraday_context:
+            self._log("Loading intraday trigger context...")
+            intraday_context = self._load_intraday_context(
+                symbol=symbol,
+                as_of_date=as_of_date,
+            )
+        else:
+            self._log(
+                "Intraday context skipped (enable_intraday_context=False)."
+            )
+            intraday_context = {
+                "status": "disabled",
+                "pit_status": "disabled",
+            }
+            self._set_pit("intraday_context", "disabled")
         self._log("Loading market regime context...")
         market_context = self._load_market_context(as_of_date=as_of_date)
         self._set_pit("market_context", "pit")
@@ -292,14 +313,32 @@ class AnalysisOnlyMVP:
             "event_timeline",
             self._pit_status.get("news", "pit"),
         )
-        self._log("Running competitor benchmark...")
-        competitor_analysis = self._build_competitor_analysis(
-            symbol=symbol,
-            as_of_date=as_of_date,
-            close=technicals.get("close"),
-            fundamentals=fundamentals,
-            industry_context=industry_context,
-        )
+        if self.enable_peer_competitor_analysis:
+            self._log("Running competitor benchmark...")
+            competitor_analysis = self._build_competitor_analysis(
+                symbol=symbol,
+                as_of_date=as_of_date,
+                close=technicals.get("close"),
+                fundamentals=fundamentals,
+                industry_context=industry_context,
+            )
+        else:
+            self._log(
+                "Peer competitor analysis skipped "
+                "(enable_peer_competitor_analysis=False)."
+            )
+            competitor_analysis = {
+                "status": "disabled",
+                "peer_tickers": [],
+                "peer_metrics": [],
+                "summary": {},
+                "peer_fundamentals_pit_status": "disabled",
+            }
+            self._set_pit("competitor_analysis", "disabled")
+            self._set_pit(
+                "competitor_analysis.peer_fundamentals",
+                "disabled",
+            )
         self._log("Loading industry news context...")
         industry_news_context = self._load_industry_news_context(
             symbol=symbol,
@@ -374,6 +413,10 @@ class AnalysisOnlyMVP:
             "enable_tradingagents_review": self.enable_tradingagents_review,
             "enable_news_fetching": self.enable_news_fetching,
             "enable_filings_fetching": self.enable_filings_fetching,
+            "enable_intraday_context": self.enable_intraday_context,
+            "enable_peer_competitor_analysis": (
+                self.enable_peer_competitor_analysis
+            ),
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
             "llm_base_url": self.llm_base_url,
@@ -1541,13 +1584,22 @@ class AnalysisOnlyMVP:
                 else 3600
             ),
         )
-        if isinstance(cached, dict):
+        if isinstance(cached, dict) and cached.get("status") != "error":
             return cached
-        latest = self.sec_filings_provider.get_latest_filing(
-            symbol,
-            as_of_date=as_of_date,
-        )
+        try:
+            latest = self.sec_filings_provider.get_latest_filing(
+                symbol,
+                as_of_date=as_of_date,
+            )
+        except SECFetchError as exc:
+            # Transient fetch failure (rate-limit, 5xx, network). Do NOT
+            # cache — historical-date entries have ttl=None, so a cached
+            # error would persist forever.
+            return {"status": "error", "reason": str(exc)}
         if not latest:
+            # The submissions feed returned successfully but contained no
+            # 10-Q/10-K/8-K filing on/before `as_of_date`. This is a real
+            # PIT result and is safe to cache.
             out = {"status": "unavailable"}
             self._set_cached_json("filings", "latest_filing", cache_payload, out)
             return out
@@ -2620,13 +2672,27 @@ class AnalysisOnlyMVP:
         as_of_date: str,
         namespace: str,
     ) -> pd.DataFrame | None:
+        """Daily OHLCV bars for `symbol`.
+
+        Routes ETF / stock symbols (SPY, XLK, etc.) through Polygon's
+        process-shared cache (`fetch_polygon_daily_aggs_cached`) to
+        eliminate the "HTTP 401 Invalid Crumb" log noise yfinance emits
+        under concurrent regen. Yahoo-style index codes (`^VIX`, `^TNX`,
+        `^IRX`) fall through to yfinance because they're not on the
+        Polygon Stocks plan (returns 403 NOT_AUTHORIZED — verified
+        against `I:VIX` / `I:TNX` / `I:IRX`). Without a POLYGON_API_KEY
+        we also use yfinance to preserve graceful degradation.
+        """
         start = start_dt.strftime("%Y-%m-%d")
         end = end_dt.strftime("%Y-%m-%d")
+        polygon_key = os.getenv("POLYGON_API_KEY", "")
+        use_polygon = bool(polygon_key) and is_polygon_supported_symbol(symbol)
+        provider_label = "polygon" if use_polygon else "yfinance"
         cache_payload = {
             "symbol": symbol.upper(),
             "start": start,
             "end": end,
-            "provider": "yfinance",
+            "provider": provider_label,
             "auto_adjust": True,
             "namespace": namespace,
         }
@@ -2638,14 +2704,29 @@ class AnalysisOnlyMVP:
         )
         if cached is not None and not cached.empty:
             return cached
-        data = yf.download(
-            symbol.upper(),
-            start=start,
-            end=end,
-            auto_adjust=True,
-            progress=False,
-            multi_level_index=False,
-        )
+        if use_polygon:
+            # Polygon /v2/aggs is inclusive on both ends; the legacy
+            # yfinance caller adds +1 day to make yfinance's exclusive
+            # `end` align with `as_of_date`. We need to subtract that day
+            # back so we don't pull a post-cutoff bar (would break PIT).
+            polygon_end_dt = end_dt - timedelta(days=1)
+            polygon_end = polygon_end_dt.strftime("%Y-%m-%d")
+            data = fetch_polygon_daily_aggs_cached(
+                symbol=symbol,
+                start=start,
+                end=polygon_end,
+                api_key=polygon_key,
+                logger=self.logger,
+            )
+        else:
+            data = yf.download(
+                symbol.upper(),
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                multi_level_index=False,
+            )
         if data is None or data.empty:
             return data
         self._set_cached_dataframe(
@@ -4281,23 +4362,32 @@ class AnalysisOnlyMVP:
                 "Peer valuation comparison unavailable.",
             )
 
+        # v1.6 (Section 28): sign INVERTED from placeholder. Phase 2 v1.5 regen
+        # IC analysis showed market_spy_trend at -0.133 IC at 60d core cohort
+        # (strongest negative-IC factor with positive weight). Walk-forward
+        # gate (custom_json C4, plan accuracy_improvements.md Unit E): +0.51pp
+        # 60d, +0.58pp 20d, +0.22pp 5d — improves all horizons. Probable
+        # economic story: in a tech-momentum universe, SPY above 50DMA is
+        # often the late-stage rally that mean-reverts before tech does;
+        # SPY below 50DMA marks broad-market panic that tech recovers from
+        # first. Weight unchanged at 0.04.
         if spy_trend is True:
             add_factor(
                 "market_spy_trend",
                 "context",
                 1.0,
-                0.5,
+                -0.5,
                 True,
-                "Market regime constructive (SPY above 50DMA).",
+                "Market regime extended (SPY above 50DMA) — mean-reversion bearish (v1.6 inverted).",
             )
         elif spy_trend is False:
             add_factor(
                 "market_spy_trend",
                 "context",
                 -1.0,
-                -0.5,
+                0.5,
                 True,
-                "Market regime risk-off (SPY below 50DMA).",
+                "Market regime risk-off (SPY below 50DMA) — oversold bullish (v1.6 inverted).",
             )
         else:
             add_factor(
@@ -4973,8 +5063,13 @@ class AnalysisOnlyMVP:
         earnings_calendar: dict[str, Any] | None,
         data_quality: dict[str, Any],
     ) -> dict[str, Any]:
+        from tradingagents.analysis_only.agent_review import (
+            normalize_review_gate,
+        )
         if not self.enable_tradingagents_review:
-            return {"enabled": False, "status": "disabled"}
+            block = {"enabled": False, "status": "disabled"}
+            block["gate"] = normalize_review_gate(block)
+            return block
         from tradingagents.analysis_only.agent_review import (
             run_report_agent_review,
         )
@@ -5016,12 +5111,16 @@ class AnalysisOnlyMVP:
                 base_url=self.llm_base_url,
             )
         except Exception as exc:
-            return {
+            block = {
                 "enabled": True,
                 "status": "tradingagents_review_runtime_error",
                 "error": str(exc),
                 "provider": self.llm_provider,
                 "model": self.llm_model,
+            }
+            block["gate"] = normalize_review_gate(block)
+            return {
+                **block,
             }
 
     def _load_confidence_calibration(self) -> dict[str, Any] | None:

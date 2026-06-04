@@ -42,11 +42,19 @@ def test_sizing_config_from_dict_ignores_unknown_keys():
         "policy": "equal_weight_bullish",
         "max_per_name": 0.10,
         "universe": ["NVDA", "AMD"],
+        "enable_tradingagents_review_gate": True,
+        "tradingagents_review_apply_to_sizing": False,
+        "tradingagents_review_apply_to_tickets": False,
+        "tradingagents_review_top_screener_n": 3,
         "unknown_future_field": 42,
         "another_unknown": "value",
     })
     assert cfg.max_per_name == 0.10
     assert cfg.universe == ("NVDA", "AMD")
+    assert cfg.enable_tradingagents_review_gate is True
+    assert cfg.tradingagents_review_apply_to_sizing is False
+    assert cfg.tradingagents_review_apply_to_tickets is False
+    assert cfg.tradingagents_review_top_screener_n == 3
 
 
 # ---------- equal_weight_bullish ----------

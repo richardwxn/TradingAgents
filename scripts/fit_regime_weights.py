@@ -2,19 +2,17 @@
 
 Reads every report in `--reports-glob`, partitions records by regime
 (trend_on vs chop, computed from each record's `market_context`), fits
-IC-signed weights per regime on the trailing window, and writes a
-`configs/regime_weights.json` map of:
+IC-signed weights per regime, and writes a candidate map of:
 
     {
       "trend_on": {"factor_a": w_a, ...},
       "chop":     {"factor_a": w_a, ...}
     }
 
-Honors the Phase 4 gate: regimes with fewer than `--min-samples` (default
-250) or per-regime walk-forward IC below the global IC are dropped from
-the output. AnalysisOnlyMVP then loads this file when `regime_weights_path`
-is set and uses the matching weights at inference; missing regimes fall
-back to the global weights vector.
+By default this writes under `backtest/results/regime_candidates/` so an
+experiment cannot silently become live production config. To write
+`configs/regime_weights.json`, pass both `--output configs/regime_weights.json`
+and `--allow-production-output` after the walk-forward acceptance gate passes.
 """
 from __future__ import annotations
 
@@ -61,13 +59,55 @@ def _ic_for(records, horizon: str) -> float | None:
     return spearman_correlation(xs, ys)
 
 
+def build_diagnostics_payload(
+    *,
+    reports_glob: str,
+    horizon: str,
+    horizons: list[int],
+    min_abs_ic: float,
+    min_n: int,
+    min_samples: int,
+    require_regime_ic_ge_global: bool,
+    global_ic: float | None,
+    diagnostics: dict[str, dict],
+) -> dict:
+    return {
+        "reports_glob": reports_glob,
+        "horizon": horizon,
+        "horizons": horizons,
+        "min_abs_ic": min_abs_ic,
+        "min_n": min_n,
+        "min_samples": min_samples,
+        "require_regime_ic_ge_global": require_regime_ic_ge_global,
+        "global_ic": global_ic,
+        "regimes": diagnostics,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--reports-glob", default="reports/analysis_mvp/*.json",
     )
     parser.add_argument(
-        "--output", default="configs/regime_weights.json",
+        "--output",
+        default="backtest/results/regime_candidates/regime_weights_candidate.json",
+    )
+    parser.add_argument(
+        "--diagnostics-output",
+        default=None,
+        help=(
+            "Optional diagnostics JSON path. Defaults to "
+            "<output-stem>_diagnostics.json."
+        ),
+    )
+    parser.add_argument(
+        "--allow-production-output",
+        action="store_true",
+        help=(
+            "Required when --output is configs/regime_weights.json. Use only "
+            "after scripts/check_regime_acceptance.py passes."
+        ),
     )
     parser.add_argument(
         "--horizons", nargs="+", type=int, default=[5, 20, 60],
@@ -89,6 +129,19 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    out_path = Path(args.output)
+    if (
+        out_path.as_posix() == "configs/regime_weights.json"
+        and not args.allow_production_output
+    ):
+        print(
+            "[fail] refusing to write configs/regime_weights.json without "
+            "--allow-production-output. Write a candidate artifact first and "
+            "run scripts/check_regime_acceptance.py.",
+            file=sys.stderr,
+        )
+        return 2
 
     paths = sorted(glob.glob(args.reports_glob))
     if not paths:
@@ -134,6 +187,8 @@ def main() -> int:
             "reason": None,
             "ic": None,
             "global_ic": global_ic,
+            "ic_lift": None,
+            "nonzero_factor_count": 0,
         }
         if len(recs) < args.min_samples:
             diag["reason"] = f"n_records<{args.min_samples}"
@@ -149,9 +204,12 @@ def main() -> int:
             diag["reason"] = "no_factors_passed_ic_threshold"
             diagnostics[regime] = diag
             continue
+        diag["nonzero_factor_count"] = sum(1 for v in weights.values() if v)
         rebuilt = rebuild_records_with_weights(recs, weights=weights)
         regime_ic = _ic_for(rebuilt, args.horizon)
         diag["ic"] = regime_ic
+        if global_ic is not None and regime_ic is not None:
+            diag["ic_lift"] = regime_ic - global_ic
         if (
             args.require_regime_ic_ge_global
             and global_ic is not None
@@ -167,11 +225,29 @@ def main() -> int:
         diag["shipped"] = True
         diagnostics[regime] = diag
 
-    out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2, sort_keys=True))
+    diag_path = (
+        Path(args.diagnostics_output)
+        if args.diagnostics_output
+        else out_path.with_name(f"{out_path.stem}_diagnostics.json")
+    )
+    diag_path.parent.mkdir(parents=True, exist_ok=True)
+    diag_payload = build_diagnostics_payload(
+        reports_glob=args.reports_glob,
+        horizon=args.horizon,
+        horizons=args.horizons,
+        min_abs_ic=args.min_abs_ic,
+        min_n=args.min_n,
+        min_samples=args.min_samples,
+        require_regime_ic_ge_global=args.require_regime_ic_ge_global,
+        global_ic=global_ic,
+        diagnostics=diagnostics,
+    )
+    diag_path.write_text(json.dumps(diag_payload, indent=2, sort_keys=True))
     print()
     print(f"Wrote {len(out)} regime(s) to {out_path}")
+    print(f"Wrote diagnostics to {diag_path}")
     print("Diagnostics:")
     for regime, diag in sorted(diagnostics.items()):
         status = "SHIPPED" if diag["shipped"] else f"SKIPPED ({diag['reason']})"

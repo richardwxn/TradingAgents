@@ -15,12 +15,136 @@ from typing import Any, Iterable
 REVIEW_PROMPT_VERSION = "v1.0"
 
 
+DEFAULT_REVIEW_GATE: dict[str, Any] = {
+    "status": "unavailable",
+    "agree_with_signal": None,
+    "risk_veto": False,
+    "confidence_adjustment": 0.0,
+    "sizing_multiplier": 1.0,
+    "ticket_gate": "allow",
+    "missing_evidence": [],
+    "execution_caveats": [],
+    "reason": "TradingAgents review unavailable.",
+}
+
+
 def _strip_code_fences(content: str) -> str:
     s = content.strip()
     if s.startswith("```"):
         s = s.strip("`")
         s = s.replace("json", "", 1).strip()
     return s
+
+
+def normalize_review_gate(
+    review: dict[str, Any] | None,
+    *,
+    report_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic gate from a TradingAgents review block.
+
+    The gate is deliberately derived rather than purely LLM-authored so
+    older review payloads and partial graph failures remain useful.  It is
+    advisory by default; callers decide whether to apply sizing/ticket effects.
+    """
+    gate = dict(DEFAULT_REVIEW_GATE)
+    gate["missing_evidence"] = []
+    gate["execution_caveats"] = []
+    if not isinstance(review, dict) or review.get("status") != "ok":
+        if isinstance(review, dict) and review.get("status"):
+            gate["status"] = str(review.get("status"))
+            gate["reason"] = f"TradingAgents review status={review.get('status')}."
+        return gate
+
+    ctx = ((review.get("graph_contexts") or [{}])[0]) or {}
+    analysis = review.get("analysis") or {}
+    report_context = report_context or {}
+    quant = _gate_stance(report_context.get("direction"))
+    graph = _gate_stance(
+        ctx.get("processed_decision") or ctx.get("final_trade_decision")
+    )
+    agree = bool(quant and graph and quant == graph) if quant and graph else None
+
+    risk_items = analysis.get("candidate_risk_critiques") or []
+    high_risk_items = [
+        item for item in risk_items
+        if str(item.get("severity", "")).lower() == "high"
+    ]
+    medium_risk_items = [
+        item for item in risk_items
+        if str(item.get("severity", "")).lower() == "medium"
+    ]
+    missing = [
+        str(item.get("feature_or_dataset") or item.get("reason") or "").strip()
+        for item in (analysis.get("feature_recommendations") or [])
+        if str(item.get("priority", "")).lower() == "high"
+    ]
+    caveats = [
+        str(item.get("concern") or item.get("mitigation") or "").strip()
+        for item in risk_items
+    ]
+    if ctx.get("status") and ctx.get("status") != "ok":
+        caveats.append(f"Graph context status={ctx.get('status')}.")
+
+    risk_veto = bool(
+        (quant == "bullish" and graph == "bearish")
+        or (quant == "bullish" and high_risk_items)
+    )
+    manual_review = bool(
+        not risk_veto
+        and (
+            agree is False
+            or high_risk_items
+            or len(medium_risk_items) >= 2
+            or len(missing) >= 2
+            or (ctx.get("status") and ctx.get("status") != "ok")
+        )
+    )
+    if risk_veto:
+        ticket_gate = "block_buy_add"
+        sizing_multiplier = 0.0
+        confidence_adjustment = -0.10
+        reason = "TradingAgents risk review vetoes new long exposure."
+    elif manual_review:
+        ticket_gate = "manual_review"
+        sizing_multiplier = 0.5
+        confidence_adjustment = -0.05
+        reason = "TradingAgents review requires manual confirmation."
+    elif agree is True and graph == "bullish":
+        ticket_gate = "allow"
+        sizing_multiplier = 1.0
+        confidence_adjustment = 0.03
+        reason = "TradingAgents review agrees with the bullish signal."
+    else:
+        ticket_gate = "allow"
+        sizing_multiplier = 1.0
+        confidence_adjustment = 0.0
+        reason = "TradingAgents review does not add a blocking caveat."
+
+    return {
+        "status": "ok",
+        "agree_with_signal": agree,
+        "risk_veto": risk_veto,
+        "confidence_adjustment": confidence_adjustment,
+        "sizing_multiplier": sizing_multiplier,
+        "ticket_gate": ticket_gate,
+        "missing_evidence": [m for m in missing if m][:8],
+        "execution_caveats": [c for c in caveats if c][:8],
+        "reason": reason,
+    }
+
+
+def _gate_stance(value: Any) -> str | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    if raw in {"bullish", "buy", "strong buy", "add"} or "buy" in raw:
+        return "bullish"
+    if raw in {"bearish", "sell", "strong sell", "exit"} or "sell" in raw:
+        return "bearish"
+    if raw in {"neutral", "hold", "watch", "wait"} or "hold" in raw:
+        return "neutral"
+    return None
 
 
 def _build_review_schema():
@@ -606,6 +730,7 @@ def run_report_agent_review(
         base_url=base_url,
     )
     block["review_type"] = "report"
+    block["gate"] = normalize_review_gate(block, report_context=report_context)
     return block
 
 

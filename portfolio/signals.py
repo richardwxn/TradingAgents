@@ -53,12 +53,14 @@ class Signal:
     next_earnings_date: str | None = None
     sector: str | None = None
     industry: str | None = None
+    tradingagents_review_gate: dict[str, Any] = field(default_factory=dict)
 
     def to_sizing_input(self) -> dict[str, Any]:
         return {
             "direction": self.direction,
             "composite": self.composite,
             "confidence": self.confidence,
+            "tradingagents_review_gate": dict(self.tradingagents_review_gate),
         }
 
 
@@ -98,6 +100,11 @@ class Action:
     atr14: float | None
     signal_age_days: int | None
     notes: list[str] = field(default_factory=list)
+    target_shares_exact: float | None = None
+    delta_shares_exact: float | None = None
+    review_gate_status: str | None = None
+    review_gate_reason: str | None = None
+    review_execution_caveats: list[str] = field(default_factory=list)
 
 
 # Action precedence for the report ordering (BUY first, then EXIT, etc.).
@@ -138,6 +145,7 @@ def _load_signal_from_json(path: Path) -> Signal | None:
     composite = model_scoring.get("composite_score")
     ec = kf.get("earnings_calendar") or {}
     ind = kf.get("industry_context") or {}
+    review_gate = (kf.get("tradingagents_review") or {}).get("gate") or {}
     return Signal(
         symbol=symbol,
         as_of_date=as_of,
@@ -155,6 +163,9 @@ def _load_signal_from_json(path: Path) -> Signal | None:
         next_earnings_date=ec.get("next_earnings_date"),
         sector=ind.get("sector"),
         industry=ind.get("industry"),
+        tradingagents_review_gate=(
+            dict(review_gate) if isinstance(review_gate, dict) else {}
+        ),
     )
 
 
@@ -302,6 +313,33 @@ def compute_actions(
             sizing_input[sym] = payload
     target_weights = compute_target_weights(sizing_input, config=config)
 
+    # 1a) TradingAgents review gate. This is opt-in because the graph is a
+    # governance layer around the calibrated composite, not the primary
+    # signal. When enabled, it scales target exposure before earnings and
+    # portfolio risk caps so all later constraints see the adjusted intent.
+    review_gate_notes: dict[str, str] = {}
+    if (
+        getattr(config, "enable_tradingagents_review_gate", False)
+        and getattr(config, "tradingagents_review_apply_to_sizing", True)
+    ):
+        for sym, sig in signals.items():
+            if sig is None:
+                continue
+            gate = sig.tradingagents_review_gate or {}
+            old_w = target_weights.get(sym, 0.0)
+            if old_w <= 0:
+                continue
+            multiplier = _review_gate_sizing_multiplier(gate)
+            if multiplier >= 1.0:
+                continue
+            target_weights[sym] = old_w * multiplier
+            review_gate_notes[sym] = (
+                f"TradingAgents gate {gate.get('ticket_gate', 'allow')} — "
+                f"target size scaled to {multiplier*100:.0f}% "
+                f"({old_w*100:.1f}% → {target_weights[sym]*100:.1f}%). "
+                f"{gate.get('reason') or ''}"
+            ).strip()
+
     # 1b) Earnings-aware sizing adjustment (Section 26). For each symbol
     # whose next earnings date is within config.pre_earnings_trim_days
     # of the cutoff (today), multiply target weight by
@@ -379,8 +417,18 @@ def compute_actions(
             if ctx.last_close and ctx.last_close > 0
             else 0
         )
+        target_shares_exact = (
+            target_dollars / ctx.last_close
+            if ctx.last_close and ctx.last_close > 0
+            else None
+        )
         current_shares = int(position.shares)
         delta_shares = target_shares - current_shares
+        delta_shares_exact = (
+            target_shares_exact - float(position.shares)
+            if target_shares_exact is not None
+            else None
+        )
         side = classify_action(
             target_weight=target_w,
             current_weight=current_w,
@@ -429,6 +477,10 @@ def compute_actions(
             notes.append(earnings_adjustment_notes[sym])
         if sym in risk_notes:
             notes.append(risk_notes[sym])
+        if sym in review_gate_notes:
+            notes.append(review_gate_notes[sym])
+
+        review_gate = sig.tradingagents_review_gate if sig is not None else {}
 
         actions.append(Action(
             symbol=sym,
@@ -449,6 +501,23 @@ def compute_actions(
             atr14=ctx.atr14,
             signal_age_days=signal_age,
             notes=notes,
+            target_shares_exact=target_shares_exact,
+            delta_shares_exact=delta_shares_exact,
+            review_gate_status=(
+                str(review_gate.get("ticket_gate"))
+                if review_gate.get("ticket_gate")
+                else None
+            ),
+            review_gate_reason=(
+                str(review_gate.get("reason"))
+                if review_gate.get("reason")
+                else None
+            ),
+            review_execution_caveats=[
+                str(x)
+                for x in (review_gate.get("execution_caveats") or [])
+                if str(x).strip()
+            ],
         ))
 
     for sym in positions:
@@ -500,8 +569,22 @@ def compute_actions(
         "risk_diagnostic": risk_diagnostic,
         "n_earnings_adjusted": len(earnings_adjustment_notes),
         "n_risk_capped": len(risk_notes),
+        "n_review_gate_adjusted": len(review_gate_notes),
     }
     return actions, summary
+
+
+def _review_gate_sizing_multiplier(gate: dict[str, Any]) -> float:
+    if not isinstance(gate, dict) or gate.get("status") != "ok":
+        return 1.0
+    if gate.get("risk_veto"):
+        return 0.0
+    raw = gate.get("sizing_multiplier", 1.0)
+    try:
+        multiplier = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.0, min(1.0, multiplier))
 
 
 # ---------- markdown rendering ----------
@@ -574,6 +657,13 @@ def format_daily_report(
     if risk_diag:
         lines.extend(_render_risk_section(risk_diag, summary))
         lines.append("")
+    if summary.get("n_review_gate_adjusted", 0):
+        lines.append("## TradingAgents review gate")
+        lines.append("")
+        lines.append(
+            f"- {summary.get('n_review_gate_adjusted', 0)} target(s) were reduced by the review gate."
+        )
+        lines.append("")
 
     grouped: dict[str, list[Action]] = {}
     for a in actions:
@@ -622,6 +712,14 @@ def _render_action_block(a: Action) -> list[str]:
         sig_bits.append(f"signal {a.signal_age_days}d old")
     if sig_bits:
         pieces.append("- Signal: " + " · ".join(sig_bits))
+    if a.review_gate_status:
+        pieces.append(
+            "- TradingAgents gate: "
+            f"`{a.review_gate_status}`"
+            + (f" — {a.review_gate_reason}" if a.review_gate_reason else "")
+        )
+        for caveat in a.review_execution_caveats[:3]:
+            pieces.append(f"- Gate caveat: {caveat}")
 
     if a.action in ("BUY", "ADD", "TRIM", "EXIT"):
         pieces.append(

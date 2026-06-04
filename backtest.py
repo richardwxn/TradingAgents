@@ -305,6 +305,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--regime-min-ic-lift", type=float, default=0.02,
+        help=(
+            "Minimum train-window IC lift vs global IC required to ship "
+            "a regime-specific weight vector (default: 0.02)."
+        ),
+    )
+    parser.add_argument(
+        "--eligible-regimes",
+        nargs="+",
+        default=["chop", "trend_on"],
+        help=(
+            "Regimes allowed to receive regime-specific weights. Others "
+            "fall back to global weights (default: chop trend_on)."
+        ),
+    )
+    parser.add_argument(
+        "--no-require-regime-ic-ge-global",
+        action="store_true",
+        help=(
+            "Disable the regime IC >= global IC + lift gate. Intended for "
+            "diagnostics only."
+        ),
+    )
+    parser.add_argument(
         "--include-llm-critic", action="store_true",
         help=(
             "Phase 6: load the `llm_critic` block from each report (if "
@@ -871,6 +895,11 @@ def main() -> None:
             min_abs_ic=args.wf_min_abs_ic,
             min_n=args.wf_min_n,
             min_samples_per_regime=args.regime_min_samples,
+            min_regime_ic_lift=args.regime_min_ic_lift,
+            eligible_regimes=args.eligible_regimes,
+            require_regime_ic_ge_global=(
+                not args.no_require_regime_ic_ge_global
+            ),
         )
         rwf_summary = summarize_all(
             rwf_rebuilt,
@@ -886,6 +915,11 @@ def main() -> None:
             "min_abs_ic": args.wf_min_abs_ic,
             "min_n": args.wf_min_n,
             "min_samples_per_regime": args.regime_min_samples,
+            "min_regime_ic_lift": args.regime_min_ic_lift,
+            "eligible_regimes": args.eligible_regimes,
+            "require_regime_ic_ge_global": (
+                not args.no_require_regime_ic_ge_global
+            ),
             "n_refit_steps": len(rwf_timeline),
             "n_records_scored": len(rwf_rebuilt),
         }
