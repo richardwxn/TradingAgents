@@ -1,0 +1,117 @@
+# Nasdaq 100 constituent list, captured point-in-time for Phase B1 smoke screener.
+# Source: en.wikipedia.org/wiki/Nasdaq-100, canonical ETF constituent listing.
+# This is intentionally hardcoded for Phase B1 — Unit 4 (Phase B2) generates
+# the structured Nasdaq-Composite-filtered yaml dynamically from Polygon
+# reference data.
+#
+# Format: a flat ticker list. Sector tags are looked up from
+# configs/universe.yaml::sectors when available; tickers not in that map
+# bucket under "Unknown" in the screener output. Unit 4 will produce a
+# richer schema (symbol + sector + market_cap + adv_usd).
+
+generated_at: 2026-05-31
+source: nasdaq-100-constituents
+tickers:
+  - AAPL
+  - ABNB
+  - ADBE
+  - ADI
+  - ADP
+  - ADSK
+  - AEP
+  - AMAT
+  - AMD
+  - AMGN
+  - AMZN
+  - ANSS
+  - APP
+  - ARM
+  - ASML
+  - AVGO
+  - AXON
+  - AZN
+  - BIIB
+  - BKNG
+  - BKR
+  - CCEP
+  - CDNS
+  - CDW
+  - CEG
+  - CHTR
+  - CMCSA
+  - COST
+  - CPRT
+  - CRWD
+  - CSCO
+  - CSGP
+  - CSX
+  - CTAS
+  - CTSH
+  - DASH
+  - DDOG
+  - DLTR
+  - DXCM
+  - EA
+  - EXC
+  - FANG
+  - FAST
+  - FTNT
+  - GEHC
+  - GFS
+  - GILD
+  - GOOG
+  - GOOGL
+  - HON
+  - IDXX
+  - INTC
+  - INTU
+  - ISRG
+  - KDP
+  - KHC
+  - KLAC
+  - LIN
+  - LRCX
+  - LULU
+  - MAR
+  - MCHP
+  - MDB
+  - MDLZ
+  - MELI
+  - META
+  - MNST
+  - MRVL
+  - MSFT
+  - MSTR
+  - MU
+  - NFLX
+  - NVDA
+  - NXPI
+  - ODFL
+  - ON
+  - ORLY
+  - PANW
+  - PAYX
+  - PCAR
+  - PDD
+  - PEP
+  - PLTR
+  - PYPL
+  - QCOM
+  - REGN
+  - ROP
+  - ROST
+  - SBUX
+  - SHOP
+  - SNPS
+  - TEAM
+  - TMUS
+  - TSLA
+  - TTD
+  - TTWO
+  - TXN
+  - VRSK
+  - VRTX
+  - WBD
+  - WDAY
+  - XEL
+  - ZS

@@ -136,6 +136,21 @@ def _format_money(value: float | None) -> str:
     return "n/a" if value is None else f"${value:,.2f}"
 
 
+def _option_rank(ticket) -> str:
+    rank = (ticket.details or {}).get("option_intent_rank")
+    return "" if rank is None else f"#{rank}"
+
+
+def _option_score(ticket) -> str:
+    details = ticket.details or {}
+    score = details.get("option_intent_score")
+    label = details.get("option_intent_score_label")
+    if score is None:
+        return ""
+    suffix = f" {label}" if label else ""
+    return f"{float(score):.0f}/100{suffix}"
+
+
 def _format_batch_markdown(batch: ExecutionBatch) -> str:
     lines = [
         f"# Trade Tickets - {batch.as_of}",
@@ -183,14 +198,16 @@ def _format_batch_markdown(batch: ExecutionBatch) -> str:
         lines.extend([
             "## Blocked Or Intent Only",
             "",
-            "| Ticket | Asset | Symbol | Side | Source | Reason |",
-            "|---|---|---|---|---|---|",
+            "| Ticket | Asset | Symbol | Side | Source | Option Rank | Option Score | Reason |",
+            "|---|---|---|---|---|---:|---:|---|",
         ])
         for t in batch.blocked_tickets:
             reason = (t.blocked_reason or "").replace("|", "\\|")
+            rank = _option_rank(t)
+            score = _option_score(t)
             lines.append(
                 f"| `{t.ticket_id}` | {t.asset_type} | {t.symbol} | {t.side} | "
-                f"{t.source_action} | {reason} |"
+                f"{t.source_action} | {rank} | {score} | {reason} |"
             )
         lines.append("")
 
@@ -207,6 +224,17 @@ def _format_batch_markdown(batch: ExecutionBatch) -> str:
             lines.append(f"- Gate reason: {t.review_gate_reason}")
         for caveat in t.review_execution_caveats:
             lines.append(f"- Gate caveat: {caveat}")
+        option_rank = _option_rank(t)
+        option_score = _option_score(t)
+        if option_score:
+            lines.append(f"- Option intent rank: {option_rank or 'n/a'}")
+            lines.append(f"- Option intent score: {option_score}")
+            lines.append(
+                "- Option signal context: "
+                f"direction `{(t.details or {}).get('report_direction')}`, "
+                f"composite `{(t.details or {}).get('report_composite')}`, "
+                f"confidence `{(t.details or {}).get('report_confidence')}`"
+            )
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

@@ -1002,14 +1002,16 @@ def _format_trade_ticket_markdown(batch) -> str:
         lines.extend([
             "## Blocked Or Intent Only",
             "",
-            "| Ticket | Asset | Symbol | Side | Source | Reason |",
-            "|---|---|---|---|---|---|",
+            "| Ticket | Asset | Symbol | Side | Source | Option Rank | Option Score | Reason |",
+            "|---|---|---|---|---|---:|---:|---|",
         ])
         for ticket in batch.blocked_tickets:
             reason = (ticket.blocked_reason or "").replace("|", "\\|")
+            rank = _option_rank(ticket)
+            score = _option_score(ticket)
             lines.append(
                 f"| `{ticket.ticket_id}` | {ticket.asset_type} | {ticket.symbol} | "
-                f"{ticket.side} | {ticket.source_action} | {reason} |"
+                f"{ticket.side} | {ticket.source_action} | {rank} | {score} | {reason} |"
             )
         lines.append("")
 
@@ -1025,6 +1027,17 @@ def _format_trade_ticket_markdown(batch) -> str:
             lines.append(f"- Gate reason: {ticket.review_gate_reason}")
         for caveat in ticket.review_execution_caveats:
             lines.append(f"- Gate caveat: {caveat}")
+        option_rank = _option_rank(ticket)
+        option_score = _option_score(ticket)
+        if option_score:
+            lines.append(f"- Option intent rank: {option_rank or 'n/a'}")
+            lines.append(f"- Option intent score: {option_score}")
+            lines.append(
+                "- Option signal context: "
+                f"direction `{(ticket.details or {}).get('report_direction')}`, "
+                f"composite `{(ticket.details or {}).get('report_composite')}`, "
+                f"confidence `{(ticket.details or {}).get('report_confidence')}`"
+            )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1083,6 +1096,21 @@ def _fills_template(batch) -> dict[str, Any]:
 
 def _fmt_money(value: float | None) -> str:
     return "n/a" if value is None else f"${value:,.2f}"
+
+
+def _option_rank(ticket) -> str:
+    rank = (ticket.details or {}).get("option_intent_rank")
+    return "" if rank is None else f"#{rank}"
+
+
+def _option_score(ticket) -> str:
+    details = ticket.details or {}
+    score = details.get("option_intent_score")
+    label = details.get("option_intent_score_label")
+    if score is None:
+        return ""
+    suffix = f" {label}" if label else ""
+    return f"{float(score):.0f}/100{suffix}"
 
 
 def _output_dir_from_reports_glob(reports_glob: str) -> str | None:
@@ -2670,6 +2698,7 @@ def _html_page() -> str:
       `;
     }}
     function tradeTicketTable(tickets, ready) {{
+      const extraHeader = ready ? '' : '<th>Option rank</th><th>Option score</th>';
       const rows = tickets.map(t => `
         <tr>
           <td><code>${{escapeHtml(t.ticket_id)}}</code></td>
@@ -2680,15 +2709,26 @@ def _html_page() -> str:
           <td>${{fmtMoney(t.limit_price)}}</td>
           <td>${{escapeHtml(t.time_in_force || '')}}</td>
           <td>${{escapeHtml(t.source_action || '')}}</td>
+          ${{ready ? '' : `<td>${{optionIntentRank(t)}}</td><td>${{optionIntentScore(t)}}</td>`}}
           <td>${{ready ? escapeHtml(t.rationale || '') : escapeHtml(t.blocked_reason || '')}}</td>
         </tr>
       `).join('');
       return `
         <table>
-          <thead><tr><th>Ticket</th><th>Asset</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Limit</th><th>TIF</th><th>Source</th><th>${{ready ? 'Rationale' : 'Reason'}}</th></tr></thead>
+          <thead><tr><th>Ticket</th><th>Asset</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Limit</th><th>TIF</th><th>Source</th>${{extraHeader}}<th>${{ready ? 'Rationale' : 'Reason'}}</th></tr></thead>
           <tbody>${{rows}}</tbody>
         </table>
       `;
+    }}
+    function optionIntentRank(t) {{
+      const rank = t.details && t.details.option_intent_rank;
+      return rank ? `#${{escapeHtml(rank)}}` : '';
+    }}
+    function optionIntentScore(t) {{
+      const details = t.details || {{}};
+      if (details.option_intent_score === null || details.option_intent_score === undefined) return '';
+      const label = details.option_intent_score_label ? ` ${{details.option_intent_score_label}}` : '';
+      return `${{fmtNum(details.option_intent_score)}}/100${{escapeHtml(label)}}`;
     }}
     function ticketQuantityLabel(t) {{
       const qty = t.quantity || '—';

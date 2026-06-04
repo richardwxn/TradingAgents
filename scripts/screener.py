@@ -309,6 +309,16 @@ def main() -> int:
         help="Cap per sector bucket. Default: 5.",
     )
     parser.add_argument(
+        "--top-n-per-cohort",
+        type=int,
+        default=25,
+        help=(
+            "Cap per cohort bucket (approach b: tech vs non_tech tables). "
+            "Default: 25. Lets non_tech names be evaluated on their own "
+            "scale without losing the global top-N to tech-weighted scores."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default="reports/screener",
         help="Output dir (date subdir appended). Default: reports/screener.",
@@ -475,6 +485,7 @@ def main() -> int:
         ScreenerCandidate,
         candidate_to_dict,
         rank_candidates,
+        rank_candidates_per_cohort,
         rank_per_sector,
         render_screener_markdown,
     )
@@ -529,6 +540,11 @@ def main() -> int:
             base_url=args.tradingagents_review_base_url,
         )
     per_sector = rank_per_sector(candidates, top_n_per_sector=args.top_n_per_sector)
+    # Approach (b): per-cohort top picks let non_tech names be evaluated
+    # on their own scale without competing against tech-weight composites.
+    per_cohort = rank_candidates_per_cohort(
+        candidates, top_n_per_cohort=args.top_n_per_cohort
+    )
 
     ranked_json_payload = {
         "as_of_date": args.date,
@@ -540,10 +556,15 @@ def main() -> int:
         "workers": args.workers,
         "top_n": args.top_n,
         "top_n_per_sector": args.top_n_per_sector,
+        "top_n_per_cohort": args.top_n_per_cohort,
         "cohort_aware": bool(args.cohort_aware),
         "tradingagents_review_enabled": bool(args.enable_tradingagents_review),
         "tradingagents_review_top_n": args.tradingagents_review_top_n,
         "top_overall": [candidate_to_dict(c) for c in top_overall],
+        "per_cohort": {
+            cohort: [candidate_to_dict(c) for c in picks]
+            for cohort, picks in per_cohort.items()
+        },
         "per_sector": {
             sector: [candidate_to_dict(c) for c in picks]
             for sector, picks in per_sector.items()
@@ -555,6 +576,7 @@ def main() -> int:
     md = render_screener_markdown(
         top_overall=top_overall,
         per_sector_top=per_sector,
+        per_cohort_top=per_cohort,
         as_of_date=args.date,
         universe_size=universe_size,
         scan_elapsed_s=scan_elapsed_s,
@@ -562,6 +584,7 @@ def main() -> int:
         excluded_core_count=excluded_count,
         top_n=args.top_n,
         top_n_per_sector=args.top_n_per_sector,
+        top_n_per_cohort=args.top_n_per_cohort,
         cohort_aware=bool(args.cohort_aware),
     )
     md_path = out_dir / "ranked.md"

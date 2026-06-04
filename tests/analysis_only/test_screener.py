@@ -16,6 +16,7 @@ from tradingagents.analysis_only.screener import (
     cohort_for_sector,
     extract_candidate_from_report,
     rank_candidates,
+    rank_candidates_per_cohort,
     rank_per_sector,
     render_screener_markdown,
     rescore_report_for_cohort,
@@ -264,6 +265,70 @@ def test_rank_per_sector_also_uses_tech_weights_when_populated():
     ]
     bucketed = rank_per_sector(cands, top_n_per_sector=3)
     assert [c.symbol for c in bucketed["Healthcare"]] == ["HZ", "HY", "HX"]
+
+
+# ---------- rank_candidates_per_cohort (approach b) ----------
+
+
+def test_rank_candidates_per_cohort_separates_tech_and_non_tech():
+    cands = [
+        ScreenerCandidate(symbol="NVDA", composite_score=0.50,
+                          composite_score_tech_weights=0.50,
+                          cohort="tech", direction="bullish", confidence=0.72),
+        ScreenerCandidate(symbol="JPM", composite_score=0.83,
+                          composite_score_tech_weights=0.55,
+                          cohort="non_tech", direction="bullish", confidence=0.77),
+        ScreenerCandidate(symbol="AAPL", composite_score=0.60,
+                          composite_score_tech_weights=0.60,
+                          cohort="tech", direction="bullish", confidence=0.70),
+        ScreenerCandidate(symbol="XOM", composite_score=0.83,
+                          composite_score_tech_weights=0.40,
+                          cohort="non_tech", direction="bullish", confidence=0.74),
+    ]
+    out = rank_candidates_per_cohort(cands, top_n_per_cohort=5)
+    assert list(out.keys()) == ["tech", "non_tech"]
+    assert [c.symbol for c in out["tech"]] == ["AAPL", "NVDA"]
+    # non_tech ties at composite_score 0.83; tiebreaker is tech-weights via
+    # _effective_rank_score → JPM (0.55) > XOM (0.40).
+    assert [c.symbol for c in out["non_tech"]] == ["JPM", "XOM"]
+
+
+def test_rank_candidates_per_cohort_caps_at_top_n():
+    cands = [
+        ScreenerCandidate(
+            symbol=f"T{i}", composite_score=float(i) / 10,
+            composite_score_tech_weights=float(i) / 10,
+            cohort="tech", direction="bullish", confidence=0.5,
+        )
+        for i in range(10)
+    ]
+    out = rank_candidates_per_cohort(cands, top_n_per_cohort=3)
+    assert len(out["tech"]) == 3
+    assert [c.symbol for c in out["tech"]] == ["T9", "T8", "T7"]
+
+
+def test_rank_candidates_per_cohort_orders_tech_first_then_unknown_last():
+    cands = [
+        ScreenerCandidate(symbol="X", composite_score=0.5, cohort="non_tech",
+                          direction="bullish", confidence=0.6),
+        ScreenerCandidate(symbol="Y", composite_score=0.5, cohort="tech",
+                          direction="bullish", confidence=0.6),
+        ScreenerCandidate(symbol="Z", composite_score=0.5, cohort=None,
+                          direction="bullish", confidence=0.6),
+    ]
+    out = rank_candidates_per_cohort(cands, top_n_per_cohort=5)
+    assert list(out.keys()) == ["tech", "non_tech", "unknown"]
+
+
+def test_rank_candidates_per_cohort_handles_missing_cohort_field():
+    """Candidates without .cohort set fall into the 'unknown' bucket."""
+    cands = [
+        ScreenerCandidate(symbol="A", composite_score=0.4, direction="bullish",
+                          confidence=0.5),  # cohort=None default
+    ]
+    out = rank_candidates_per_cohort(cands, top_n_per_cohort=5)
+    assert "unknown" in out
+    assert out["unknown"][0].symbol == "A"
 
 
 # ---------- rank_per_sector ----------

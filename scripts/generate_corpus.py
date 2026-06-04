@@ -87,7 +87,10 @@ def report_path(output_dir: Path, ticker: str, date_str: str) -> Path:
 
 
 def _generate_one(
-    args: tuple[str, str, str, str, int, bool, str | None, float, bool, bool],
+    args: tuple[
+        str, str, str, str, int, bool, str | None, float, bool, bool,
+        str | None, str | None,
+    ],
 ) -> dict:
     """Worker: generate a single report. Returns a result dict for the parent
     process to aggregate. Defined at module level so it's picklable.
@@ -108,6 +111,8 @@ def _generate_one(
         pace_seconds,
         skip_news,
         skip_filings,
+        confidence_calibration_path,
+        regime_weights_path,
     ) = args
     if pace_seconds > 0:
         time.sleep(pace_seconds)
@@ -147,6 +152,13 @@ def _generate_one(
                 state_store_path=state_store_path,
                 enable_news_fetching=not skip_news,
                 enable_filings_fetching=not skip_filings,
+                # Plumb the Phase-4 / Phase-5 config paths through so the
+                # regen output reflects calibrated confidence + regime-
+                # conditional weights when the artifacts exist on disk.
+                # Section 28 smoke discovered the pipeline ignored both
+                # in regen-mode because these were missing here.
+                confidence_calibration_path=confidence_calibration_path,
+                regime_weights_path=regime_weights_path,
             )
             report = mvp.run(symbol=ticker, as_of_date=date_str)
             mvp.save_report(report, output_dir=output_dir)
@@ -274,6 +286,27 @@ def main() -> int:
             "validate `filings_recency_signal` IC on a regenerated corpus."
         ),
     )
+    parser.add_argument(
+        "--confidence-calibration-path",
+        default="configs/confidence_calibration.json",
+        help=(
+            "Path to the Phase-5 isotonic confidence calibration JSON. "
+            "When present, the pipeline uses calibrated `confidence` "
+            "instead of the heuristic formula. Pass an empty string to "
+            "force heuristic. Default matches `analysis_mvp.py` so regen "
+            "output is consistent with single-shot reports."
+        ),
+    )
+    parser.add_argument(
+        "--regime-weights-path",
+        default="configs/regime_weights.json",
+        help=(
+            "Path to the Phase-4 regime-conditional factor weights JSON. "
+            "When present, the pipeline applies per-regime weights at "
+            "inference; missing regimes fall back to `DEFAULT_FACTOR_WEIGHTS`. "
+            "File doesn't need to exist — pipeline silently falls back."
+        ),
+    )
     args = parser.parse_args()
     # `--minimal-context` is the legacy bundled flag — expand it into the
     # individual skip flags so the rest of the code only checks the
@@ -305,7 +338,16 @@ def main() -> int:
     # so chronological execution is needed for the trailing window to
     # populate correctly during a first-time backfill.
     state_store_path = args.state_store_path or None
-    JobTuple = tuple[str, str, str, str, int, bool, str | None, float, bool, bool]
+    # Phase-4 / Phase-5 config paths: pass None when missing so the pipeline
+    # falls back to default weights / heuristic confidence. When present,
+    # workers pick them up so regen output reflects production-grade
+    # calibration and regime-aware weights.
+    cal_path = args.confidence_calibration_path or None
+    regime_path = args.regime_weights_path or None
+    JobTuple = tuple[
+        str, str, str, str, int, bool, str | None, float, bool, bool,
+        str | None, str | None,
+    ]
     jobs: list[JobTuple] = [
         (
             t,
@@ -318,6 +360,8 @@ def main() -> int:
             args.pace_seconds,
             skip_news,
             skip_filings,
+            cal_path,
+            regime_path,
         )
         for d in dates
         for t in tickers

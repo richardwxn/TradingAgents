@@ -394,6 +394,43 @@ def rank_candidates(
     return sorted_c[:top_n]
 
 
+def rank_candidates_per_cohort(
+    candidates: list[ScreenerCandidate],
+    *,
+    top_n_per_cohort: int = 25,
+) -> dict[str, list[ScreenerCandidate]]:
+    """Rank candidates separately within each cohort.
+
+    Approach (b) from Section 27 deferred: emit per-cohort tables so
+    non_tech names don't have to compete with tech for the global top-N.
+    Tech and non_tech weights are calibrated against different signals
+    (Section 22 cohort split) — direct global comparison systematically
+    favors tech.
+
+    Within each cohort, ranking uses the same `_effective_rank_score`
+    (prefers tech-weights composite as tiebreaker when cohort-aware
+    saturates the displayed `composite_score`).
+
+    Returns `dict[cohort_label, list[ScreenerCandidate]]`. Cohort
+    ordering: `tech` first, then `non_tech`, then any other labels
+    (alphabetical) — deterministic for the markdown render.
+    """
+    buckets: dict[str, list[ScreenerCandidate]] = {}
+    for c in candidates:
+        buckets.setdefault(c.cohort or "unknown", []).append(c)
+    out: dict[str, list[ScreenerCandidate]] = {}
+    preferred = ["tech", "non_tech"]
+    known = [k for k in preferred if k in buckets]
+    rest = sorted(k for k in buckets if k not in preferred)
+    for cohort in known + rest:
+        sorted_c = sorted(
+            buckets[cohort],
+            key=lambda c: (-_effective_rank_score(c), -c.confidence, c.symbol),
+        )
+        out[cohort] = sorted_c[:top_n_per_cohort]
+    return out
+
+
 def rank_per_sector(
     candidates: list[ScreenerCandidate],
     *,
@@ -481,6 +518,8 @@ def render_screener_markdown(
     top_n: int | None = None,
     top_n_per_sector: int | None = None,
     cohort_aware: bool | None = None,
+    per_cohort_top: dict[str, list[ScreenerCandidate]] | None = None,
+    top_n_per_cohort: int | None = None,
 ) -> str:
     """Render the full screener markdown.
 
@@ -562,6 +601,39 @@ def render_screener_markdown(
                 f" {_fmt_review(c)} |"
             )
         lines.append("")
+
+    # Per-cohort top picks (approach b from Section 27 deferred). Lets
+    # non_tech names be evaluated on their own scale instead of competing
+    # against tech-weighted composites in the global top-N. Renders BEFORE
+    # the per-sector view because cohort is the coarser, more decision-
+    # relevant cut.
+    if per_cohort_top:
+        title = "## Per-cohort top picks"
+        if top_n_per_cohort is not None:
+            title += f" (top {top_n_per_cohort} each)"
+        lines.append(title)
+        lines.append("")
+        for cohort, picks in per_cohort_top.items():
+            label = cohort.replace("_", "-")
+            lines.append(f"### Cohort: {label}")
+            lines.append("")
+            if not picks:
+                lines.append("_No candidates in this cohort._")
+                lines.append("")
+                continue
+            lines.append(
+                "| # | Symbol | Composite | Composite (tech wts) | "
+                "Direction | Confidence | Sector | Top factors |"
+            )
+            lines.append("|---|---|---:|---:|---|---:|---|---|")
+            for i, c in enumerate(picks, start=1):
+                tf = " · ".join(_fmt_factor(t) for t in c.top_factors) or "—"
+                lines.append(
+                    f"| {i} | **{c.symbol}** | {c.composite_score:+.3f} | "
+                    f"{_fmt_tech_wt_composite(c)} | {c.direction} | "
+                    f"{c.confidence:.2f} | {c.sector} | {tf} |"
+                )
+            lines.append("")
 
     lines.append("## Per-sector top picks")
     lines.append("")

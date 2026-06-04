@@ -88,10 +88,17 @@ def test_analysis_ui_trade_tickets_writes_handoff_files(tmp_path):
     assert out["report_coverage"]["resolved_count"] == 1
     assert out["batch"]["summary"]["ready_count"] == 1
     assert out["batch"]["summary"]["option_intent_count"] == 1
+    option_ticket = next(
+        t for t in out["batch"]["blocked_tickets"] if t["asset_type"] == "option_intent"
+    )
+    assert option_ticket["details"]["option_intent_rank"] == 1
+    assert option_ticket["details"]["option_intent_score"] == 86.2
     assert Path(out["paths"]["ticket_json"]).exists()
     assert Path(out["paths"]["ticket_markdown"]).exists()
     assert Path(out["paths"]["codex_review"]).exists()
     assert Path(out["paths"]["fills_template"]).exists()
+    assert "Option Score" in out["ticket_markdown"]
+    assert "86/100 high" in out["ticket_markdown"]
     assert "Do not place any order" in out["codex_review"]
 
 

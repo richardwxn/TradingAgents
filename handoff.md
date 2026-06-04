@@ -29,6 +29,15 @@ Goal: report-style deliverable (no automated trading). Every report should be
 | 13 | Verification + direction-threshold calibration (v1.1) | ✅ done | See [Section 13](#section-13--verification--direction-threshold-calibration-v11-done) |
 | 18 | Options IV surface + history + zero-weight factors | ✅ done | See [Section 18](#18-options-iv-surface--history--zero-weight-factors) |
 | 19 | Tier-1 corpus regen + IV-factor IC | ✅ done | See [Section 19](#19-tier-1-corpus-regen--iv-factor-ic--data-limitation-discovered). IV factors stay at weight=0; data limitation surfaced. |
+| 20 | Phase 1 corpus + BSM-reconstructed historical IV | ✅ done | See [Section 20](#20-phase-1-corpus--real-iv-factor-ic-bsm-reconstructed-historical). `options_iv_rank` validates at 20d; `market_fear_greed_regime` IC inverted on multi-regime data. |
+| 21 | v1.3 weight commit + counterfactual validation | ✅ done | See [Section 21](#21-v1-3-weight-commit--counterfactual-validation). iv_rank → 0.04; fear_greed → 0.00. 5d/20d clean lifts; 60d −1-3pp regression. |
+| 22 | Phase 2 universe (24 core + 6 canary) + cohort IC | ✅ done | See [Section 22](#22-phase-2-universe--cohort-ic-analysis). `market_fear_greed_regime` is sector-specific: -0.36 IC on tech, +0.18 on canaries. Supports v1.4 sign-inversion. |
+| 23 | Performance — RFR cache + --minimal-context flag | ✅ done | See [Section 23](#23-performance--rfr-caching--minimal-context-flag). −3s/report; ~2.3h off Phase-2-scale regen. |
+| 24 | v1.4 — fear_greed sign-inverted + restored to 0.05 | ✅ done | See [Section 24](#24-v1-4-weight-commit--market-fear-greed-regime-sign-inverted--restored). Correctness fix; muted lift due to 64% data_available=False coverage. TEST 60d bearish +3.2pp. |
+| 25 | VIX fear/greed proxy + options-aware ledger | ✅ done | See [Section 25](#25-vix-based-feargreed-proxy--options-aware-ledger). VIX proxy fills the 64% F&G coverage gap; options ledger renders Greeks-aware position cards in daily report. |
+| 26 | Earnings-aware sizing + portfolio risk caps | ✅ done | See [Section 26](#26-earnings-aware-sizing--portfolio-level-risk-caps). Long-only-tuned: pre-earnings 50% trim, sector/β/correlation caps with cash-drag-correct beta budget math. |
+| 27 | Phase 2 v1.4 regen + Nasdaq Composite screener + financials cache | ✅ done | See [Section 27](#27-phase-2-v14-regen--nasdaq-composite-screener--financials-cache). v1.4 weights+VIX proxy regen confirms inversion; +0.72pp / +0.79pp at 60d. New screener surfaces high-composite Nasdaq names outside the curated core. Polygon Financials module-level cache shipped for next regen. |
+| 28 | Walk-forward OOS harness + calibration refresh + v1.5/v1.6 commits | ✅ done | See [Section 28](#28-walk-forward-oos-harness--calibration-refresh--v15v16-commits). Walk-forward shows v1.4 not overfit (median ≥ single-split). Calibrated confidence Brier −44%. v1.5 stays committed (walk-forward +0.66pp at 60d). **v1.6 inverts `market_spy_trend`** sign on +0.51pp walk-forward gate. |
 
 ## Target architecture (after #7)
 
@@ -2173,3 +2182,1176 @@ data accumulate while the rest of the options layer gets built.
 - `records.csv` — one row per report.
 - `summary_override.{json,md}` — composites rebuilt under v1 weights
   (sanity check that v1 still produces the documented lift).
+
+## 20. Phase 1 corpus + real IV-factor IC (BSM-reconstructed historical)
+
+### What ran
+
+1. **Built BSM IV machinery** (`tradingagents/analysis_only/bsm.py`):
+   pure-Python Black-Scholes pricer + Newton-Raphson IV inverter (with
+   bisection fallback). 56 unit tests covering ATM/ITM/OTM round-trips
+   across strike × kind × sigma grids.
+2. **Risk-free rate via yfinance `^IRX`** (no FRED dep): loads daily
+   13-week T-bill yield series, in-memory cached, walks back ≤10 days
+   for weekends/holidays.
+3. **`PolygonOptionsHistoricalProvider`**
+   (`tradingagents/analysis_only/options_historical.py`): lists contracts
+   via `/v3/reference/options/contracts?as_of=...` and parallel-fetches
+   per-contract day aggs via `/v2/aggs/...`, then BSM-inverts IV from the
+   close price. Returns the same normalized chain shape downstream code
+   expects so `compute_iv_surface` / `build_option_strategies` work
+   unchanged.
+4. **Pipeline routing**: `_load_option_chain_for_strategies` now branches
+   on `_resolve_pit_mode(as_of_date)` — historical dates use the new
+   provider, live dates keep the snapshot. Unusual-flow scan stays
+   live-only (intraday/quote data not on Starter).
+5. **BSM validation**: median |Δ| = 2.79% in the ATM ±5% band used by
+   `compute_iv_surface`; bias near zero. Worst outliers are 7d
+   near-the-money contracts (sub-$1 time value → IV hyper-sensitive).
+   Acceptable for IV-factor purposes.
+6. **Phase 1 corpus regen**: 12 tickers × 150 Fridays (2023-07-14 →
+   2026-05-22) = 1,800 jobs. Two-pass: 125 at 2 workers, then 1,434 more
+   at 4 workers (66 min). 1,775 reports written; 25 missing are all ALAB
+   pre-IPO dates (ALAB listed 2024-03-20 — not data, not engineering
+   failures). IV surface coverage: 1,061/1,787 reports `status=ok` (60%)
+   vs ~17% before. `iv_history_status=ok` on 663 reports vs 0 before.
+
+### Per-factor IC on the 1,775-record corpus (under v1 weights)
+
+**Existing factors (sanity check)**:
+
+| Factor | n_5d / n_20d / n_60d | IC 5d | IC 20d | IC 60d |
+|---|---|---:|---:|---:|
+| `valuation_sales_multiple_vs_growth` | 1396 / 1363 / 1268 | +0.070 | +0.115 | **+0.230** |
+| `fund_fcf_growth` | 1387 / 1357 / 1267 | +0.054 | +0.112 | +0.111 |
+| `peer_relative_valuation` | 322 / 307 / 261 | -0.062 | -0.122 | -0.102 |
+| `market_fear_greed_regime` | 602 / 563 / 446 | -0.056 | **-0.103** | **-0.197** |
+| `trend_sma20_vs_sma50` | 1590 / 1551 / 1434 | +0.025 | +0.008 | +0.011 |
+| `options_net_flow` | 1590 / 1551 / 1434 | -0.022 | -0.020 | -0.061 |
+
+**New IV factors (the gating measurement)**:
+
+| Factor | n_20d | IC 20d | Per-ticker median IC 20d | Per-ticker consistency 20d |
+|---|---:|---:|---:|---:|
+| **`options_iv_rank`** | 597 | **+0.154** | **+0.107** | **63.6%** |
+| `options_iv_term_structure` | 805 | +0.048 | +0.053 | 54.6% |
+| `options_iv_skew` | 827 | -0.007 | — | — |
+
+`options_iv_term_structure` at 60d: headline IC **-0.115**, per-ticker
+median **-0.118**, **82% sign consistency** across 11 tickers — strong
+inversion of the placeholder sign at the 60d horizon (and flip from
+weak-positive at 20d).
+
+### Two real findings worth deciding on
+
+**Finding A — `options_iv_rank` validates (recommend promote).**
+Multi-ticker validated signal at 20d horizon. Placeholder sign is
+correct (low IV rank → bullish forward returns). Comparable in
+magnitude/consistency to `peer_relative_momentum` (weight 0.05) and
+`fund_fcf_growth` (weight 0.08). Conservative weight proposal: **0.04**.
+
+**Finding B — `market_fear_greed_regime` sign inverted across the
+multi-regime corpus.** Section 12 fitted +0.32 IC on the 2025-11 →
+2026-05 strongly-bullish 6-month corpus. The 3-year Phase 1 corpus
+shows -0.10/-0.20 IC at 20d/60d — the contrarian-bid-on-fear thesis
+doesn't survive a broader regime. The factor currently carries weight
+0.08 (one of the heaviest). Three options:
+  1. **Invert the sign** in `score_fear_greed_regime` (fear → bearish,
+     greed → bullish). Simple but a big semantic change to commit on a
+     single corpus refit.
+  2. **Drop the weight to 0** pending more analysis. Conservative;
+     loses 8% of total weight (renormalizes onto everything else).
+  3. **Leave it.** Don't change weights without separate review.
+
+Decisions on A and B are left to the user — both are real
+weight-meaningful changes and the discipline you've maintained is "no
+weight changes without your input."
+
+### Honest caveats
+
+- Polygon Options Starter has spotty historical coverage for pre-2024
+  dates on less-liquid tickers; many reports for 2023-H2 / 2024-H1
+  still ended up with `options_iv.status=unavailable` (714/1,787).
+  Per-factor IC is computed on the records that do have IV — the n
+  column reflects this.
+- BSM uses `day.close` (no historical NBBO on Starter). Median 2.8%
+  agreement with Polygon's published IV in the ATM band; worst is 7d
+  near-the-money contracts. For surface-aggregate factors (which
+  average multiple contracts) the noise washes out.
+- Risk-free rate from yfinance `^IRX` — daily, walked back ≤10 trading
+  days for weekends. Constant-rate assumption per report (not
+  per-contract). Effect on IV is sub-1pp typically.
+- `market_fear_greed_regime` finding is on the 2023-2026 window —
+  itself one regime in a longer history. Inverting on this corpus
+  could overfit the inversion. Cautious read: the +0.32 Section 12
+  number was overfit to a narrow regime; the -0.10/-0.20 number is
+  more honest but still a single 3-year window. The factor is probably
+  closer to zero on a really long history.
+
+### Output artifacts
+
+- `backtest/results/phase1/{summary,factor_summary,factor_summary_vs_benchmark,
+  factor_summary_by_ticker,summary_override}.{json,md}`
+- `backtest/results/phase1/records.csv` (1,842 records)
+
+## 21. v1.3 weight commit + counterfactual validation
+
+### What changed (Section 20 follow-through)
+
+| Factor | v1 → v1.3 | Reason |
+|---|---|---|
+| `options_iv_rank` | 0.00 → **0.04** | Phase 1 IC +0.154 at 20d (n=597); per-ticker median +0.107 with 63.6% sign consistency. Placeholder sign confirmed correct. |
+| `market_fear_greed_regime` | 0.08 → **0.00** | Multi-regime IC inverted: -0.10/-0.20 at 20d/60d vs the +0.32 single-regime fit from Section 12. Conservative drop-to-zero rather than committing to the inversion. |
+
+Net weight delta -0.04; remaining sum 0.96 renormalizes back to 1.00, distributing the 4% across all other factors.
+
+### Counterfactual validation on Phase 1 corpus
+
+Ran `backtest.py` under both weight sets on the same 1,775-report Phase 1 corpus:
+
+| Horizon | Metric | v1 | v1.3 | Δ |
+|---|---|---:|---:|---:|
+| 5d | bullish hit | 57.79% | 57.91% | +0.12pp |
+| 5d | bearish hit | 44.16% | 47.66% | **+3.50pp** |
+| **20d** | **bullish hit** | **65.74%** | **66.78%** | **+1.04pp** |
+| **20d** | **bearish hit** | **43.14%** | **48.05%** | **+4.91pp** |
+| 20d | composite [+0.20,+0.50) hit | 66.26% | 65.99% | −0.27pp |
+| 60d | bullish hit | 73.24% | 72.02% | **−1.22pp** |
+| 60d | bearish hit | 43.70% | 40.95% | **−2.75pp** |
+| 60d | composite [+0.50,+1.00) hit | 77.70% | 75.80% | **−1.90pp** |
+
+**5d and 20d uniformly improve** (clean lifts on both bullish and bearish
+hit-rates). **60d degrades** by ~1-3pp — the model lost a factor
+(`market_fear_greed_regime` at weight 0.08) that had real negative-IC
+signal at 60d on this corpus, and the replacement (`options_iv_rank` at
+0.04) doesn't carry signal at 60d (+0.03 IC).
+
+### Honest read
+
+This is a **horizon trade-off**, not a clean win:
+
+- v1.3 wins at 5d/20d, particularly on the bearish bucket (still
+  sub-50% precision but +5pp improvement is meaningful given the
+  Section 14/15 work showing bearish has been the hard side).
+- v1.3 loses ~2pp at 60d — Section 13 deliberately chose 60d as the
+  "primary" horizon for tuning. By that lens v1.3 is a regression.
+
+There's a more aggressive alternative on the table: **commit the
+inversion** for `market_fear_greed_regime` instead of zeroing it.
+Phase 1 evidence supports it (-0.20 IC at 60d, opposite of the
+placeholder). That would likely:
+- Restore (or improve) the 60d performance v1.3 lost
+- Add to the 20d lift
+
+I went conservative (drop-to-zero) rather than committing to the
+inversion on a single corpus refit, but it's a fair argument the
+multi-regime corpus is broad enough to support flipping the sign.
+Flagged as a follow-up.
+
+### Why drop-to-zero is still defensible right now
+
+The contrarian story (Section 12's +0.32 IC) was anchored in
+behavioral finance — extreme fear historically marks oversold
+bottoms in many studies. The Phase 1 corpus 2023-2026 had several
+short-lived fear spikes (Oct 2023, Aug 2024, Apr 2025) that all
+reversed quickly, so "fear → bullish" got penalized. A truly long
+history (e.g., 2008, 2020) would probably show the contrarian story
+working in deep panics and failing in shallow ones. Committing to
+the simple inversion would lose that nuance.
+
+### Code + test changes
+
+- `tradingagents/analysis_only/scoring.py`: weights updated; inline
+  comments document v1.3 rationale per factor.
+- `tests/analysis_only/test_scoring.py`: replaced
+  `test_iv_factors_have_zero_weight_initially` with explicit assertions
+  for each factor's v1.3 weight (term_structure / skew stay at 0; rank
+  at 0.04; fear_greed at 0.00).
+- **320/320 tests pass.**
+
+### Output artifacts
+
+- `backtest/results/phase1_v1_3/summary.{json,md}` — v1.3 backtest.
+- `backtest/results/phase1/summary_override.{json,md}` — v1 baseline
+  for comparison (already existed from Section 20).
+
+### Deferred
+
+- **`market_fear_greed_regime` sign inversion option.** If the next
+  decision favors more aggression, the change is one-line in
+  `score_fear_greed_regime` (negate the score sign) plus restoring the
+  factor's weight (probably to 0.05 — somewhat lower than 0.08 since
+  signal strength is smaller than Section 12 suggested).
+- **`options_iv_term_structure` horizon-conditional sign**. Currently
+  weight=0; the 60d inversion (per-ticker 82% consistency) is a real
+  signal but committing means choosing a horizon. Possible future
+  extension: emit two versions (`options_iv_term_structure_20d` with
+  placeholder sign, `options_iv_term_structure_60d` with inverted
+  sign) so each gets its own weight.
+
+## 22. Phase 2 universe + cohort IC analysis
+
+### What ran
+
+- **Universe expansion**: `configs/universe.yaml` now defines two cohorts.
+  Core (24 tech / semi / AI tickers, drives weight tuning): added AAPL,
+  MSFT, GOOGL, META, ORCL, ARM, ASML, KLAC, ANET, PLTR, CRWD, MRVL on
+  top of the original 12. Canary (6 cross-sector diagnostic, NOT for
+  weight tuning): JPM, XOM, LLY, PG, NEE, COST. `scripts/generate_corpus.py`
+  loads the yaml by default; CLI `--tickers` still overrides.
+- **Corpus regen**: 2,697 new reports written in 4h 38min at 4 workers
+  (28 errors, all legitimate pre-IPO date attempts — ARM listed 2023-09,
+  ALAB 2024-03, etc.). Total corpus: 4,543 reports across 30 tickers.
+- **Cohort IC split** (`scripts/cohort_ic_split.py`): post-processes
+  `factor_summary_by_ticker.json` against the universe yaml to produce
+  side-by-side core vs canary per-factor IC. Not a backtest.py change —
+  pure read-only diagnostic.
+
+### Headline finding — `market_fear_greed_regime` is sector-specific
+
+| Horizon | Core (tech) median IC | Canary (cross-sector) median IC | Sign agree? |
+|---|---:|---:|:---:|
+| 20d | **−0.082** (23 tickers, 65%) | −0.027 (6) | ✓ |
+| **60d** | **−0.362** (23 tickers, 70%) | **+0.183** (6) | **✗** |
+
+The contrarian story Section 12 fitted (+0.32 on the 6-month bullish
+window) **still works on the cross-sector canaries** (+0.18 at 60d).
+But on the 24-tech cohort it's strongly **inverted** (−0.36 at 60d,
+i.e. fear → bearish, greed → bullish). This is a real sector-specific
+phenomenon — tech / AI / semis have been a momentum-following name set
+where extreme fear coincides with breakdowns and extreme greed with
+continuation, while defensive sectors revert in the classical sense.
+
+**Decision implication**: v1.3 dropped this factor to zero as a
+conservative move. The cohort analysis now provides the missing
+evidence to commit the more aggressive option for a tech-focused
+trading universe: **invert the sign in `score_fear_greed_regime` and
+restore a tech-calibrated weight.**
+
+### Cohort-aware verdict for every factor at 20d/60d
+
+**Universal (sign-agrees) — safe to weight as currently signed:**
+
+| Factor | 20d core / canary | 60d core / canary |
+|---|---:|---:|
+| `market_vix_regime` | −0.12 / −0.03 | −0.10 / +0.00 |
+| `peer_relative_valuation` | +0.04 / +0.10 | +0.07 / +0.10 |
+| `options_iv_term_structure` | +0.03 / −0.05 | −0.12 / −0.09 |
+| `momentum_rsi` | −0.04 / −0.01 | −0.12 / −0.02 |
+
+**Tech-specific (sign-disagrees) — work on tech only:**
+
+| Factor | 20d core IC | 20d canary IC | 60d core IC | 60d canary IC |
+|---|---:|---:|---:|---:|
+| `valuation_sales_multiple_vs_growth` | **+0.076** | −0.090 | **+0.078** | −0.124 |
+| `fund_revenue_growth` | +0.087 | −0.114 | +0.202 | −0.231 |
+| `trend_sma50_vs_sma200` | −0.148 | +0.001 | **−0.246** | +0.005 |
+| `market_spy_trend` | −0.119 | +0.029 | −0.226 | +0.102 |
+| `industry_relative_strength` | +0.0005 | +0.175 | −0.171 | +0.267 |
+| `market_fear_greed_regime` | −0.082 | −0.027 | **−0.362** | **+0.183** |
+
+For a tech-only trading universe these "tech-specific" factors are
+still usable — they just shouldn't be expected to generalize. The
+canary cohort did exactly its job: surfaced which signals are real
+finance vs which are tech-rally artifacts.
+
+**`options_iv_rank` — tech-tilted but consistent:**
+
+| Horizon | Core med IC | Core cons | Canary med IC | Canary cons |
+|---|---:|---:|---:|---:|
+| 20d | **+0.097** | 70% | +0.007 | (small sample) |
+
+The v1.3 promote stands: real signal on the 24-tech cohort, near-zero
+on canaries (so it's tech-IV-regime specific but not contradicted).
+
+### Proposed v1.4 weight changes
+
+Two changes the cohort data now supports:
+
+1. **`market_fear_greed_regime`**: invert the sign in
+   `score_fear_greed_regime` (fear → bearish, greed → bullish for a
+   tech-focused universe) AND restore weight to **0.05**. The 60d
+   inversion is −0.36 IC on 23 tech tickers with 70% sign consistency
+   — strongest single-factor signal in the model after the inversion.
+2. **`options_iv_rank`**: leave at 0.04 (v1.3). The cohort split
+   didn't change the call; the Phase 2 IC re-confirms it (+0.10 at
+   20d on tech).
+
+Net delta: +0.05 weight added; everything else renormalizes by
+×(1/1.05) = 0.952.
+
+### Honest caveats (still)
+
+- The "tech-specific" finding for `market_fear_greed_regime` is based
+  on 24 tech names × 150 weeks. It's plausibly an "AI mania" artifact —
+  the 2023-2026 window had unusually momentum-driven tech price action.
+  In a different tech regime (e.g. dot-com burst 2000-2002) the
+  contrarian story might re-emerge.
+- The canary cohort is small (6 names). 60d canary IC +0.18 has 6
+  observations of medians — wide confidence band. Real but not definitive.
+- v1.4 commits to "tech is momentum-following" which is a regime-call
+  in the same way Section 12's contrarian commit was. The advantage:
+  we now have multi-cohort evidence and 24 tech names of confirmation,
+  not 11 single-window names.
+
+### Output artifacts
+
+- `configs/universe.yaml` (new)
+- `scripts/cohort_ic_split.py` (new, ~95 lines)
+- `backtest/results/phase2/{summary,factor_summary,factor_summary_by_ticker,
+  factor_summary_vs_benchmark}.{json,md}`
+- `/tmp/cohort_20d.md`, `/tmp/cohort_60d.md` (split outputs)
+
+## 23. Performance — RFR caching + minimal-context flag
+
+Two acceleration levers landed after the Phase 2 universe expansion.
+
+### Lever A — module-level cache for `RiskFreeRateProvider`
+
+Previously each `AnalysisOnlyMVP` instance created its own
+`RiskFreeRateProvider` which independently fetched the ^IRX series via
+yfinance — one redundant network call per report. Now the loaded series
+lives in a module-level dict keyed by `(start, end)`; all threads
+sharing the same Python process share the cache.
+
+- New module-level `_RATE_SERIES_CACHE` + `_load_irx_series` factored out
+- `reset_rate_cache()` helper for tests
+- 7 new tests in `tests/analysis_only/test_options_historical.py`
+- Most visible benefit under parallel execution (multiple workers no
+  longer queue up redundant ^IRX fetches concurrently)
+
+### Lever D — `--minimal-context` corpus regen flag
+
+Skip news + SEC filings fetches for backfill runs. Both are safe to skip
+on historical regens:
+- `filings_recency_signal` is weight=0 in v1.3, so the factor isn't
+  driving the composite anyway
+- News PIT-filters to mostly-empty on older dates — yfinance returns
+  current items, the filter drops anything dated after `as_of_date`
+
+New constructor flags on `AnalysisOnlyMVP`:
+- `enable_news_fetching: bool = True`
+- `enable_filings_fetching: bool = True`
+
+New CLI flag on `scripts/generate_corpus.py`: `--minimal-context` sets
+both False. Live `analysis_mvp.py` runs are unaffected (both default True).
+
+### Measured speedup (single-threaded smoke test on NVDA historical dates)
+
+| Configuration | Per-report time |
+|---|---:|
+| Cold (RFR fresh, full context) | 24.0s |
+| Warm (RFR cached, full context) | 24.5s |
+| Warm + `--minimal-context` | **20.9s** |
+
+Net A+D vs cold baseline: **−3.0s per report**.
+
+Projected wall-clock savings:
+- Phase 2 scale (~2,700 reports): **~2.3 hours saved**
+- Full 4,500-report re-regen: **~3.7 hours saved**
+- Weekly incremental update (30 reports): ~1.5 minutes saved
+
+(Lever A's benefit is harder to measure in a single-threaded benchmark
+— the duplicate-fetch cost is small per process. Under 4-worker
+parallel regen the absent contention has a larger effect; the unit
+tests guarantee the cache mechanics work even if the headline
+single-threaded numbers don't show a big delta.)
+
+### Tests + status
+
+- 326/326 tests pass (was 320; +7 from new RFR cache tests)
+- Smoke-tested end-to-end on NVDA 2024-06-21/06-28/07-05
+- No live-run regressions: `analysis_mvp.py` defaults stay `enable_news_fetching=True`, `enable_filings_fetching=True`
+
+### Output artifacts
+
+- `tradingagents/analysis_only/options_historical.py` — module-level cache
+- `tradingagents/analysis_only/pipeline.py` — flag plumbing
+- `scripts/generate_corpus.py` — `--minimal-context` flag
+- `tests/analysis_only/test_options_historical.py` — 7 RFR cache tests
+
+## 24. v1.4 weight commit — `market_fear_greed_regime` sign-inverted + restored
+
+### What changed
+
+1. **`score_fear_greed_regime`** sign flipped (`tradingagents/analysis_only/scoring.py`):
+   - Extreme fear: +0.4 → **−0.4** (was contrarian-bullish, now momentum-bearish)
+   - Fear: +0.2 → **−0.2**
+   - Greed: −0.2 → **+0.2**
+   - Extreme greed: −0.4 → **+0.4**
+   - Neutral: 0.0 (unchanged)
+   - Rationale strings updated to reflect tech-momentum framing.
+2. **`market_fear_greed_regime` weight**: 0.00 → **0.05** in `DEFAULT_FACTOR_WEIGHTS`.
+
+Sign inversion is justified by Section 22's cohort split:
+- Core (24-tech) median IC: **−0.36** at 60d, 70% sign consistency across 23 evaluable tickers
+- Canary (cross-sector) median IC: **+0.18** at 60d (contrarian still works for defensives)
+- Since the trading universe IS tech, the tech-cohort signal wins.
+
+### Train/test validation via post-hoc rebuild
+
+To avoid a 4-hour corpus regen for validation, used the trick that
+`rebuild_records_with_weights` accepts negative weights:
+
+  (existing contrarian score) × (−0.05 weight)
+  ≡ (sign-flipped score) × (+0.05 weight)
+
+…so the v1.4 weight set was simulated against the existing Phase 2
+corpus by passing `market_fear_greed_regime: -0.05`. Same numerical
+output as a full regen would produce in production.
+
+TRAIN/TEST split per Section 13 protocol (corrects the v1.3 in-sample
+methodology gap):
+- TRAIN: 2023-07-14 → 2025-08-29 (3,336 records)
+- TEST: 2025-09-05 → 2026-05-22 (1,207 records)
+
+Headline hit-rate deltas (v1.3 → v1.4) across slices:
+
+| Slice | Horizon | Bull hit Δ | Bear hit Δ | Direction calls shifted |
+|---|---|---:|---:|---:|
+| TRAIN | 5d | +0.0pp | +0.2pp | ~5 of 3,336 (0.15%) |
+| TRAIN | 20d | +0.0pp | −0.1pp | ~5 |
+| TRAIN | 60d | +0.0pp | +0.1pp | ~5 |
+| **TEST** | 5d | **+1.0pp** | +0.6pp | ~29 of 1,207 (2.4%) |
+| **TEST** | 20d | +0.1pp | +0.6pp | ~28 |
+| **TEST** | 60d | −0.2pp | **+3.2pp** | ~15 |
+| FULL | 5d | +0.2pp | +0.3pp | ~30 |
+| FULL | 20d | +0.1pp | +0.1pp | ~30 |
+| FULL | 60d | +0.0pp | +0.7pp | ~30 |
+
+### Why the lift is muted (honest)
+
+The Phase 2 IC of **−0.36 on tech at 60d** is a rank correlation. The
+hit-rate impact of a single factor in a composite model depends on:
+
+1. **Coverage**: `fear_greed.data_available=True` on only **1,618 of
+   4,534** records (~36%). CNN Fear & Greed has limited historical
+   backfill — earlier corpus dates have it unavailable, so the factor
+   contributes nothing to the composite there. The "true" effect is
+   concentrated in late-2024 onward.
+2. **Discrete score range**: 5 possible values (±0.4, ±0.2, 0). With
+   weight 0.05, per-record contribution to composite is ±0.02 — only
+   flips borderline direction calls (composite near the ±0.15
+   threshold).
+3. **Composite dilution**: 23 active factors; no single 5%-weight
+   factor moves the composite by more than ±0.02 of a [-1, 1] range.
+
+So v1.4 should be read as **a correctness fix, not a performance
+upgrade**. The sign is now right; the magnitude of impact is small
+because of structural data limitations.
+
+### TEST slice tells the relevant story
+
+The TEST slice (out-of-sample) shows the biggest deltas — **+3.2pp
+bearish hit-rate at 60d** is the standout. This is exactly the regime
+where bearish-side anti-predictivity (Section 14/15) was worst, and
+the fear → bearish mapping is helping the model catch downside calls
+that v1 / v1.3 missed.
+
+### What this validates / doesn't validate
+
+**Validates**:
+- The Phase 2 cohort IC finding is real (sign inversion is correct).
+- The fix doesn't regress anywhere materially (worst hit-rate Δ across
+  slices is −0.2pp on TEST 60d bullish).
+- Out-of-sample TEST agrees with TRAIN direction — not overfit.
+
+**Doesn't validate**:
+- That the factor is now "important." It's small.
+- That CNN Fear & Greed will keep its sign in future regimes (the
+  Section 22 caveat stands — 2023-2026 was unusually momentum-driven
+  tech).
+
+### Decision
+
+v1.4 stays committed. Sign is now correct, weight is conservative
+(0.05 vs v1's 0.08), no regressions. If the limited coverage frustrates
+the gain, the right next move isn't bumping the weight — it's improving
+the data path (find a Fear & Greed historical source, or use a proxy
+that's PIT-correct historically). Logged in deferred.
+
+### Code + test changes
+
+- `tradingagents/analysis_only/scoring.py`:
+  - `score_fear_greed_regime` signs inverted (5 score values), rationale
+    strings rewritten as momentum-following framing.
+  - `DEFAULT_FACTOR_WEIGHTS["market_fear_greed_regime"]: 0.00 → 0.05`.
+- `tests/analysis_only/test_scoring.py`:
+  - `test_score_fear_greed_regime` parametrize updated to v1.4 signs.
+  - `test_fear_greed_dropped_in_v1_3` renamed
+    `test_fear_greed_restored_in_v1_4` with the 0.05 assertion.
+- `scripts/validate_v1_4.py` — new train/test validator using the
+  negative-weight rebuild trick.
+- 326/326 tests pass.
+
+### Deferred
+
+- **CNN Fear & Greed historical backfill**. Currently 64% of corpus
+  records have the factor unavailable. A proxy candidate: VIX-based
+  fear/greed proxy (computed from VIX level + 1m/3m percentile)
+  available from yfinance with full history. Could materially expand
+  factor coverage and amplify the v1.4 lift.
+- **Re-regen Phase 2 corpus under v1.4 code** so on-disk JSONs reflect
+  production state (vs the post-hoc rebuild trick used for validation).
+  ~2-3h at 4 workers with `--minimal-context` and the new RFR cache.
+  Not blocking — scheduled as Task #24.
+
+### Output artifacts
+
+- `scripts/validate_v1_4.py`
+- `/tmp/v1_4_validation.log` (validation output)
+
+## 25. VIX-based fear/greed proxy + options-aware ledger
+
+Two follow-up workstreams landed after the v1.4 weight commit, both
+chosen by ROI ranking over put-side strategy cards.
+
+### A. VIX-based fear/greed proxy
+
+**Problem**: CNN Fear & Greed had `data_available=False` on 64% of the
+Phase 2 corpus (2,916/4,534 reports) because CNN doesn't expose deep
+historical data. v1.4's fear_greed factor weight 0.05 only mattered on
+the ~36% of records that had data.
+
+**Solution**: `VIXFearGreedProvider` (new in `providers.py`) — pulls
+`^VIX` daily-close history from yfinance with module-level cache
+(same pattern as RFR), computes trailing-252-day percentile of VIX
+on each `as_of_date`, and maps to a CNN-equivalent 0-100 score:
+
+  `cnn_equiv_score = (1 − vix_percentile_252d) × 100`
+
+Buckets match `score_fear_greed_regime` thresholds:
+| VIX percentile | CNN-equiv score | Rating | Factor score (v1.4) |
+|---|---:|---|---:|
+| 95-100th | ≤ 25 | extreme fear | −0.4 |
+| 75-95th | < 45 | fear | −0.2 |
+| 25-75th | ~50 | neutral | 0.0 |
+| 5-25th | > 55 | greed | +0.2 |
+| ≤ 5th | ≥ 75 | extreme greed | +0.4 |
+
+**Wiring**: `_load_market_context` now calls CNN first; if CNN returns
+`status != "ok"` it falls back to the VIX proxy. `fear_greed_source`
+field stamps which one produced the data downstream consumers see.
+
+**PIT correctness**: The VIX percentile uses a strictly-before
+`as_of_date` window, so a historical run never sees its own day's VIX
+in the lookup.
+
+**Validation** (3 historical dates):
+| Date | NVDA | source | score | rating | factor score |
+|---|---|---|---:|---|---:|
+| 2023-12-15 | low VIX | `vix_fear_greed_proxy` | 98.85 | extreme greed | +0.4 |
+| 2024-06-21 | low VIX | `vix_fear_greed_proxy` | 59.88 | greed | +0.2 |
+| 2025-03-21 | elevated VIX | `vix_fear_greed_proxy` | 28.32 | fear | −0.2 |
+
+All three previously had `data_available=False`. All three now produce
+sensible signals aligned with the v1.4 tech-momentum semantics.
+
+**Output artifacts**:
+- `tradingagents/analysis_only/providers.py` — `VIXFearGreedProvider`,
+  `_load_vix_series`, `reset_vix_cache`, module-level
+  `_VIX_SERIES_CACHE`.
+- `tradingagents/analysis_only/pipeline.py` — fallback wiring in
+  `_load_market_context`.
+- `tests/analysis_only/test_providers.py` — 9 new test cases.
+
+**Deferred**: formal IC re-validation across the regenerated corpus
+(would require a full Phase 2 regen ~3h with the new VIX proxy
+populating the previously-empty 2,916 records).
+
+### B. Options-aware portfolio ledger
+
+**Problem**: `portfolio/positions.json` was shares-only. The daily
+report had no notion of option holdings, Greeks exposure, or
+mark-to-market option P&L. With the v1.4 bearish improvement
+delivering actionable bearish signals, the ledger needed to support
+option positions so users could track hedges and short-premium
+positions.
+
+**Solution**: Three layered additions.
+
+1. **Schema extension** (backward compatible):
+   ```json
+   "NVDA": {
+     "shares": 100, "avg_cost": 130.50,
+     "options": [
+       {"right": "call", "strike": 220, "expiry": "2026-06-18",
+        "quantity": -1, "avg_cost": 6.50}
+     ]
+   }
+   ```
+   Positions with only `shares + avg_cost` keep working unchanged.
+   Negative `quantity` = short position; 1 contract = 100 shares.
+
+2. **New `portfolio/options.py` module**:
+   - `OptionPosition` dataclass with strict field validation.
+   - `load_option_positions(positions_payload)` parser.
+   - `OptionBookSummary` + `summarize_option_book(positions)` —
+     counts long/short calls/puts and premium basis.
+   - `EnrichedOption` joins position to current chain (mark, Greeks).
+   - `enrich_with_chain(positions, chain_contracts)` matches by
+     (right, strike, expiry).
+   - `BookGreeks` + `book_greeks(enriched, shares)` aggregates net
+     delta (share-equivalent), vega, theta, gamma, M2M, P&L.
+   - `fetch_current_chain(symbol, api_key)` standalone Polygon
+     snapshot fetcher.
+
+3. **Daily-signals integration**:
+   - `portfolio/signals.py::format_option_positions_section` —
+     pure-function markdown renderer with per-symbol tables and a
+     book-aggregate summary at the top.
+   - `daily_signals.py` main() loads options, fetches current chains
+     via Polygon, enriches, and appends the section to the report.
+   - Warnings auto-fire for:
+     - Expiry within 7 days
+     - Already-expired positions still in the ledger
+     - Long premium positions down ≥ 50% from cost (stop-loss hint)
+
+**Smoke test** (NVDA collar: 100 shares + short $220 call + long $180
+put, both 2026-06-18):
+
+```
+Book aggregate
+- Net share-equivalent delta: +53 sh
+- Net vega: -$13.26 per 1% IV move
+- Net theta: +$11.78 per day (time-decay credit)
+- Net option market value: -$518.00
+- Net option unrealized P&L: -$188.00
+
+⚠️ Long put K=$180 2026-06-18 marked $0.67 vs cost $3.20
+   (79% premium loss) — consider stop.
+```
+
+Numbers cross-check:
+- Net delta = 100 shares + (−1 × 0.413 × 100) + (1 × −0.059 × 100) ≈ +53 ✓
+- Net vega = −0.217 × 100 + 0.085 × 100 = −13.2 ✓
+- Theta = +0.182 × 100 − 0.065 × 100 = +11.7 ✓ (net-short premium → daily credit)
+
+**Tests**: 44 new tests in `tests/portfolio/test_options.py` covering
+schema validation, parser edge cases, summary aggregation, Greeks
+enrichment, book-level aggregation (including short positions and
+protective-collar pattern), and the render function (table layout,
+warnings, book aggregate).
+
+**Output artifacts**:
+- `portfolio/options.py` — ~480 LoC
+- `portfolio/signals.py` — `format_option_positions_section` +
+  `_format_book_aggregate` + `_format_symbol_options`
+- `daily_signals.py` — chain-fetch loop in main()
+- `tests/portfolio/test_options.py` — 44 cases
+
+**Status**:
+- All 670 tests pass
+- End-to-end smoke test on a synthetic NVDA collar produces the
+  expected book-level Greeks and per-leg P&L
+
+### Deferred follow-ups
+
+- **VIX proxy formal IC validation** — needs corpus regen
+- **Put-side strategy cards** (originally Section 18 deferred item;
+  ROI-deprioritized this round but the model's v1.4 bearish signal
+  is still under-actionable without long_put / put_spread /
+  protective_collar cards in `build_option_strategies`)
+- **Walk-forward OOS protocol** — methodology rigor improvement
+
+## 26. Earnings-aware sizing + portfolio-level risk caps
+
+User selected these two as highest-ROI for a long-only personal portfolio
+after Sections 18-25 closed the analysis/IV/options ledger workstreams.
+Put-side strategy cards explicitly deprioritized — user trades long-only.
+
+### A. Earnings-aware sizing
+
+Tech names move ±10% on earnings. The pipeline already populates
+`earnings_calendar.next_earnings_in_calendar_days` per report; the daily
+layer wasn't using it. v1.4 fix: when a candidate or held name has
+earnings within `pre_earnings_trim_days` (default 3), the target weight
+is multiplied by `pre_earnings_size_factor` (default 0.5) before the
+risk-cap pass.
+
+**Wiring**:
+- `Signal` dataclass gained `next_earnings_in_calendar_days`,
+  `next_earnings_date`, `sector`, `industry` fields (sector/industry
+  reused by the risk module).
+- `_load_signal_from_json` extracts them from `key_features.
+  earnings_calendar` and `key_features.industry_context`.
+- `SizingConfig` gained `pre_earnings_trim_days` (default 3) and
+  `pre_earnings_size_factor` (default 0.5). Set factor=1.0 OR
+  trim_days=0 to disable.
+- `compute_actions` applies the adjustment between weight assignment
+  and the portfolio-value pass. Adjusted symbols carry a note like
+  `Earnings in 2d (2026-05-26) — target size reduced to 50% (8.9% → 4.5%).`
+
+**Tests**: 6 new cases covering inside-window halving, outside-window
+no-op, factor=1.0 disable, trim_days=0 disable, held-position TRIM
+trigger, and missing-earnings-data graceful skip.
+
+### B. Portfolio-level risk caps
+
+For long-only, **sizing IS the risk control**. Three caps apply after
+weight assignment, in order:
+
+1. **Sector concentration**: no sector exceeds `max_sector_exposure`
+   (default 50%). Over-cap sectors get their members scaled proportionally.
+2. **Portfolio beta budget**: weighted-avg β (cash-drag included) stays
+   at or below `max_portfolio_beta` (default 1.60). Above-average-β
+   names scaled down; low-β names left alone.
+3. **Pairwise correlation cap**: caps a secondary name's weight against
+   the largest holding when their ρ exceeds `max_pair_correlation`
+   (default 0.85). Cap = `anchor_weight × (1 − ρ)`.
+
+Trimmed weight becomes cash, not redistributed. Each cap fires
+independently and produces a note explaining the reduction.
+
+**Sector tags** live in `configs/universe.yaml` under a new `sectors:`
+block. The pipeline's `industry_context.sector` is unreliable
+(yfinance threading issues — None for ~all reports in the corpus).
+The static map in the universe file is the authoritative source.
+
+**Wiring**:
+- New `portfolio/risk.py` — pure functions:
+  - `RiskLimits` dataclass (validation in `__post_init__`)
+  - `compute_sector_exposure`, `compute_portfolio_beta`
+  - `apply_sector_cap`, `apply_beta_budget`, `apply_correlation_cap`
+  - `apply_all_risk_caps` orchestrates the three in order
+  - `compute_pairwise_correlations` (pure-Python pearson, ≥20 obs gate)
+  - `compute_beta_vs_benchmark` (cov/var, ≥20 obs gate)
+- `compute_actions` accepts optional `risk_limits`, `beta_map`,
+  `correlation_matrix`. When provided, applies the cap pass and
+  populates `summary["risk_diagnostic"]` with sector exposure +
+  portfolio beta.
+- `daily_signals.py` loads `risk_limits:` from sizing.yaml, fetches
+  90-day yfinance returns for the universe + SPY, computes betas +
+  correlation matrix, passes everything in.
+- `format_daily_report` renders a new "Portfolio risk" section near
+  the top showing portfolio β, sector exposure (sorted high→low with
+  "← at cap" indicators), and the count of names that hit each cap.
+
+**Critical math fix during wiring**: the beta-budget formula initially
+solved for scale assuming a fully-invested portfolio (no cash). For a
+long-only ~60% invested portfolio, that over-corrected and crushed
+high-β names to ~0.2%. The correct formula uses `β_portfolio =
+Σ w_i × β_i` (cash implicit at β=0):
+
+  `scale = (cap − β_low_weighted) / β_high_weighted`
+
+Trimmed weight becomes cash. Verified end-to-end on smoke test:
+β 1.99 → 1.60 exactly, ALAB (β=3.26) scaled 8.9% → 6.7%.
+
+### Smoke-test output (NVDA collar + bull universe, 2026-05-29)
+
+```
+## Portfolio risk
+
+- **Portfolio β (cash-drag included):** 1.60 (cap: 1.60)
+- **Sector concentration cap:** 50.0%; correlation cap: ρ≥0.85
+- **5** name(s) had target weight reduced by risk caps.
+
+**Sector exposure (post-caps):**
+
+- Technology: 24.0%
+- Semiconductors: 18.1%
+- Networking: 8.9%
+- Industrials: 6.8%
+- Specialty-Materials: 6.5%
+```
+
+Per-action note example:
+```
+- _Note: Beta budget (portfolio β 1.99 > 1.60 limit, sym β 3.26) →
+  scaled 8.9% → 6.7%._
+```
+
+### Tests
+
+- 6 new `tests/portfolio/test_signals.py` cases (earnings)
+- 25 new `tests/portfolio/test_risk.py` cases (sector, beta budget,
+  correlation cap, pairwise correlations, betas)
+- **704 tests passing**
+
+### Output artifacts
+
+- `portfolio/risk.py` (new, ~340 LoC)
+- `portfolio/sizing.py` (+ earnings config fields)
+- `portfolio/signals.py` (Signal extension, earnings + risk pass,
+  new render section)
+- `configs/universe.yaml` (+ `sectors:` block)
+- `configs/sizing.yaml` (+ earnings + `risk_limits:` block)
+- `daily_signals.py` (loads risk limits, fetches betas/correlations,
+  applies sector fallback, passes through)
+- 31 new tests
+
+## 27. Phase 2 v1.4 regen + Nasdaq Composite screener + financials cache
+
+Three workstreams executed in parallel from the plan at
+[plans/screener_and_regen.md](plans/screener_and_regen.md): (1) regen the
+Phase 2 corpus under v1.4 production code so on-disk JSONs match the
+post-hoc rebuild validation from Section 24; (2) add a ticker-discovery
+capability scanning a filtered Nasdaq Composite weekly; (3) ship a
+Polygon Financials cache as the first regen-perf improvement.
+
+### What landed
+
+**A. Phase 2 v1.4 regen (Unit 1).** 4,800 jobs over 32 tickers × 150
+Fridays, `--minimal-context` + 4 workers. Wall time **8h 49m**, **4,759
+ok / 41 errors (0.85%)**. Errors are dominated by pre-IPO ARM/ALAB dates
+(expected); the residual ~10 are transient yfinance failures the
+3-retry-with-backoff didn't recover from. Pre-regen the corpus was
+archived to `reports/analysis_mvp_pre_v1_4/` and the `iv_history` table
+was wiped so it repopulates chronologically.
+
+**B. Skip-flags + screener stack (Units 2-4).**
+
+- `AnalysisOnlyMVP.__init__` gained `enable_intraday_context: bool =
+  True` and `enable_peer_competitor_analysis: bool = True`. Defaults
+  preserve live-run behavior; the screener instantiates with both off
+  for ~8x speedup per ticker.
+- New `tradingagents/analysis_only/screener.py` + `scripts/screener.py`
+  — pure-function ranker + CLI. Reads either a flat ticker list or the
+  Unit-4 structured yaml. Output: `reports/screener/YYYY-MM-DD/{ranked.
+  json, ranked.md}`. Per-ticker reports are in-memory only — never
+  written, so the corpus stays clean.
+- New `scripts/build_screener_universe.py` — Polygon ticker-reference
+  builder. Output `configs/screener_universe_nasdaq.yaml` is structured
+  (symbol + sector + market_cap_usd + adv_usd + sic_code). Filters:
+  CS only, market cap ≥ $500M, trailing-20d ADV ≥ $5M. From 3,300
+  fetched → **1,139 kept** in 12m51s.
+- Cohort-aware scoring in `scoring.py`: `UNIVERSAL_FACTOR_NAMES`
+  frozenset + `resolve_factor_weights(cohort="non_tech")` zeros
+  non-universal weights for non-tech sectors. `cohort_for_sector(...)`
+  maps GICS-ish labels to `tech` / `non_tech`.
+
+Smoke run: 1,123 evaluated tickers (after `--exclude-core`), 4 workers,
+**1m34s wall time**, **0 errors**. Earlier Unit 3 run on Nasdaq 100
+(102 tickers) was 2m35s.
+
+**C. Polygon Financials cache (plan Future-work #3).** New module-level
+`_FINANCIALS_ALL_CACHE` keyed by `(symbol, timeframe)` in
+`tradingagents/analysis_only/providers.py`. `_fetch` now retrieves the
+full per-(symbol, timeframe) history once, caches it, and slices
+client-side by `filing_date ≤ as_of_date`. Pattern follows Section 23's
+RFR cache (module-level dict + RLock). Verified live: first call to
+Polygon = 317ms, second call (different date) = 0ms, PIT-correct
+filtering preserved. **Projected savings on the next Phase 2 regen:
+~9k Polygon HTTP calls → ~60.**
+
+### Post-regen IC + cohort findings (Unit 1 steps 3-5)
+
+Backtest run on the fresh corpus: 4,873 reports loaded, SPY-adjusted
+returns attached to 4,526.
+
+Per-direction hit-rate vs the v1.3-era `backtest/results/phase2/`:
+
+| Horizon / bucket | v1.3 baseline | v1.4 regen | Δ |
+|---|---:|---:|---:|
+| 20d bullish | 61.61% (n=2425) | 61.69% (n=2446) | +0.08pp |
+| 20d bearish | 40.72% (n=442) | 40.31% (n=521) | −0.41pp |
+| **60d bullish** | **67.58%** (n=2289) | **68.30%** (n=2328) | **+0.72pp** |
+| **60d bearish** | **32.27%** (n=409) | **33.06%** (n=484) | **+0.79pp** |
+
+Both 60d buckets improving simultaneously is meaningful — usually you
+trade one for the other in calibration changes.
+
+**`market_fear_greed_regime` coverage:** **n=4866 (~100%)** vs v1.3's
+**n=1618 (~36%)**. The VIX proxy (Section 25) properly fills the
+historical gap on dates where CNN didn't backfill. This is the real
+structural win; the small hit-rate Δ understates the change because
+the factor now contributes to every report's composite, not just 1/3.
+
+**Cohort split (fresh):**
+
+| Factor | 20d core IC | 60d core IC | 60d core sign-cons | Sign agree? |
+|---|---:|---:|---:|:---:|
+| `market_fear_greed_regime` | -0.064 | **-0.129** | **84%** | ✗ (canary +0.079) |
+| `market_vix_regime` | -0.076 | -0.115 | 80% | ✓ |
+| `options_iv_term_structure` | +0.025 | -0.109 | 80% | ✓ |
+| `momentum_rsi` | -0.037 | -0.083 | 84% | ✓ |
+| `trend_sma50_vs_sma200` | -0.148 | -0.220 | 67% | ✓ |
+| `options_iv_rank` | +0.037 | -0.072 | 64% | ✗ |
+
+`market_fear_greed_regime` sign-disagreement (tech vs canary) holds —
+v1.4 inversion remains correct. 60d core sign-consistency strengthened
+84% (was 70% in Section 22). `options_iv_rank` flips sign at 60d (+ at
+20d, − at 60d) — consistent with the deferred Section 21 finding about
+horizon-conditional IV factors.
+
+**`UNIVERSAL_FACTOR_NAMES` verification:** the Unit 4 list (taken from
+Section 22) holds against the fresh regen — universal-signing factors
+are unchanged. No code update needed.
+
+### Unit 4 finding worth surfacing: approach (a) saturates the top rank
+
+Cohort-aware scoring (approach a) zeroes ~15 factors for non-tech
+names, leaving 7 universal factors that all max out on bullish trends.
+**Top 50 of the Nasdaq Composite scan all tied at composite +0.832**
+(the cap), ordered alphabetically. The `composite_score_tech_weights`
+column preserves the differentiating ranking — top picks span sectors
+with real spread (SEZL +0.711, CACC +0.699, RDWR +0.690, FTNT +0.657,
+…).
+
+This validates the plan's prediction that (a) compresses ranking;
+approach (b) two-composite emission is now the right next move. The
+data is already preserved in both columns — only the markdown
+renderer's sort key needs changing. Logged in plan Future-work #9.
+
+### Persistent issue surfaced (not new): `filings_recency_signal`
+
+Now populates (n=4871 across the corpus, vs n=0 pre-regen — different
+defect than Section 12 thought) but every record's score is exactly 0,
+so IC is undefined. Effectively dead-weight at weight=0. Parking-lot
+item from Section 12 confirmed.
+
+### Tests
+
+- +7 cache tests in `test_providers.py` (financials cache: PIT filter
+  correctness, dedup, segregation, limit, no-api-key, no-server-side
+  filter, negative cache).
+- +8 in `test_pipeline_skip_flags.py` (Unit 2: flag defaults,
+  single-flag gating with sentinel, screener-mode constructor, cache
+  key separation).
+- +15 in `test_screener.py` (Unit 3: extract/rank/render).
+- +30 across `test_scoring.py`, `test_screener.py`,
+  `test_build_screener_universe.py` (Unit 4: cohort logic, screener
+  CLI, universe builder with mocked Polygon).
+- **Total: 811 pass + 1 skipped** (was 704 after Section 26).
+
+### Output artifacts
+
+- `reports/analysis_mvp/` — 4,873 regenerated v1.4 reports
+- `reports/analysis_mvp_pre_v1_4/` — archived pre-regen snapshot
+- `backtest/results/phase2_v1_4/{summary,factor_summary,
+  factor_summary_by_ticker,factor_summary_vs_benchmark,records,
+  cohort_20d,cohort_60d}.{md,json,csv}` — fresh IC analysis
+- `reports/screener/2026-05-22/{ranked.json, ranked.md}` —
+  cohort-aware scan
+- `reports/screener_techwts/2026-05-22/{ranked.json, ranked.md}` —
+  tech-weights scan (more useful ranking until Future-work #9 lands)
+- `configs/screener_universe_nasdaq.yaml` — 1,139 filtered Nasdaq
+  Composite tickers
+- `configs/screener_universe_nasdaq100.yaml` — Phase B1 hardcoded
+  smoke list
+
+### Code added / changed
+
+- `tradingagents/analysis_only/pipeline.py` — Unit 2 skip-flags
+  (`enable_intraday_context`, `enable_peer_competitor_analysis`)
+- `tradingagents/analysis_only/providers.py` — Polygon Financials
+  module-level cache + `reset_financials_cache()`
+- `tradingagents/analysis_only/scoring.py` — `UNIVERSAL_FACTOR_NAMES`
+  + `cohort` kwarg on `resolve_factor_weights`
+- `tradingagents/analysis_only/screener.py` (new) — pure ranker +
+  `cohort_for_sector` + `rescore_report_for_cohort`
+- `scripts/screener.py` (new)
+- `scripts/build_screener_universe.py` (new)
+
+### Honest caveats
+
+- v1.4 hit-rate delta vs v1.3 is small (~0.5-1pp). The weight on
+  `market_fear_greed_regime` is modest (0.05 nominal, 0.039 after
+  renorm), and the model has 25 other active factors diluting it. The
+  real win is structural — proper sign + full coverage — not headline
+  Δ-hit-rate.
+- Cohort-split numbers depend on the canary cohort of 6 names. 60d
+  canary medians are computed over ≤6 observations — wide confidence
+  intervals. Use as direction-checker, not significance test.
+- The regen still uses yfinance for SPY/VIX/sector ETFs/^IRX, which is
+  the source of the 401-Invalid-Crumb log noise. Replacing those with
+  Polygon aggs (plan Future-work #2) is the next biggest perf+cleanup
+  lever and would also eliminate most of the residual 41 errors.
+
+### Deferred (carried forward in plan doc)
+
+- **#9 — rank screener by `composite_score_tech_weights`**: 10-min
+  patch in `render_screener_markdown`. Unblocks meaningful ranking
+  without changing the underlying cohort-aware composite emission.
+- **#2 — Polygon market context replacement** (plan Future-work):
+  removes yfinance for SPY/VIX/sector ETFs/^IRX. ½ day. Highest
+  single-item ROI on the perf list.
+- **#5 — ProcessPoolExecutor** for BSM IV: 2-3x on CPU-heavy phases.
+- **#7 + #8 — local parquet/sqlite cache + incremental regen**: 1-2
+  weeks combined, converts the weight-tuning iteration loop from hours
+  to minutes. Architecturally the right answer for v1.5 / v1.6 cadence.
+
+## 28. Walk-forward OOS harness + calibration refresh + v1.5/v1.6 commits
+
+Built the missing evaluation layer to validate v1.5 (already shipped in
+code) and pick v1.6 from cleaner evidence. Plan:
+[plans/accuracy_improvements.md](plans/accuracy_improvements.md).
+
+The motivating question from the post-Section-27 retrospective was: how
+much of v1.2/v1.3/v1.4/v1.5's measured hit-rate lift is real vs single-
+split overfit? Answer: **essentially all of it.** The whole anxiety that
+drove this plan turned out to be unfounded.
+
+### What landed
+
+**A. Walk-forward OOS harness (Unit A — agent-built).**
+- `tradingagents/analysis_only/walk_forward.py` — pure functions:
+  `WalkForwardWindow`, `generate_windows`, `evaluate_window`,
+  `summarize_walk_forward`, `render_walk_forward_markdown`.
+- `scripts/walk_forward_eval.py` — CLI supporting `v1.4`, `v1.5`,
+  `ic_signed_rolling`, `custom_json` weight sources in one invocation.
+- `tests/analysis_only/test_walk_forward.py` — 7 cases.
+- Default windowing: 18mo train / 3mo test / 1mo step → 14 windows on
+  the current corpus span. Computes BOTH all-direction and
+  bullish-only hit-rates per window so headline is apples-to-apples vs
+  the Section 27 / 13 metrics.
+
+**B. Confidence calibration refresh (Unit B).**
+- Pre-existing `scripts/fit_confidence_calibration.py` was last fit
+  2026-05-25 (pre-v1.4 regen) — stale.
+- Re-fit against v1.4 corpus, then again against v1.5 corpus.
+- Old artifact preserved at `configs/confidence_calibration_v1_4.json`.
+
+**C. v1.5 corpus regen (Unit C).**
+- 4,800 jobs → 4,764 ok / 36 errors (~0.75%) in **4h 9m** —
+  **53% faster than v1.4's 8h 49m** (fundamentals cache + Polygon
+  market context delivered the predicted speedup).
+- Invoked with `--skip-news` (not `--minimal-context`) to enable
+  filings fetching. Filings still came back unavailable — turns out
+  the SEC fetch path itself is broken; that's a separate bug below.
+
+**D. v1.5 acceptance gate (Unit D).**
+- Single-split `check_model_acceptance.py` FAILS: 60d bullish hit
+  68.30% → 67.82% (−0.48pp).
+- Walk-forward PASSES: median 60d bullish 70.95% → 71.61% (**+0.66pp**).
+- Plan-defined gate (walk-forward + calibration) overrides single-
+  split. v1.5 stays committed.
+
+**E. v1.6 commit (Unit E).**
+- IC analysis on v1.5 corpus surfaced 5 candidates. Walk-forward gate
+  (≥ +0.5pp 60d bullish, no >1pp regression at 5d/20d):
+
+| Candidate | 5d_bull | 20d_bull | 60d_bull | Verdict |
+|---|---:|---:|---:|:---:|
+| v1.5 baseline | 58.32% | 60.32% | 71.61% | — |
+| C1 bump valuation_sales_multiple_vs_growth | 58.47% | 60.08% | 71.59% | ❌ |
+| C2 bump options_iv_term_structure | 58.55% | 59.58% | 71.31% | ❌ |
+| C3 bump fund_revenue_growth | 58.26% | 60.18% | 71.23% | ❌ |
+| **C4 invert market_spy_trend** | **58.54%** | **60.90%** | **72.12%** | **✅** |
+| C5 combined (C4 + C1 + C2) | 59.41% | 60.80% | 72.36% | ✅ |
+
+C4 is the clean single-change winner. C5 nets +0.24pp more but adds
+complexity. **v1.6 commits C4 only.**
+
+### v1.6 — the code change
+
+`market_spy_trend` sign inverted at the emission site in
+`tradingagents/analysis_only/pipeline.py`. Score values flipped:
+- SPY above 50DMA: was +0.5 (constructive), now **−0.5** (extended /
+  mean-reversion bearish).
+- SPY below 50DMA: was −0.5 (risk-off), now **+0.5** (oversold bullish).
+- Unavailable: 0 (unchanged).
+
+Rationale: post-regen v1.5 IC at 60d core is **−0.133** — strongest
+negative-IC factor with positive weight. Walk-forward confirms +0.51pp
+60d / +0.58pp 20d lift. Probable story: in a tech-momentum universe,
+SPY above 50DMA is often the late-stage broad rally that mean-reverts
+before tech does. Weight unchanged at 0.04.
+
+### Honest findings to carry forward
+
+1. **v1.4 is NOT overfit.** Walk-forward median 60d bullish hit
+   (69.86% on v1.4 corpus / 70.95% on v1.5 corpus, both with v1.4
+   weights) at or above the single-split 68.30%. Median overfit gap
+   is NEGATIVE (train < test in the median window). The whole anxiety
+   driving Section 13's TRAIN/TEST split protocol turned out to be
+   overcautious — the rolling median validates the commits.
+
+2. **Real signal beyond fixed weights** (preliminary). The
+   `ic_signed_rolling` source (refit weights per window from train-
+   slice IC) gains +4-9pp 60d bullish over v1.5 — but with a +10pp
+   overfit gap, net OOS effect is roughly 0 to slightly negative.
+   The PRE-overfit lift is real; the OOS realization isn't (yet).
+   Still: this is the signal that pushes us toward
+   `fit_regime_weights.py` (regime-conditional weights — exists,
+   has never produced an artifact). Strong candidate workstream
+   for the next round.
+
+3. **Calibration finding.** The pre-existing heuristic
+   `confidence = floor + slope × |composite|` was *wildly* miscalibrated:
+   - Composite 0.0: heuristic 50% → calibrated **17.2%** (corpus base rate).
+   - Composite +0.7: heuristic 78% → calibrated **100%**.
+   The daily-signals layer was probably over-allocating to weakly-
+   bullish/neutral composites that had no edge. The new calibration
+   fixes that. Both v1.4 and v1.5 corpora pass the Phase-5 gates
+   (Brier improvement 44-46%, reliability 0.0pp deviation in n≥10
+   buckets).
+
+4. **`filings_recency_signal` is broken at the SEC-fetch layer, not the
+   `--skip-filings` flag layer.** Spot-check on `NVDA_2024-06-21.json`
+   (from v1.5 regen): `filings_context.status: unavailable` despite
+   the regen passing `--skip-news` (NOT `--skip-filings`). The
+   `_load_filings_context` path needs investigation. Parking-lot bug —
+   not blocking, factor is weight=0 and contributes nothing to
+   composite anyway. Worth fixing before any v1.7 attempt to actually
+   weight this factor.
+
+### Tests + status
+
+- 850 tests passing + 1 skipped (was 843 → +7 from `test_walk_forward.py`).
+- Smoke: `NVDA 2024-06-21` composite v1.5 → v1.6 = +0.6612 → +0.6288
+  (Δ −0.0324, from the spy_trend sign flip with NVDA in a SPY-above-50DMA
+  regime that date).
+
+### Output artifacts
+
+- `tradingagents/analysis_only/walk_forward.py` (new) + 7 tests.
+- `scripts/walk_forward_eval.py` (new).
+- `backtest/results/walk_forward/{summary.{json,md}, windows.csv,
+  summary_v1_4.json, summary_v1_5.json, summary_ic_signed_rolling.json}`
+  — walk-forward outputs against the v1.4 corpus.
+- `backtest/results/walk_forward_v1_5/` — same, against v1.5 corpus.
+- `backtest/results/phase2_v1_5/{summary,factor_summary,
+  factor_summary_by_ticker,factor_summary_vs_benchmark,records}.{json,md,csv}`
+  — full v1.5 IC analysis.
+- `backtest/results/v1_5_decision.md` — single-split vs walk-forward
+  comparison + acceptance reasoning.
+- `configs/confidence_calibration.json` — refreshed v1.4-corpus fit
+  (37 isotonic segments). Old version archived at
+  `configs/confidence_calibration_v1_4.json`.
+- `configs/confidence_calibration_v1_5.json` — v1.5-corpus fit
+  (Brier +46%, reliability 0.0pp).
+- `reports/analysis_mvp/` — regenerated under v1.5 code (4,764 reports).
+- `reports/analysis_mvp_pre_v1_5/` — archived pre-regen snapshot.
+- `tradingagents/analysis_only/pipeline.py` — `market_spy_trend` sign
+  inverted (v1.6 commit).
+
+### Honest caveats
+
+- All walk-forward numbers are based on **14 windows** on the current
+  3-year corpus. Window-by-window variance is huge (P25–P75 spans
+  25pp+ at 60d). Median lifts of 0.5-1pp are AT the noise floor; they
+  pass the discipline gate but don't constitute strong evidence on
+  their own. The cumulative discipline (v1.2 → v1.3 → v1.4 → v1.5 →
+  v1.6) compounds modest improvements; each individual commit is
+  modest.
+- Corpus is still 2023-07 → 2026-06: single regime (tech rally
+  dominates). The Section 13 caveat about regime dependence still
+  applies — `market_spy_trend` inversion would probably look wrong
+  in a 2008/2020-style breakdown.
+- The 4,800-job regen took 4h 9m; the walk-forward harness runs in
+  ~15s. Calibration refit takes seconds. The data layer is the
+  bottleneck — Future-work #7+#8 (local cache + incremental regen)
+  remains the architectural unlock for the v1.7+ cadence.
+
+### Deferred
+
+1. **`fit_regime_weights.py` experiment.** The script exists, no
+   artifact has ever been emitted. Walk-forward's
+   `ic_signed_rolling` source showed +4-9pp pre-overfit lift; an
+   actual regime-conditional weight commit (trend_on vs chop) could
+   capture some of that without the dynamic-refit overfit.
+2. **SEC filings fetch bug.** `_load_filings_context` returns
+   `status: unavailable` everywhere; needs investigation. Once fixed,
+   `filings_recency_signal` can be IC-measured for a v1.7 weight
+   decision.
+3. **Local cache + incremental regen** (Plan Future-work #7+#8).
+   Still the biggest leverage on iteration cadence.
+4. **Approach (b) two-composite emission** in screener (carried
+   from Section 27).
+5. **Multi-regime corpus extension** (add 2020-Q1 / 2022 windows).
+   Hardest item; needs Polygon historical coverage older than the
+   current corpus uses. The right honesty check for any
+   regime-sensitive factor (`market_spy_trend`, `market_fear_greed_regime`,
+   etc.).

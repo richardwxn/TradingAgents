@@ -97,6 +97,11 @@ def test_trade_tickets_no_prices_writes_blocked_artifacts(tmp_path):
     assert payload["summary"]["ready_count"] == 0
     assert payload["summary"]["blocked_count"] == 2
     assert any(t["asset_type"] == "equity" for t in payload["blocked_tickets"])
-    assert any(t["asset_type"] == "option_intent" for t in payload["blocked_tickets"])
+    option_ticket = next(
+        t for t in payload["blocked_tickets"] if t["asset_type"] == "option_intent"
+    )
+    assert option_ticket["details"]["option_intent_rank"] == 1
+    assert option_ticket["details"]["option_intent_score"] == 86.2
     assert "Codex Robinhood MCP Steps" not in md
     assert "Blocked Or Intent Only" in md
+    assert "Option Score" in md

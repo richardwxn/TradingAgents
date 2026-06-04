@@ -160,7 +160,10 @@ def test_option_strategy_reports_emit_blocked_intent_tickets():
     cfg = ExecutionConfig()
     report = {
         "symbol": "AMD",
+        "direction": "bullish",
+        "confidence": 0.8,
         "key_features": {
+            "model_scoring": {"composite_score": 0.5},
             "option_strategies": {
                 "strategies": [
                     {
@@ -185,3 +188,49 @@ def test_option_strategy_reports_emit_blocked_intent_tickets():
     assert tickets[0].asset_type == "option_intent"
     assert tickets[0].status == "blocked"
     assert "options placement is not available" in tickets[0].blocked_reason
+    assert tickets[0].details["option_intent_score"] == 86.2
+    assert tickets[0].details["option_intent_score_label"] == "high"
+    assert tickets[0].details["report_confidence"] == 0.8
+    assert tickets[0].details["report_composite"] == 0.5
+
+
+def test_execution_batch_ranks_option_intents_by_score():
+    cfg = ExecutionConfig()
+    report = {
+        "symbol": "AMD",
+        "direction": "bullish",
+        "confidence": 0.8,
+        "key_features": {
+            "model_scoring": {"composite_score": 0.5},
+            "option_strategies": {
+                "strategies": [
+                    {
+                        "type": "buy_call_spread",
+                        "verdict": "wait",
+                        "reason": "Wait for a cleaner entry.",
+                        "expiry": "2026-06-19",
+                        "long_strike": 90.0,
+                        "short_strike": 100.0,
+                        "debit": 1.25,
+                    },
+                    {
+                        "type": "sell_put",
+                        "verdict": "consider",
+                        "reason": "Pays premium to enter lower.",
+                        "expiry": "2026-06-19",
+                        "strike": 80.0,
+                        "premium": 1.0,
+                    },
+                ]
+            },
+        },
+    }
+    batch = build_execution_batch(
+        actions=[],
+        as_of="2026-05-31",
+        config=cfg,
+        option_strategy_reports=[report],
+    )
+    option_tickets = [t for t in batch.blocked_tickets if t.asset_type == "option_intent"]
+    assert [t.source_action for t in option_tickets] == ["sell_put", "buy_call_spread"]
+    assert [t.details["option_intent_rank"] for t in option_tickets] == [1, 2]

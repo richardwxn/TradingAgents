@@ -8,7 +8,7 @@ and execute through the Robinhood MCP tools after explicit confirmation.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 from portfolio.signals import Action
@@ -18,6 +18,12 @@ EXECUTABLE_ACTIONS = ("BUY", "ADD", "TRIM", "EXIT")
 BUY_ACTIONS = ("BUY", "ADD")
 SELL_ACTIONS = ("TRIM", "EXIT")
 SUPPORTED_ASSET_TYPES = ("equity", "option_intent")
+OPTION_VERDICT_WEIGHTS = {
+    "consider": 1.0,
+    "conditional": 0.72,
+    "wait": 0.45,
+    "avoid": 0.15,
+}
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,7 @@ def build_execution_batch(
     for report in option_strategy_reports or []:
         for ticket in option_intent_tickets_from_report(report, as_of=as_of, config=config):
             blocked.append(ticket)
+    blocked = _rank_option_intents(blocked)
 
     summary = {
         "ready_count": len(ready),
@@ -304,6 +311,7 @@ def option_intent_tickets_from_report(
         verdict = str(strategy.get("verdict") or "").lower()
         if verdict in {"unavailable"}:
             continue
+        score_details = _option_intent_score_details(report, strategy)
         ticket_id = stable_ticket_id(
             as_of=as_of,
             asset_type="option_intent",
@@ -331,13 +339,117 @@ def option_intent_tickets_from_report(
                 risk_notes=[
                     "Robinhood MCP options placement is not available yet.",
                     f"strategy verdict: {verdict or 'unknown'}",
+                    (
+                        "option intent rank score: "
+                        f"{score_details['option_intent_score']:.0f}/100 "
+                        f"({score_details['option_intent_score_label']})"
+                    ),
                 ],
                 status="blocked",
                 blocked_reason="Robinhood MCP options placement is not available yet",
-                details={k: v for k, v in strategy.items() if k != "reason"},
+                details={
+                    **{k: v for k, v in strategy.items() if k != "reason"},
+                    **score_details,
+                },
             )
         )
     return out
+
+
+def _rank_option_intents(tickets: list[ExecutionTicket]) -> list[ExecutionTicket]:
+    non_options = [t for t in tickets if t.asset_type != "option_intent"]
+    options = [t for t in tickets if t.asset_type == "option_intent"]
+    ranked_options = sorted(
+        options,
+        key=lambda t: (
+            -(_safe_float((t.details or {}).get("option_intent_score")) or 0.0),
+            t.symbol,
+            t.source_action,
+            t.ticket_id,
+        ),
+    )
+    with_rank: list[ExecutionTicket] = []
+    for idx, ticket in enumerate(ranked_options, start=1):
+        details = dict(ticket.details)
+        details["option_intent_rank"] = idx
+        with_rank.append(replace(ticket, details=details))
+    return [*non_options, *with_rank]
+
+
+def _option_intent_score_details(
+    report: dict[str, Any],
+    strategy: dict[str, Any],
+) -> dict[str, Any]:
+    key_features = report.get("key_features") or {}
+    scoring = key_features.get("model_scoring") or {}
+    price_target = key_features.get("price_target") or {}
+    direction = str(report.get("direction") or "neutral").lower()
+    strategy_type = str(strategy.get("type") or "")
+    verdict = str(strategy.get("verdict") or "").lower()
+    confidence = _safe_float(report.get("confidence"))
+    if confidence is None:
+        confidence = _safe_float(price_target.get("confidence"))
+    if confidence is None:
+        confidence = 0.5
+    confidence = _clamp(confidence, 0.0, 1.0)
+    composite = _safe_float(scoring.get("composite_score"))
+    if composite is None:
+        composite = 0.0
+    composite = _clamp(composite, -1.0, 1.0)
+    verdict_weight = OPTION_VERDICT_WEIGHTS.get(verdict, 0.35)
+    alignment = _option_direction_alignment(strategy_type, direction)
+    signal_component = _option_signal_component(strategy_type, composite)
+    score = 100.0 * verdict_weight * (
+        (0.50 * confidence) + (0.30 * signal_component) + (0.20 * alignment)
+    )
+    score = _clamp(score, 0.0, 100.0)
+    return {
+        "option_intent_score": round(score, 1),
+        "option_intent_score_label": _option_score_label(score),
+        "report_direction": direction,
+        "report_confidence": round(confidence, 4),
+        "report_composite": round(composite, 4),
+        "strategy_verdict_weight": verdict_weight,
+        "strategy_direction_alignment": round(alignment, 4),
+        "strategy_signal_component": round(signal_component, 4),
+    }
+
+
+def _option_direction_alignment(strategy_type: str, direction: str) -> float:
+    table = {
+        "sell_put": {"bullish": 1.0, "neutral": 0.55, "bearish": 0.20},
+        "buy_call_spread": {"bullish": 1.0, "neutral": 0.35, "bearish": 0.10},
+        "sell_call": {"bullish": 0.45, "neutral": 0.85, "bearish": 0.75},
+    }
+    return table.get(strategy_type, {}).get(direction, 0.40)
+
+
+def _option_signal_component(strategy_type: str, composite: float) -> float:
+    if strategy_type == "sell_call":
+        return _clamp(0.70 - max(0.0, composite) + max(0.0, -composite) * 0.30, 0.0, 1.0)
+    return _clamp((composite + 0.20) / 0.80, 0.0, 1.0)
+
+
+def _option_score_label(score: float) -> str:
+    if score >= 75:
+        return "high"
+    if score >= 55:
+        return "medium"
+    if score >= 35:
+        return "low"
+    return "watch"
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out else None
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
 def stable_ticket_id(

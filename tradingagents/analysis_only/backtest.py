@@ -1467,7 +1467,11 @@ class RegimeWalkForwardStep:
     n_score_total: int
     n_score_by_regime: dict[str, int]
     global_weights: dict[str, float]
+    global_ic: float | None
     regime_weights: dict[str, dict[str, float]]
+    regime_ics: dict[str, float | None]
+    regime_ic_lifts: dict[str, float | None]
+    regime_skip_reasons: dict[str, str]
     regimes_used: list[str]
     regimes_fellback_to_global: list[str]
 
@@ -1483,6 +1487,22 @@ def _record_regime(rec: BacktestRecord) -> str:
     return regime_for_market_context(rec.market_context)
 
 
+def _composite_ic(records: list[BacktestRecord], horizon: str) -> float | None:
+    pairs: list[tuple[float, float]] = []
+    for r in records:
+        if r.composite_score is None:
+            continue
+        ret = r.forward_returns.get(horizon)
+        if ret is None:
+            continue
+        pairs.append((float(r.composite_score), float(ret)))
+    if len(pairs) < 30:
+        return None
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    return spearman_correlation(xs, ys)
+
+
 def regime_walk_forward_backtest(
     records: list[BacktestRecord],
     *,
@@ -1494,13 +1514,18 @@ def regime_walk_forward_backtest(
     min_abs_ic: float = 0.05,
     min_n: int = 50,
     min_samples_per_regime: int = 250,
+    min_regime_ic_lift: float = 0.02,
+    eligible_regimes: Sequence[str] | None = None,
+    require_regime_ic_ge_global: bool = True,
 ) -> tuple[list[BacktestRecord], list[RegimeWalkForwardStep]]:
     """Phase 4: walk-forward with per-regime weight fits.
 
     At each refit:
     1. Fit `global_weights` on the full training window (always present).
-    2. For each regime that has >= `min_samples_per_regime` training
-       samples, fit `regime_weights[regime]` on the regime-only slice.
+    2. For each eligible regime that has >= `min_samples_per_regime`
+       training samples, fit `regime_weights[regime]` on the regime-only
+       slice and ship it only when rebuilt regime IC beats global IC by
+       `min_regime_ic_lift`.
     3. At scoring time, look up each record's regime and apply the
        matching regime weights if available; otherwise fall back to
        global weights (logged in `regimes_fellback_to_global`).
@@ -1509,6 +1534,13 @@ def regime_walk_forward_backtest(
     `capture_market_context=True` in `backtest.load_records`). Records
     without it get `REGIME_UNKNOWN` and use global weights.
     """
+    from tradingagents.analysis_only.scoring import (
+        REGIME_CHOP,
+        REGIME_TREND_ON,
+        REGIME_UNKNOWN,
+    )
+
+    eligible = set(eligible_regimes or (REGIME_CHOP, REGIME_TREND_ON))
     anchors = walk_forward_refit_dates(
         records,
         refit_freq_weeks=refit_freq_weeks,
@@ -1530,6 +1562,11 @@ def regime_walk_forward_backtest(
             min_abs_ic=min_abs_ic,
             min_n=min_n,
         )
+        global_ic = (
+            _composite_ic(rebuild_records_with_weights(train, weights=global_w), horizon)
+            if global_w
+            else None
+        )
         train_by_regime: dict[str, list[BacktestRecord]] = {}
         for r in train:
             train_by_regime.setdefault(_record_regime(r), []).append(r)
@@ -1537,15 +1574,23 @@ def regime_walk_forward_backtest(
         for r in score:
             score_by_regime.setdefault(_record_regime(r), []).append(r)
         regime_weights: dict[str, dict[str, float]] = {}
+        regime_ics: dict[str, float | None] = {}
+        regime_ic_lifts: dict[str, float | None] = {}
+        regime_skip_reasons: dict[str, str] = {}
         regimes_used: list[str] = []
         regimes_fellback: list[str] = []
         for regime, regime_train in train_by_regime.items():
-            from tradingagents.analysis_only.scoring import REGIME_UNKNOWN
-
             if regime == REGIME_UNKNOWN:
+                continue
+            if regime not in eligible:
+                regimes_fellback.append(regime)
+                regime_skip_reasons[regime] = "regime_not_eligible"
                 continue
             if len(regime_train) < min_samples_per_regime:
                 regimes_fellback.append(regime)
+                regime_skip_reasons[regime] = (
+                    f"n_train<{min_samples_per_regime}"
+                )
                 continue
             w = fit_weights_from_records(
                 regime_train,
@@ -1555,7 +1600,32 @@ def regime_walk_forward_backtest(
             )
             if not w:
                 regimes_fellback.append(regime)
+                regime_skip_reasons[regime] = "no_factors_passed_ic_threshold"
                 continue
+            rebuilt_train = rebuild_records_with_weights(regime_train, weights=w)
+            regime_ic = _composite_ic(rebuilt_train, horizon)
+            regime_ics[regime] = regime_ic
+            if global_ic is None or regime_ic is None:
+                lift = None
+            else:
+                lift = regime_ic - global_ic
+            regime_ic_lifts[regime] = lift
+            if require_regime_ic_ge_global:
+                if global_ic is None:
+                    regimes_fellback.append(regime)
+                    regime_skip_reasons[regime] = "global_ic_unavailable"
+                    continue
+                if regime_ic is None:
+                    regimes_fellback.append(regime)
+                    regime_skip_reasons[regime] = "regime_ic_unavailable"
+                    continue
+                if lift is not None and lift < min_regime_ic_lift:
+                    regimes_fellback.append(regime)
+                    regime_skip_reasons[regime] = (
+                        f"regime_ic_lift {lift:.4f} < required "
+                        f"{min_regime_ic_lift:.4f}"
+                    )
+                    continue
             regime_weights[regime] = w
             regimes_used.append(regime)
         train_end = _add_days(anchor, -gap_weeks * 7)
@@ -1569,7 +1639,11 @@ def regime_walk_forward_backtest(
             n_score_total=len(score),
             n_score_by_regime={k: len(v) for k, v in score_by_regime.items()},
             global_weights=global_w,
+            global_ic=global_ic,
             regime_weights=regime_weights,
+            regime_ics=regime_ics,
+            regime_ic_lifts=regime_ic_lifts,
+            regime_skip_reasons=regime_skip_reasons,
             regimes_used=sorted(regimes_used),
             regimes_fellback_to_global=sorted(regimes_fellback),
         )
@@ -1601,7 +1675,11 @@ def regime_walk_forward_timeline_to_dict(
             "n_score_total": s.n_score_total,
             "n_score_by_regime": s.n_score_by_regime,
             "global_weights": s.global_weights,
+            "global_ic": s.global_ic,
             "regime_weights": s.regime_weights,
+            "regime_ics": s.regime_ics,
+            "regime_ic_lifts": s.regime_ic_lifts,
+            "regime_skip_reasons": s.regime_skip_reasons,
             "regimes_used": s.regimes_used,
             "regimes_fellback_to_global": s.regimes_fellback_to_global,
         }
