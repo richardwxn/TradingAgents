@@ -31,6 +31,24 @@ from typing import Any
 
 SUPPORTED_POLICIES = ("equal_weight_bullish", "confidence_weighted", "top_n_bullish")
 
+DEFAULT_SECTOR_SHOCK_ETFS: dict[str, str] = {
+    "Semiconductors": "SOXX",
+    "Photonics": "SOXX",
+    "Networking": "XLK",
+    "Tech-MegaCap": "XLK",
+    "Software": "IGV",
+    "Specialty-Materials": "XLB",
+    "Energy-Nuclear": "URA",
+    "Financial-Data": "XLK",
+    "Aerospace": "ITA",
+    "Financials": "XLF",
+    "Energy": "XLE",
+    "Healthcare": "XLV",
+    "Consumer-Staples": "XLP",
+    "Utilities": "XLU",
+    "Consumer-Discretionary": "XLY",
+}
+
 
 @dataclass(frozen=True)
 class SizingConfig:
@@ -66,6 +84,16 @@ class SizingConfig:
     tradingagents_review_apply_to_sizing: bool = True
     tradingagents_review_apply_to_tickets: bool = True
     tradingagents_review_top_screener_n: int = 5
+    # Same-day sector shock guard. The caller supplies triggered sector
+    # shocks from live ETF data; sizing applies the multipliers here so
+    # generated tickets stand down on broad sector selloff days.
+    sector_shock_guard_enabled: bool = True
+    sector_shock_drop_pct: float = 0.03
+    sector_shock_new_buy_size_factor: float = 0.0
+    sector_shock_existing_position_size_factor: float = 0.5
+    sector_shock_etfs: dict[str, str] = field(
+        default_factory=lambda: dict(DEFAULT_SECTOR_SHOCK_ETFS)
+    )
 
     def __post_init__(self) -> None:
         if self.policy not in SUPPORTED_POLICIES:
@@ -87,6 +115,14 @@ class SizingConfig:
             raise ValueError("pre_earnings_size_factor must be in [0, 1]")
         if self.tradingagents_review_top_screener_n < 0:
             raise ValueError("tradingagents_review_top_screener_n must be >= 0")
+        if self.sector_shock_drop_pct <= 0:
+            raise ValueError("sector_shock_drop_pct must be positive")
+        if not 0 <= self.sector_shock_new_buy_size_factor <= 1:
+            raise ValueError("sector_shock_new_buy_size_factor must be in [0, 1]")
+        if not 0 <= self.sector_shock_existing_position_size_factor <= 1:
+            raise ValueError(
+                "sector_shock_existing_position_size_factor must be in [0, 1]"
+            )
 
 
 def sizing_config_from_dict(data: dict[str, Any]) -> SizingConfig:
@@ -107,8 +143,37 @@ def sizing_config_from_dict(data: dict[str, Any]) -> SizingConfig:
         "tradingagents_review_apply_to_sizing",
         "tradingagents_review_apply_to_tickets",
         "tradingagents_review_top_screener_n",
+        "sector_shock_guard_enabled",
+        "sector_shock_drop_pct",
+        "sector_shock_new_buy_size_factor",
+        "sector_shock_existing_position_size_factor",
+        "sector_shock_etfs",
     }
     kwargs = {k: v for k, v in data.items() if k in allowed}
+    shock_block = data.get("sector_shock_guard") or {}
+    if isinstance(shock_block, dict):
+        mapping = {
+            "enabled": "sector_shock_guard_enabled",
+            "drop_pct": "sector_shock_drop_pct",
+            "new_buy_size_factor": "sector_shock_new_buy_size_factor",
+            "existing_position_size_factor": (
+                "sector_shock_existing_position_size_factor"
+            ),
+            "etfs": "sector_shock_etfs",
+        }
+        for src, dest in mapping.items():
+            if src in shock_block:
+                kwargs[dest] = shock_block[src]
+    if "sector_shock_etfs" in kwargs:
+        etfs = dict(DEFAULT_SECTOR_SHOCK_ETFS)
+        raw_etfs = kwargs["sector_shock_etfs"] or {}
+        if isinstance(raw_etfs, dict):
+            etfs.update({
+                str(sector): str(symbol).upper()
+                for sector, symbol in raw_etfs.items()
+                if sector and symbol
+            })
+        kwargs["sector_shock_etfs"] = etfs
     universe = data.get("universe") or ()
     if universe:
         kwargs["universe"] = tuple(universe)

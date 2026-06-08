@@ -45,6 +45,23 @@ from portfolio.simulator import (
 from portfolio.sizing import SizingConfig, sizing_config_from_dict
 
 
+def _atr_from_report(path: Path) -> float | None:
+    """Best-effort extraction of `key_features.technical.atr_14` from a
+    composite report JSON. Returns None on any parse/missing failure."""
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    tech = ((payload.get("key_features") or {}).get("technical") or {})
+    val = tech.get("atr_14")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
 DEFAULT_POLICIES = ("equal_weight_bullish", "top_n_bullish", "confidence_weighted")
 
 
@@ -67,6 +84,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Inclusive lower bound on rebalance week (YYYY-MM-DD).")
     p.add_argument("--date-to", default=None,
                    help="Inclusive upper bound on rebalance week (YYYY-MM-DD).")
+    p.add_argument("--stop-loss-atr-multiple", type=float, default=None,
+                   help="Override stop_loss_atr_multiple from sizing.yaml. "
+                        "Set to 0 to disable intra-week stops (legacy behavior).")
     p.add_argument("--output-dir", default="backtest/results/simulator_full")
     return p.parse_args()
 
@@ -86,7 +106,12 @@ def _load_observations(
     """Group composites by (week_date, ticker). Carries forward the most
     recent composite for tickers that didn't refresh on a given Friday,
     annotated with `composite_age_weeks` so the simulator can age-out
-    stale signals consistently with the daily layer."""
+    stale signals consistently with the daily layer.
+
+    Also extracts `key_features.technical.atr_14` so the simulator can
+    apply position-level stop-loss exits (Section 16). ATR is carried
+    forward with the rest of the composite when a week has no fresh
+    report for a given ticker."""
     by_ticker_week: dict[str, dict[date, dict]] = defaultdict(dict)
     for p in report_paths:
         sig = _load_signal_from_json(p)
@@ -102,6 +127,7 @@ def _load_observations(
             "direction": sig.direction,
             "composite": sig.composite,
             "confidence": sig.confidence,
+            "atr_14": _atr_from_report(p),
         }
 
     all_weeks = sorted({w for entries in by_ticker_week.values() for w in entries})
@@ -126,7 +152,43 @@ def _load_observations(
                 composite=latest["composite"],
                 confidence=latest["confidence"],
                 composite_age_weeks=age_weeks,
+                atr_14=latest.get("atr_14"),
             )
+    return out
+
+
+def _build_intra_week_min_close(
+    daily_closes: pd.DataFrame,
+    weeks: list[date],
+) -> dict[date, dict[str, float]]:
+    """Build `{friday: {ticker: min_close_between_(friday, next_friday]}}`.
+
+    Excludes the entry Friday itself (we entered at that close) and
+    INCLUDES the next Friday (we'd exit at that close, so a pierce on
+    the exit day still counts). Stops on the last week of the window
+    are skipped because there's no next-Friday to define the interval.
+    Returns an empty dict if `daily_closes` is empty.
+    """
+    out: dict[date, dict[str, float]] = {}
+    if daily_closes is None or daily_closes.empty:
+        return out
+    idx = pd.to_datetime(daily_closes.index)
+    df = daily_closes.copy()
+    df.index = idx
+    for i, w in enumerate(weeks):
+        if i + 1 >= len(weeks):
+            continue
+        w_next = weeks[i + 1]
+        # Inclusive of next Friday's close; exclusive of entry Friday.
+        mask = (df.index > pd.Timestamp(w)) & (df.index <= pd.Timestamp(w_next))
+        slab = df.loc[mask]
+        if slab.empty:
+            continue
+        mins = slab.min(axis=0, skipna=True)
+        out[w] = {
+            sym: float(v) for sym, v in mins.items()
+            if pd.notna(v)
+        }
     return out
 
 
@@ -197,10 +259,16 @@ def main() -> None:
     if not universe:
         raise SystemExit("No universe configured in sizing.yaml.")
 
+    stop_mult = (
+        float(args.stop_loss_atr_multiple)
+        if args.stop_loss_atr_multiple is not None
+        else float(base_sizing.stop_loss_atr_multiple)
+    )
     sim_config = SimulationConfig(
         initial_capital=args.initial_capital,
         cost_per_side_bps=args.cost_bps,
         benchmark=args.benchmark,
+        stop_loss_atr_multiple=stop_mult,
     )
 
     date_from = _parse_date_opt(args.date_from)
@@ -226,6 +294,15 @@ def main() -> None:
     weekly_prices = _project_to_weeks(daily_closes, weeks)
     n_priced = (~weekly_prices.isna()).any(axis=0).sum()
     print(f"Got weekly close coverage for {int(n_priced)}/{len(fetch_symbols)} symbols.")
+    intra_week_min_close = _build_intra_week_min_close(daily_closes, weeks)
+    if stop_mult > 0:
+        n_with_mins = sum(1 for w in weeks if intra_week_min_close.get(w))
+        print(
+            f"Intra-week min closes built for {n_with_mins}/{len(weeks) - 1} weeks; "
+            f"stop_loss_atr_multiple={stop_mult:.2f}."
+        )
+    else:
+        print("Stops disabled (stop_loss_atr_multiple=0).")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +333,7 @@ def main() -> None:
             sizing_config=sizing_for_policy,
             sim_config=sim_config,
             policy_name=policy,
+            intra_week_min_close=intra_week_min_close,
         )
         results.append(res)
         _write_per_policy_json(res, out_dir / f"sim_{policy}.json")
@@ -300,7 +378,8 @@ def main() -> None:
         print(
             f"  {r.policy_name:30s}  end=${m['end_equity']:>11,.0f}  "
             f"CAGR={m['cagr']*100:+6.2f}%  Sharpe={m['sharpe_annualized']:+5.2f}  "
-            f"MaxDD={m['max_drawdown']*100:+6.2f}%  TO={m['total_one_way_turnover']:.1f}x"
+            f"MaxDD={m['max_drawdown']*100:+6.2f}%  TO={m['total_one_way_turnover']:.1f}x  "
+            f"Stops={int(m.get('n_stops_hit', 0))}"
         )
 
 
@@ -312,6 +391,7 @@ def _write_per_policy_json(res, path: Path) -> None:
             "cost_per_side_bps": res.config.cost_per_side_bps,
             "benchmark": res.config.benchmark,
             "stale_composite_weeks": res.config.stale_composite_weeks,
+            "stop_loss_atr_multiple": res.config.stop_loss_atr_multiple,
         },
         "metrics": res.metrics,
         "states": [
@@ -323,6 +403,7 @@ def _write_per_policy_json(res, path: Path) -> None:
                 "one_way_turnover": s.one_way_turnover,
                 "cost_paid": s.cost_paid,
                 "target_weights": s.target_weights,
+                "n_stops_hit": s.n_stops_hit,
             }
             for s in res.states
         ],

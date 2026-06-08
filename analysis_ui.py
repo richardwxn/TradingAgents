@@ -29,6 +29,7 @@ from portfolio.execution import (
     ExecutionTicket,
     build_execution_batch,
     execution_config_from_dict,
+    option_intent_score_details,
     ticket_from_action,
 )
 from portfolio.snapshot import load_positions_payload
@@ -51,6 +52,7 @@ DEFAULT_EXECUTION_CONFIG = "configs/execution.yaml"
 DEFAULT_TRADE_TICKETS_DIR = "reports/trade_tickets"
 DEFAULT_TRADE_WORKFLOW_DIR = "reports/trade_workflow"
 DEFAULT_MAX_READY_BUY_TICKETS = 1
+DEFAULT_MAX_REPORT_AGE_DAYS = 3
 FORECAST_PRESETS: dict[str, dict[str, int]] = {
     "short_term_1_2_weeks": {"2d": 2, "1w": 5, "2w": 10, "1m": 21},
     "swing_1_4_weeks": {"1w": 5, "2w": 10, "1m": 21, "3m": 63},
@@ -85,6 +87,8 @@ DATA_PROVIDER_KEY_ENV: dict[str, str | None] = {
 }
 _BEST_BUY_STATUS_LOCK = threading.Lock()
 _BEST_BUY_STATUS: dict[str, dict[str, Any]] = {}
+_BEST_BUY_RESULT_LOCK = threading.Lock()
+_BEST_BUY_RESULTS: dict[str, dict[str, Any]] = {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,6 +128,11 @@ def make_handler(output_dir: str):
                 job_id = (query.get("job_id") or [""])[0]
                 self._send_json(_best_buy_status(job_id))
                 return
+            if parsed.path == "/api/best-buy-result":
+                query = parse_qs(parsed.query)
+                job_id = (query.get("job_id") or [""])[0]
+                self._send_json(_best_buy_result(job_id))
+                return
             if parsed.path == "/report":
                 query = parse_qs(parsed.query)
                 path = (query.get("path") or [""])[0]
@@ -154,7 +163,10 @@ def make_handler(output_dir: str):
             if self.path == "/api/best-buy":
                 try:
                     payload = self._read_json()
-                    response = _run_best_buy(payload, output_dir=output_dir)
+                    if bool(payload.get("async_job", False)):
+                        response = _start_best_buy_job(payload, output_dir=output_dir)
+                    else:
+                        response = _run_best_buy(payload, output_dir=output_dir)
                     self._send_json(response)
                 except Exception as exc:
                     self._send_json(
@@ -322,10 +334,11 @@ def _run_analysis(payload: dict[str, Any], output_dir: str) -> dict[str, Any]:
         json_path = mvp.save_report(report, out_dir)
     else:
         json_path = report_file(out_dir, ticker, as_of_date)
-    markdown = render_markdown(report.to_json_dict())
+    data = report.to_json_dict()
+    _annotate_option_strategy_scores(data)
+    markdown = render_markdown(data)
     md_path = json_path.with_suffix(".md")
     md_path.write_text(markdown)
-    data = report.to_json_dict()
     return {
         "ok": True,
         "json_path": str(json_path.resolve()),
@@ -334,6 +347,26 @@ def _run_analysis(payload: dict[str, Any], output_dir: str) -> dict[str, Any]:
         "report": data,
         "markdown": markdown,
     }
+
+
+def _annotate_option_strategy_scores(report: dict[str, Any]) -> dict[str, Any]:
+    strategies = (
+        ((report.get("key_features") or {}).get("option_strategies") or {})
+        .get("strategies")
+        or []
+    )
+    if not isinstance(strategies, list):
+        return report
+    for strategy in strategies:
+        if not isinstance(strategy, dict):
+            continue
+        if str(strategy.get("verdict") or "").lower() == "unavailable":
+            continue
+        try:
+            strategy.update(option_intent_score_details(report, strategy))
+        except Exception:
+            continue
+    return report
 
 
 def _best_buy_status(job_id: str) -> dict[str, Any]:
@@ -349,6 +382,31 @@ def _best_buy_status(job_id: str) -> dict[str, Any]:
     return status
 
 
+def _best_buy_result(job_id: str) -> dict[str, Any]:
+    if not job_id:
+        return {"ok": False, "error": "job_id is required"}
+    with _BEST_BUY_RESULT_LOCK:
+        result = dict(_BEST_BUY_RESULTS.get(job_id) or {})
+    if result:
+        return result
+    status = _best_buy_status(job_id)
+    if status.get("state") == "running":
+        return {"ok": False, "job_id": job_id, "state": "running"}
+    return {
+        "ok": False,
+        "job_id": job_id,
+        "state": status.get("state", "unknown"),
+        "error": status.get("error") or "Best Buy result is not available.",
+    }
+
+
+def _store_best_buy_result(job_id: str | None, result: dict[str, Any]) -> None:
+    if not job_id:
+        return
+    with _BEST_BUY_RESULT_LOCK:
+        _BEST_BUY_RESULTS[job_id] = dict(result)
+
+
 def _update_best_buy_status(job_id: str | None, **updates: Any) -> None:
     if not job_id:
         return
@@ -358,6 +416,43 @@ def _update_best_buy_status(job_id: str | None, **updates: Any) -> None:
         current["job_id"] = job_id
         current["updated_at"] = datetime.now().isoformat(timespec="seconds")
         _BEST_BUY_STATUS[job_id] = current
+
+
+def _start_best_buy_job(
+    payload: dict[str, Any],
+    output_dir: str = DEFAULT_OUTPUT_DIR,
+) -> dict[str, Any]:
+    job_id = str(payload.get("job_id") or "")
+    if not job_id:
+        raise ValueError("job_id is required for async Best Buy jobs.")
+
+    def worker() -> None:
+        try:
+            result = _run_best_buy(payload, output_dir=output_dir)
+            _store_best_buy_result(job_id, result)
+        except Exception as exc:
+            error_result = {
+                "ok": False,
+                "job_id": job_id,
+                "state": "error",
+                "error": str(exc),
+                "traceback": traceback.format_exc(limit=8),
+            }
+            _store_best_buy_result(job_id, error_result)
+            _update_best_buy_status(
+                job_id,
+                state="error",
+                phase="error",
+                error=str(exc),
+            )
+
+    thread = threading.Thread(
+        target=worker,
+        name=f"best-buy-{job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return {"ok": True, "job_id": job_id, "state": "started"}
 
 
 def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR) -> dict[str, Any]:
@@ -386,18 +481,33 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
     report_paths = [Path(p) for p in glob.glob(reports_glob)]
     signals = load_latest_signals(report_paths, universe=symbols, as_of=as_of)
     config = _load_sizing_config(Path(str(payload.get("sizing_config") or DEFAULT_SIZING_CONFIG)), symbols)
+    max_report_age_days = _max_report_age_days(
+        payload,
+        default=config.stale_composite_days,
+    )
     generated_reports: list[dict[str, Any]] = []
-    if bool(payload.get("run_missing_reports", False)) or bool(payload.get("refresh_stale_reports", False)):
+    generate_all_reports = bool(payload.get("generate_all_reports", False))
+    if (
+        generate_all_reports
+        or bool(payload.get("run_missing_reports", False))
+        or bool(payload.get("refresh_stale_reports", False))
+    ):
         symbols_to_generate: list[tuple[str, str]] = []
-        if bool(payload.get("run_missing_reports", False)):
+        if generate_all_reports:
+            symbols_to_generate.extend((sym, "llm_refresh") for sym in symbols)
+        elif bool(payload.get("run_missing_reports", False)):
             symbols_to_generate.extend(
                 (sym, "missing") for sym in symbols if signals.get(sym) is None
             )
-        if bool(payload.get("refresh_stale_reports", False)):
+        if not generate_all_reports and bool(payload.get("refresh_stale_reports", False)):
             missing = {sym for sym, reason in symbols_to_generate if reason == "missing"}
             symbols_to_generate.extend(
-                (sym, "stale_promising")
-                for sym in _stale_promising_symbols(signals, config, as_of)
+                (sym, "stale")
+                for sym in _stale_signal_symbols(
+                    signals,
+                    as_of=as_of,
+                    max_age_days=max_report_age_days,
+                )
                 if sym not in missing
             )
         _update_best_buy_status(
@@ -421,27 +531,29 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
                 completed=idx - 1,
             )
             analysis_payload = _best_buy_analysis_payload(payload, sym, as_of_raw)
+            if bool(payload.get("force_refresh_reports", False)) or reason == "llm_refresh":
+                analysis_payload["force_refresh"] = True
             try:
                 result = _run_analysis(analysis_payload, output_dir=report_output_dir)
             except Exception as exc:
-                _update_best_buy_status(
-                    job_id,
-                    state="error",
-                    phase="error",
-                    current_symbol=sym,
-                    current_reason=reason,
-                    error=str(exc),
-                    elapsed_seconds=round(time.time() - started_at, 1),
+                generated_reports.append(
+                    {
+                        "symbol": sym,
+                        "reason": reason,
+                        "json_path": None,
+                        "cache_hit": False,
+                        "error": str(exc),
+                    }
                 )
-                raise
-            generated_reports.append(
-                {
-                    "symbol": sym,
-                    "reason": reason,
-                    "json_path": result.get("json_path"),
-                    "cache_hit": result.get("cache_hit", False),
-                }
-            )
+            else:
+                generated_reports.append(
+                    {
+                        "symbol": sym,
+                        "reason": reason,
+                        "json_path": result.get("json_path"),
+                        "cache_hit": result.get("cache_hit", False),
+                    }
+                )
             _update_best_buy_status(
                 job_id,
                 completed=idx,
@@ -461,7 +573,12 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
     cash, positions = _load_positions(Path(str(payload.get("positions_path") or DEFAULT_POSITIONS_PATH)))
     reports_by_symbol = _load_signal_reports(signals)
     fetch_current_prices = bool(payload.get("fetch_current_prices", False))
-    prices = _price_contexts_for_rank(signals, reports_by_symbol, fetch_current_prices)
+    prices = _price_contexts_for_rank(
+        signals,
+        reports_by_symbol,
+        fetch_current_prices,
+        as_of=as_of,
+    )
 
     actions, summary = compute_actions(
         signals=signals,
@@ -470,6 +587,12 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
         config=config,
         cash=cash,
         as_of=as_of,
+        sector_shocks=_sector_shock_context(
+            signals=signals,
+            config=config,
+            fetch_current_prices=fetch_current_prices,
+            as_of=as_of,
+        ),
     )
     by_symbol = {a.symbol: a for a in actions}
     execution_config = _load_execution_config(Path(DEFAULT_EXECUTION_CONFIG))
@@ -502,6 +625,8 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
         for sym in symbols
     ]
     candidates = [c for c in candidates if c is not None]
+    for candidate in candidates:
+        candidate["max_report_age_days"] = max_report_age_days
     candidates.sort(key=lambda c: c["rank_score"], reverse=True)
     _apply_best_buy_ticket_alignment_to_candidates(
         candidates,
@@ -524,6 +649,7 @@ def _run_best_buy(payload: dict[str, Any], output_dir: str = DEFAULT_OUTPUT_DIR)
         "best": best,
         "candidates": candidates,
         "generated_reports": generated_reports,
+        "max_report_age_days": max_report_age_days,
         "summary": summary,
         "positions_source": _positions_source_summary(
             Path(str(payload.get("positions_path") or DEFAULT_POSITIONS_PATH))
@@ -553,6 +679,10 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
     positions_source = _positions_source_summary(positions_path)
     config = _load_sizing_config(sizing_path, [])
     execution_config = _load_execution_config(execution_path)
+    max_report_age_days = _max_report_age_days(
+        payload,
+        default=execution_config.max_signal_age_days,
+    )
     universe = list(config.universe) or sorted(positions.keys()) or _default_watchlist()
     if not universe:
         raise ValueError("No universe configured and no positions held; nothing to ticket.")
@@ -574,7 +704,7 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
                 for sym in _stale_signal_symbols(
                     signals,
                     as_of=as_of,
-                    max_age_days=execution_config.max_signal_age_days,
+                    max_age_days=max_report_age_days,
                 )
                 if sym not in queued
             )
@@ -605,6 +735,7 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
         signals,
         reports_by_symbol,
         fetch_current_prices=fetch_current_prices,
+        as_of=as_of,
     )
     for sym in positions:
         if sym not in prices:
@@ -614,6 +745,12 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
         sizing_path=sizing_path,
         universe=universe,
         fetch_current_prices=fetch_current_prices,
+    )
+    sector_shocks = _sector_shock_context(
+        signals=signals,
+        config=config,
+        fetch_current_prices=fetch_current_prices,
+        as_of=as_of,
     )
     actions, action_summary = compute_actions(
         signals=signals,
@@ -625,6 +762,7 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
         risk_limits=risk_limits,
         beta_map=beta_map,
         correlation_matrix=corr_matrix,
+        sector_shocks=sector_shocks,
     )
     rank_target_weights = compute_target_weights(
         _sizing_input_from_signals(signals, config=config, as_of=as_of),
@@ -692,16 +830,16 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
                     signals,
                     universe=universe,
                     as_of=as_of,
-                    max_age_days=execution_config.max_signal_age_days,
+                    max_age_days=max_report_age_days,
                 )
                 if row["status"] == "stale"
             ),
-            "max_age_days": execution_config.max_signal_age_days,
+            "max_age_days": max_report_age_days,
             "report_age_rows": _report_age_rows(
                 signals,
                 universe=universe,
                 as_of=as_of,
-                max_age_days=execution_config.max_signal_age_days,
+                max_age_days=max_report_age_days,
             ),
         },
         "positions_source": positions_source,
@@ -735,7 +873,7 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             *(
                 [
-                    f"Stale analysis reports remain for: {', '.join(row['symbol'] for row in _report_age_rows(signals, universe=universe, as_of=as_of, max_age_days=execution_config.max_signal_age_days) if row['status'] == 'stale')}"
+                    f"Stale analysis reports remain for: {', '.join(row['symbol'] for row in _report_age_rows(signals, universe=universe, as_of=as_of, max_age_days=max_report_age_days) if row['status'] == 'stale')}"
                 ]
                 if any(
                     row["status"] == "stale"
@@ -743,7 +881,7 @@ def _run_trade_tickets(payload: dict[str, Any]) -> dict[str, Any]:
                         signals,
                         universe=universe,
                         as_of=as_of,
-                        max_age_days=execution_config.max_signal_age_days,
+                        max_age_days=max_report_age_days,
                     )
                 )
                 else []
@@ -967,6 +1105,22 @@ def _risk_context_for_trade_tickets(
     return risk_limits, beta_map, corr_matrix
 
 
+def _sector_shock_context(
+    *,
+    signals: dict[str, Any],
+    config: SizingConfig,
+    fetch_current_prices: bool,
+    as_of: Any,
+) -> dict[str, Any]:
+    if not fetch_current_prices or not getattr(config, "sector_shock_guard_enabled", True):
+        return {}
+    try:
+        from daily_signals import fetch_sector_shocks
+        return fetch_sector_shocks(signals, config=config, as_of=as_of)
+    except Exception:
+        return {}
+
+
 def _format_trade_ticket_markdown(batch) -> str:
     lines = [
         f"# Trade Tickets - {batch.as_of}",
@@ -985,13 +1139,14 @@ def _format_trade_ticket_markdown(batch) -> str:
         lines.extend([
             "## Ready For Robinhood Review",
             "",
-            "| Ticket | Symbol | Side | Qty | Limit | TIF | Source |",
-            "|---|---|---|---:|---:|---|---|",
+            "| Ticket | Symbol | Side | Qty | Price Used | Limit | TIF | Source |",
+            "|---|---|---|---:|---:|---:|---|---|",
         ])
         for ticket in batch.tickets:
             lines.append(
                 f"| `{ticket.ticket_id}` | {ticket.symbol} | {ticket.side} | "
-                f"{ticket.quantity} | {_fmt_money(ticket.limit_price)} | "
+                f"{ticket.quantity} | {_fmt_money(_ticket_price_used(ticket))} | "
+                f"{_fmt_money(ticket.limit_price)} | "
                 f"{ticket.time_in_force} | {ticket.source_action} |"
             )
         lines.append("")
@@ -1002,16 +1157,17 @@ def _format_trade_ticket_markdown(batch) -> str:
         lines.extend([
             "## Blocked Or Intent Only",
             "",
-            "| Ticket | Asset | Symbol | Side | Source | Option Rank | Option Score | Reason |",
-            "|---|---|---|---|---|---:|---:|---|",
+            "| Ticket | Asset | Symbol | Side | Contract | Source | Option Rank | Option Score | Reason |",
+            "|---|---|---|---|---|---|---:|---:|---|",
         ])
         for ticket in batch.blocked_tickets:
-            reason = (ticket.blocked_reason or "").replace("|", "\\|")
+            reason = _markdown_cell(ticket.blocked_reason)
+            contract = _markdown_cell(_option_contract_label(ticket))
             rank = _option_rank(ticket)
             score = _option_score(ticket)
             lines.append(
                 f"| `{ticket.ticket_id}` | {ticket.asset_type} | {ticket.symbol} | "
-                f"{ticket.side} | {ticket.source_action} | {rank} | {score} | {reason} |"
+                f"{ticket.side} | {contract} | {ticket.source_action} | {rank} | {score} | {reason} |"
             )
         lines.append("")
 
@@ -1027,9 +1183,25 @@ def _format_trade_ticket_markdown(batch) -> str:
             lines.append(f"- Gate reason: {ticket.review_gate_reason}")
         for caveat in ticket.review_execution_caveats:
             lines.append(f"- Gate caveat: {caveat}")
+        price_source = (ticket.details or {}).get("price_source")
+        if _ticket_price_used(ticket) is not None:
+            lines.append(
+                "- Price used: "
+                f"{_fmt_money(_ticket_price_used(ticket))}"
+                + (f" (`{price_source}`)" if price_source else "")
+            )
+        if ticket.limit_price is not None:
+            lines.append(
+                "- Limit basis: "
+                f"{_fmt_money(ticket.limit_price)}"
+                + _ticket_limit_basis_note(ticket)
+            )
         option_rank = _option_rank(ticket)
         option_score = _option_score(ticket)
         if option_score:
+            option_contract = _option_contract_label(ticket)
+            if option_contract:
+                lines.append(f"- Option contract: {option_contract}")
             lines.append(f"- Option intent rank: {option_rank or 'n/a'}")
             lines.append(f"- Option intent score: {option_score}")
             lines.append(
@@ -1113,6 +1285,58 @@ def _option_score(ticket) -> str:
     return f"{float(score):.0f}/100{suffix}"
 
 
+def _option_contract_label(ticket) -> str:
+    if getattr(ticket, "asset_type", "") != "option_intent":
+        return ""
+    details = ticket.details or {}
+    expiry = details.get("expiry") or "—"
+    dte = details.get("dte")
+    dte_label = "—" if dte is None else str(dte)
+    long_strike = _safe_float(details.get("long_strike"))
+    short_strike = _safe_float(details.get("short_strike"))
+    strike = _safe_float(details.get("strike"))
+    source_action = str(getattr(ticket, "source_action", "") or details.get("type") or "")
+
+    if long_strike is not None or short_strike is not None:
+        return (
+            f"{expiry} / {dte_label} DTE / "
+            f"{_fmt_money(long_strike)}-{_fmt_money(short_strike)} call spread"
+        )
+
+    if strike is None:
+        return ""
+    option_type = details.get("option_type")
+    if not option_type:
+        if source_action == "sell_put":
+            option_type = "put"
+        elif source_action in {"sell_call", "buy_call_spread"}:
+            option_type = "call"
+    suffix = f" {option_type}" if option_type else ""
+    return f"{expiry} / {dte_label} DTE / {_fmt_money(strike)}{suffix}"
+
+
+def _markdown_cell(value: Any) -> str:
+    return str(value or "").replace("|", "\\|")
+
+
+def _ticket_price_used(ticket) -> float | None:
+    try:
+        value = (ticket.details or {}).get("last_close")
+    except AttributeError:
+        return None
+    return _safe_float(value)
+
+
+def _ticket_limit_basis_note(ticket) -> str:
+    details = ticket.details or {}
+    bits = []
+    if details.get("sma20") is not None:
+        bits.append(f"SMA20 {_fmt_money(_safe_float(details.get('sma20')))}")
+    if details.get("atr14") is not None:
+        bits.append(f"ATR14 {_fmt_money(_safe_float(details.get('atr14')))}")
+    return f" ({', '.join(bits)})" if bits else ""
+
+
 def _output_dir_from_reports_glob(reports_glob: str) -> str | None:
     if not reports_glob:
         return None
@@ -1127,6 +1351,16 @@ def _output_dir_from_reports_glob(reports_glob: str) -> str | None:
     if not has_wildcard:
         return str(path)
     return str(path.parent if path.name else path)
+
+
+def _max_report_age_days(payload: dict[str, Any], *, default: int) -> int:
+    raw = payload.get("max_report_age_days")
+    if raw in (None, ""):
+        return max(0, int(default))
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return max(0, int(default))
 
 
 def _stale_promising_symbols(
@@ -1366,25 +1600,74 @@ def _price_contexts_for_rank(
     signals: dict[str, Any],
     reports_by_symbol: dict[str, dict[str, Any]],
     fetch_current_prices: bool,
+    as_of: Any | None = None,
 ) -> dict[str, PriceContext]:
     out: dict[str, PriceContext] = {}
     for sym in signals:
+        report = reports_by_symbol.get(sym) or {}
+        report_ctx = _price_context_from_report(report)
         if fetch_current_prices:
             try:
                 from daily_signals import fetch_price_context
-                out[sym] = fetch_price_context(sym)
+                fetched = fetch_price_context(sym)
+                if fetched.last_close is None and report_ctx.last_close is not None:
+                    out[sym] = PriceContext(
+                        last_close=report_ctx.last_close,
+                        sma20=report_ctx.sma20,
+                        atr14=report_ctx.atr14,
+                        source="report_current_price_yfinance_unavailable",
+                    )
+                elif _fetched_price_conflicts_with_same_day_report(
+                    fetched,
+                    report_ctx,
+                    report,
+                    as_of=as_of,
+                ):
+                    out[sym] = PriceContext(
+                        last_close=report_ctx.last_close,
+                        sma20=report_ctx.sma20,
+                        atr14=report_ctx.atr14,
+                        source="report_current_price_yfinance_disagreed",
+                    )
+                else:
+                    out[sym] = fetched
                 continue
             except Exception:
                 pass
-        report = reports_by_symbol.get(sym) or {}
-        tech = ((report.get("key_features") or {}).get("technical") or {})
-        decision = ((report.get("key_features") or {}).get("decision_summary") or {})
-        out[sym] = PriceContext(
-            last_close=_safe_float(decision.get("current_price") or tech.get("close")),
-            sma20=_safe_float(tech.get("sma_20")),
-            atr14=_safe_float(tech.get("atr_14")),
-        )
+        out[sym] = report_ctx
     return out
+
+
+def _price_context_from_report(report: dict[str, Any]) -> PriceContext:
+    tech = ((report.get("key_features") or {}).get("technical") or {})
+    decision = ((report.get("key_features") or {}).get("decision_summary") or {})
+    return PriceContext(
+        last_close=_safe_float(decision.get("current_price") or tech.get("close")),
+        sma20=_safe_float(tech.get("sma_20")),
+        atr14=_safe_float(tech.get("atr_14")),
+        source="report_current_price",
+    )
+
+
+def _fetched_price_conflicts_with_same_day_report(
+    fetched: PriceContext,
+    report_ctx: PriceContext,
+    report: dict[str, Any],
+    *,
+    as_of: Any | None,
+    tolerance_pct: float = 0.05,
+) -> bool:
+    if fetched.last_close is None or report_ctx.last_close is None:
+        return False
+    if report_ctx.last_close <= 0:
+        return False
+    if as_of is None:
+        return False
+    report_date = str(report.get("as_of_date") or "")
+    as_of_date = as_of.isoformat() if hasattr(as_of, "isoformat") else str(as_of)
+    if report_date != as_of_date:
+        return False
+    return abs(float(fetched.last_close) / float(report_ctx.last_close) - 1.0) > tolerance_pct
 
 
 def _rank_candidate(
@@ -1579,77 +1862,153 @@ def _html_page() -> str:
   <style>
     :root {{
       color-scheme: light;
-      --ink: #172026;
-      --muted: #5c6870;
-      --line: #d8dee3;
-      --panel: #f7f9fa;
-      --accent: #0c6b58;
-      --warn: #9d4b00;
-      --bad: #a33131;
+      --ink: #182229;
+      --muted: #65717a;
+      --line: #d9e1e6;
+      --line-strong: #bdc8d0;
+      --panel: #f4f7f8;
+      --panel-soft: #f9fbfb;
+      --surface: #ffffff;
+      --accent: #0b6b5b;
+      --accent-soft: #e7f2ef;
+      --warn: #9a5b00;
+      --warn-soft: #fff6e6;
+      --bad: #a43131;
+      --bad-soft: #fbebeb;
       --good: #0b6f45;
+      --good-soft: #e8f4ee;
+      --shadow: 0 1px 2px rgba(24, 34, 41, .06), 0 12px 28px rgba(24, 34, 41, .05);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: #ffffff; color: var(--ink); }}
+    body {{ margin: 0; background: #eef3f4; color: var(--ink); }}
     header {{
       border-bottom: 1px solid var(--line);
-      padding: 16px 24px;
+      padding: 14px 24px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 16px;
+      background: var(--surface);
+      position: sticky;
+      top: 0;
+      z-index: 4;
     }}
     h1 {{ margin: 0; font-size: 20px; font-weight: 650; }}
     main {{
       display: grid;
-      grid-template-columns: minmax(300px, 420px) minmax(0, 1fr);
-      min-height: calc(100vh - 66px);
+      grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
+      min-height: calc(100vh - 58px);
     }}
     aside {{
       border-right: 1px solid var(--line);
-      padding: 18px;
+      padding: 16px;
       overflow: auto;
       background: var(--panel);
+      max-height: calc(100vh - 58px);
+      position: sticky;
+      top: 58px;
     }}
-    section {{ padding: 20px 24px; overflow: auto; }}
+    section {{ padding: 18px 22px 28px; overflow: auto; min-width: 0; }}
     fieldset {{
       border: 1px solid var(--line);
       border-radius: 8px;
-      margin: 0 0 14px;
-      padding: 14px;
-      background: #fff;
+      margin: 0;
+      padding: 12px;
+      background: var(--surface);
     }}
-    legend {{ padding: 0 6px; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }}
-    label {{ display: block; font-size: 12px; font-weight: 650; color: #2c373d; margin: 10px 0 5px; }}
+    legend {{ padding: 0 6px; color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; }}
+    label {{ display: block; font-size: 12px; font-weight: 700; color: #2c373d; margin: 10px 0 5px; }}
     input, select, textarea {{
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 8px 9px;
       font: inherit;
-      background: #fff;
+      background: var(--surface);
+      color: var(--ink);
+      min-width: 0;
+    }}
+    input:focus, select:focus, textarea:focus, button:focus-visible, summary:focus-visible {{
+      outline: 2px solid rgba(11, 107, 91, .24);
+      outline-offset: 2px;
+      border-color: var(--accent);
     }}
     textarea {{ min-height: 92px; resize: vertical; line-height: 1.35; }}
     input[type="checkbox"] {{ width: auto; margin-right: 8px; }}
     input[type="range"] {{ padding: 0; }}
     .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-    .checkrow {{ display: flex; align-items: center; margin-top: 10px; color: #2c373d; font-size: 13px; }}
-    .hint {{ color: var(--muted); font-size: 12px; line-height: 1.35; margin: 8px 0 0; }}
+    .checkrow {{ display: flex; align-items: center; margin-top: 10px; color: #2c373d; font-size: 13px; line-height: 1.25; }}
+    .hint {{ color: var(--muted); font-size: 12px; line-height: 1.38; margin: 8px 0 0; overflow-wrap: anywhere; }}
     .hint.warn {{ color: var(--warn); }}
+    .quick-toggles {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0 12px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+    }}
+    .quick-toggles .checkrow {{ margin-top: 6px; }}
+    .form-stack {{ display: grid; gap: 12px; }}
+    .form-section {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden;
+    }}
+    .form-section summary {{
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 11px 12px;
+      font-size: 12px;
+      font-weight: 800;
+      color: #2c373d;
+      list-style: none;
+    }}
+    .form-section summary::-webkit-details-marker {{ display: none; }}
+    .form-section summary::after {{
+      content: "+";
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1;
+    }}
+    .form-section[open] summary {{
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-soft);
+    }}
+    .form-section[open] summary::after {{ content: "-"; }}
+    .form-section-body {{ padding: 0 12px 12px; }}
+    .primary-fieldset {{
+      box-shadow: var(--shadow);
+      border-color: var(--line-strong);
+    }}
+    .primary-actions {{
+      position: sticky;
+      bottom: 0;
+      display: grid;
+      gap: 8px;
+      padding-top: 4px;
+      background: linear-gradient(rgba(244,247,248,0), var(--panel) 30%);
+    }}
     .side-switch {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 6px;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
     }}
     .side-tab {{
       width: auto;
-      background: #fff;
+      background: var(--surface);
       color: var(--ink);
       border: 1px solid var(--line);
       padding: 8px 6px;
       font-size: 12px;
       white-space: nowrap;
+      box-shadow: none;
     }}
     .side-tab.active {{
       background: var(--ink);
@@ -1672,22 +2031,25 @@ def _html_page() -> str:
       font-weight: 700;
       cursor: pointer;
     }}
-    button.secondary {{ background: var(--ink); margin-top: 8px; }}
+    button.secondary {{ background: var(--ink); margin-top: 0; }}
     button:disabled {{ opacity: .55; cursor: wait; }}
     .toolbar {{ display: flex; gap: 10px; align-items: center; }}
-    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; font-size: 12px; color: var(--muted); background: #fff; }}
-    .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }}
-    .metric {{ border-bottom: 2px solid var(--line); padding: 8px 0; min-width: 0; }}
-    .metric b {{ display: block; font-size: 20px; overflow-wrap: anywhere; }}
+    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; font-size: 12px; color: var(--muted); background: var(--surface); }}
+    .summary-grid, .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }}
+    .metric {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; background: var(--panel-soft); }}
+    .metric b {{ display: block; font-size: 20px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }}
     .metric span {{ color: var(--muted); font-size: 12px; }}
     .bullish {{ color: var(--good); }}
     .bearish {{ color: var(--bad); }}
     .neutral {{ color: var(--warn); }}
     .dashboard-hero {{
+      border: 1px solid var(--line);
       border-top: 4px solid var(--accent);
-      border-bottom: 1px solid var(--line);
-      padding: 16px 0 18px;
-      margin-bottom: 18px;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
     }}
     .hero-line {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }}
     .action-badge {{
@@ -1709,11 +2071,20 @@ def _html_page() -> str:
     .hero-copy h2 {{ margin: 0 0 6px; font-size: 24px; }}
     .hero-copy p {{ margin: 0; color: var(--muted); line-height: 1.45; }}
     .stat-strip {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 16px; }}
-    .stat-item {{ border-left: 3px solid var(--line); padding: 4px 0 4px 10px; min-width: 0; }}
+    .stat-item {{ border-left: 3px solid var(--line); padding: 4px 0 4px 10px; min-width: 0; background: transparent; }}
     .stat-item b {{ display: block; font-size: 18px; overflow-wrap: anywhere; }}
     .stat-item span {{ color: var(--muted); font-size: 12px; }}
     .summary-columns {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 18px; align-items: start; }}
-    .dashboard-panel {{ border-top: 1px solid var(--line); padding-top: 14px; margin-bottom: 18px; }}
+    .panel, .dashboard-panel {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 16px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      min-width: 0;
+      overflow-x: auto;
+    }}
     .dashboard-panel h2 {{ margin: 0 0 10px; font-size: 16px; }}
     .dashboard-panel p {{ line-height: 1.45; }}
     .levels {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }}
@@ -1724,7 +2095,7 @@ def _html_page() -> str:
     .level.sell-level {{ border-left-color: var(--accent); }}
     .level.stop-level {{ border-left-color: var(--bad); }}
     .strategy-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }}
-    .strategy-card {{ border-top: 3px solid var(--line); padding: 8px 0 10px; min-width: 0; }}
+    .strategy-card {{ border: 1px solid var(--line); border-top: 3px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; background: var(--panel-soft); }}
     .strategy-card.consider {{ border-top-color: var(--good); }}
     .strategy-card.conditional {{ border-top-color: var(--warn); }}
     .strategy-card.wait {{ border-top-color: var(--warn); }}
@@ -1747,18 +2118,18 @@ def _html_page() -> str:
     .muted-list {{ margin: 0; padding-left: 18px; color: var(--muted); }}
     .muted-list li {{ margin: 4px 0; }}
     .rank-list {{ display: grid; gap: 10px; }}
-    .rank-row {{ border-top: 1px solid var(--line); padding: 12px 0; display: grid; grid-template-columns: 92px minmax(0, 1fr) 120px; gap: 12px; align-items: start; }}
+    .rank-row {{ border: 1px solid var(--line); border-radius: 8px; padding: 12px; display: grid; grid-template-columns: 92px minmax(0, 1fr) 120px; gap: 12px; align-items: start; background: var(--panel-soft); }}
     .rank-symbol {{ font-size: 20px; font-weight: 800; }}
     .rank-score {{ text-align: right; font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; }}
     .rank-meta {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }}
-    .pill-row {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-    .data-pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; font-size: 12px; color: var(--muted); background: #fff; }}
+    .pill-row, .chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .data-pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font-size: 12px; color: var(--muted); background: var(--surface); max-width: 100%; overflow-wrap: anywhere; }}
     .artifact-list {{ display: grid; gap: 8px; margin-top: 10px; }}
     .artifact-row {{ display: grid; grid-template-columns: minmax(150px, .45fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; border-top: 1px solid var(--line); padding-top: 8px; }}
     .artifact-row b {{ font-size: 13px; }}
     .artifact-row span {{ color: var(--muted); font-size: 12px; line-height: 1.35; }}
     .artifact-row a {{ white-space: nowrap; }}
-    .handoff-box {{ background: #fbfcfd; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
+    .handoff-box {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
     .handoff-box p {{ margin: 0 0 10px; color: var(--muted); line-height: 1.45; }}
     .agent-room {{ display: grid; gap: 12px; }}
     .agent-room details {{ border-top: 1px solid var(--line); padding-top: 10px; }}
@@ -1773,21 +2144,50 @@ def _html_page() -> str:
     .disagreement-list li {{ margin: 5px 0; }}
     details.details-block {{ border-top: 1px solid var(--line); padding-top: 12px; margin-top: 8px; }}
     details.details-block summary {{ cursor: pointer; font-weight: 700; margin-bottom: 8px; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 12px 0 18px; font-size: 13px; }}
+    .table-wrap {{ width: 100%; overflow-x: auto; }}
+    table {{ width: 100%; min-width: 620px; border-collapse: collapse; margin: 12px 0 18px; font-size: 13px; }}
     th, td {{ border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }}
     th {{ color: var(--muted); font-size: 12px; }}
     ul {{ padding-left: 20px; }}
-    pre {{ white-space: pre-wrap; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fbfcfd; max-height: 520px; overflow: auto; }}
-    .tabs {{ display: flex; gap: 6px; margin: 4px 0 14px; }}
-    .tab {{ width: auto; background: #fff; color: var(--ink); border: 1px solid var(--line); padding: 7px 10px; }}
+    pre {{ white-space: pre-wrap; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); max-height: 620px; overflow: auto; box-shadow: var(--shadow); }}
+    .tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 0 0 14px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      position: sticky;
+      top: 72px;
+      z-index: 3;
+      box-shadow: var(--shadow);
+    }}
+    .tab {{ width: auto; background: var(--surface); color: var(--ink); border: 1px solid var(--line); padding: 7px 10px; box-shadow: none; }}
     .tab.active {{ background: var(--ink); color: white; border-color: var(--ink); }}
     .hidden {{ display: none; }}
-    .error {{ color: var(--bad); white-space: pre-wrap; }}
+    .error, .empty-state {{ color: var(--bad); white-space: pre-wrap; border: 1px solid var(--bad-soft); border-radius: 8px; padding: 12px; background: var(--bad-soft); }}
+    .empty-state {{ color: var(--muted); background: var(--panel-soft); border-color: var(--line); }}
     @media (max-width: 900px) {{
       main {{ grid-template-columns: 1fr; }}
-      aside {{ border-right: 0; border-bottom: 1px solid var(--line); }}
+      aside {{ border-right: 0; border-bottom: 1px solid var(--line); max-height: none; position: static; }}
+      .tabs {{ position: static; }}
       .summary-grid {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
       .summary-columns {{ grid-template-columns: 1fr; }}
+      .rank-row {{ grid-template-columns: 1fr; }}
+      .rank-score {{ text-align: left; }}
+      .artifact-row {{ grid-template-columns: 1fr; }}
+    }}
+    @media (max-width: 560px) {{
+      header {{ align-items: flex-start; flex-direction: column; padding: 12px 16px; }}
+      section {{ padding: 14px; }}
+      aside {{ padding: 14px; }}
+      .grid2 {{ grid-template-columns: 1fr; }}
+      .quick-toggles {{ grid-template-columns: 1fr; }}
+      .side-switch {{ grid-template-columns: 1fr; }}
+      .hero-copy h2 {{ font-size: 20px; }}
+      .stat-strip, .summary-grid, .metric-grid {{ grid-template-columns: 1fr 1fr; }}
     }}
   </style>
 </head>
@@ -1806,8 +2206,8 @@ def _html_page() -> str:
         <button class="side-tab" data-side-panel="trade-ticket-form" type="button">Tickets</button>
       </div>
 
-      <form id="analysis-form" class="side-panel active">
-        <fieldset>
+      <form id="analysis-form" class="side-panel active form-stack">
+        <fieldset class="primary-fieldset">
           <legend>Run</legend>
           <div class="grid2">
             <div>
@@ -1836,62 +2236,74 @@ def _html_page() -> str:
           <p id="data_provider_status" class="hint"></p>
           <label for="competitors">Competitors</label>
           <input id="competitors" name="competitors" placeholder="AMD,INTC,AVGO">
-        </fieldset>
-
-        <fieldset>
-          <legend>Options</legend>
-          <label class="checkrow"><input id="disable_options_scan" type="checkbox"> Disable options scan</label>
-          <label for="min_unusual_option_notional">Min Unusual Notional</label>
-          <input id="min_unusual_option_notional" type="number" min="0" step="50000" value="500000">
-          <label for="min_option_volume_oi_ratio">Min Volume/OI Ratio</label>
-          <input id="min_option_volume_oi_ratio" type="number" min="0" step="0.1" value="3.0">
-        </fieldset>
-
-        <fieldset>
-          <legend>LLM</legend>
-          <label class="checkrow"><input id="enable_narrative" type="checkbox"> Narrative</label>
-          <label class="checkrow"><input id="enable_llm_insights" type="checkbox"> Insight Block</label>
-          <label class="checkrow"><input id="enable_tradingagents_review" type="checkbox"> TradingAgents Review</label>
-          <div class="grid2">
-            <div>
-              <label for="llm_provider">Provider</label>
-              <select id="llm_provider">
-                <option value="openai">openai</option>
-                <option value="google">google</option>
-                <option value="anthropic">anthropic</option>
-                <option value="xai">xai</option>
-                <option value="openrouter">openrouter</option>
-                <option value="ollama">ollama</option>
-              </select>
-            </div>
-            <div>
-              <label for="llm_model_select">Model</label>
-              <select id="llm_model_select"></select>
-            </div>
+          <div class="quick-toggles">
+            <label class="checkrow"><input id="enable_narrative" type="checkbox"> Narrative</label>
+            <label class="checkrow"><input id="enable_llm_insights" type="checkbox"> Insight Block</label>
+            <label class="checkrow"><input id="enable_tradingagents_review" type="checkbox"> TradingAgents Review</label>
+            <label class="checkrow"><input id="force_refresh" type="checkbox"> Refresh cached report</label>
           </div>
-          <input id="llm_model_custom" class="hidden" placeholder="Custom model id">
-          <p id="llm_status" class="hint"></p>
         </fieldset>
 
-        <fieldset>
-          <legend>Weights</legend>
-          <div id="factors"></div>
-        </fieldset>
+        <details class="form-section">
+          <summary>Options scan</summary>
+          <div class="form-section-body">
+            <label class="checkrow"><input id="disable_options_scan" type="checkbox"> Disable options scan</label>
+            <label for="min_unusual_option_notional">Min Unusual Notional</label>
+            <input id="min_unusual_option_notional" type="number" min="0" step="50000" value="500000">
+            <label for="min_option_volume_oi_ratio">Min Volume/OI Ratio</label>
+            <input id="min_option_volume_oi_ratio" type="number" min="0" step="0.1" value="3.0">
+          </div>
+        </details>
 
-        <fieldset>
-          <legend>State</legend>
-          <label class="checkrow"><input id="no_state" type="checkbox"> Disable state delta</label>
-          <label class="checkrow"><input id="force_refresh" type="checkbox"> Refresh cached report</label>
-          <label for="state_store">State Store</label>
-          <input id="state_store" value="state/analysis_state.sqlite">
-          <label for="portfolio_path">Portfolio Snapshot</label>
-          <input id="portfolio_path" value="{DEFAULT_PORTFOLIO_PATH}">
-        </fieldset>
-        <button id="run" type="submit">Run Analysis</button>
+        <details class="form-section" open>
+          <summary>LLM provider and model</summary>
+          <div class="form-section-body">
+            <div class="grid2">
+              <div>
+                <label for="llm_provider">Provider</label>
+                <select id="llm_provider">
+                  <option value="openai">openai</option>
+                  <option value="google">google</option>
+                  <option value="anthropic">anthropic</option>
+                  <option value="xai">xai</option>
+                  <option value="openrouter">openrouter</option>
+                  <option value="ollama">ollama</option>
+                </select>
+              </div>
+              <div>
+                <label for="llm_model_select">Model</label>
+                <select id="llm_model_select"></select>
+              </div>
+            </div>
+            <input id="llm_model_custom" class="hidden" placeholder="Custom model id">
+            <p id="llm_status" class="hint"></p>
+          </div>
+        </details>
+
+        <details class="form-section">
+          <summary>Factor weights</summary>
+          <div class="form-section-body">
+            <div id="factors"></div>
+          </div>
+        </details>
+
+        <details class="form-section">
+          <summary>State and files</summary>
+          <div class="form-section-body">
+            <label class="checkrow"><input id="no_state" type="checkbox"> Disable state delta</label>
+            <label for="state_store">State Store</label>
+            <input id="state_store" value="state/analysis_state.sqlite">
+            <label for="portfolio_path">Portfolio Snapshot</label>
+            <input id="portfolio_path" value="{DEFAULT_PORTFOLIO_PATH}">
+          </div>
+        </details>
+        <div class="primary-actions">
+          <button id="run" type="submit">Run Analysis</button>
+        </div>
       </form>
 
-      <form id="best-buy-form" class="side-panel">
-        <fieldset>
+      <form id="best-buy-form" class="side-panel form-stack">
+        <fieldset class="primary-fieldset">
           <legend>Best Buy</legend>
           <label for="watchlist">Care Tickers</label>
           <textarea id="watchlist">{watchlist_text}</textarea>
@@ -1905,21 +2317,35 @@ def _html_page() -> str:
               <input id="best_buy_reports_glob" value="{DEFAULT_REPORTS_GLOB}">
             </div>
           </div>
-          <label for="best_buy_sizing_config">Sizing Config</label>
-          <input id="best_buy_sizing_config" value="{DEFAULT_SIZING_CONFIG}">
-          <label for="best_buy_positions_path">Positions Source</label>
-          <input id="best_buy_positions_path" value="{trade_positions_default}">
-          <p class="hint">Uses the same default account source as Tickets, so ranking and ticket status share the same current holdings.</p>
-          <label class="checkrow"><input id="best_buy_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
-          <label class="checkrow"><input id="best_buy_run_missing" type="checkbox"> Run analysis for missing reports</label>
-          <label class="checkrow"><input id="best_buy_refresh_stale" type="checkbox"> Refresh stale promising reports</label>
-          <p class="hint">Ranks latest reports for the watchlist. Missing and stale promising reports can be generated first using the current analysis settings.</p>
-          <button id="best-buy-run" class="secondary" type="submit">Pick Best Buy</button>
+          <label for="best_buy_max_report_age_days">Max Report Age</label>
+          <input id="best_buy_max_report_age_days" type="number" min="0" step="1" value="{DEFAULT_MAX_REPORT_AGE_DAYS}">
+          <div class="quick-toggles">
+            <label class="checkrow"><input id="best_buy_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
+            <label class="checkrow"><input id="best_buy_run_missing" type="checkbox"> Run analysis for missing reports</label>
+            <label class="checkrow"><input id="best_buy_refresh_stale" type="checkbox"> Refresh reports older than max age</label>
+          </div>
+          <p class="hint">Ranks latest reports for the watchlist. With refresh enabled, reports older than this many calendar days are regenerated for the selected as-of date.</p>
+          <p class="hint">Generate All LLM Reports refreshes every watchlist ticker with Narrative + Insight Block. Check TradingAgents Review only when you want the slower full-agent review included.</p>
         </fieldset>
+
+        <details class="form-section">
+          <summary>Ranking files</summary>
+          <div class="form-section-body">
+            <label for="best_buy_sizing_config">Sizing Config</label>
+            <input id="best_buy_sizing_config" value="{DEFAULT_SIZING_CONFIG}">
+            <label for="best_buy_positions_path">Positions Source</label>
+            <input id="best_buy_positions_path" value="{trade_positions_default}">
+            <p class="hint">Uses the same default account source as Tickets, so ranking and ticket status share the same current holdings.</p>
+          </div>
+        </details>
+        <div class="primary-actions">
+          <button id="best-buy-run" class="secondary" type="submit">Pick Best Buy</button>
+          <button id="best-buy-llm-run" class="secondary" type="button">Generate All LLM Reports</button>
+        </div>
       </form>
 
-      <form id="trade-ticket-form" class="side-panel">
-        <fieldset>
+      <form id="trade-ticket-form" class="side-panel form-stack">
+        <fieldset class="primary-fieldset">
           <legend>Trade Tickets</legend>
           <div class="grid2">
             <div>
@@ -1931,32 +2357,51 @@ def _html_page() -> str:
               <input id="trade_ticket_reports_glob" value="{DEFAULT_REPORTS_GLOB}">
             </div>
           </div>
+          <label for="trade_ticket_max_report_age_days">Max Report Age</label>
+          <input id="trade_ticket_max_report_age_days" type="number" min="0" step="1" value="{DEFAULT_MAX_REPORT_AGE_DAYS}">
           <label for="trade_ticket_positions_path">Positions Source</label>
           <input id="trade_ticket_positions_path" value="{trade_positions_default}">
           <p class="hint">Use `configs/robinhood_snapshot.json` after a Robinhood sync, or the manual ledger as a fallback.</p>
-          <label for="trade_ticket_sizing_config">Sizing Config</label>
-          <input id="trade_ticket_sizing_config" value="{DEFAULT_SIZING_CONFIG}">
-          <label for="trade_ticket_execution_config">Execution Config</label>
-          <input id="trade_ticket_execution_config" value="{DEFAULT_EXECUTION_CONFIG}">
-          <div class="grid2">
-            <div>
-              <label for="trade_ticket_tickets_dir">Tickets Dir</label>
-              <input id="trade_ticket_tickets_dir" value="{DEFAULT_TRADE_TICKETS_DIR}">
-            </div>
-            <div>
-              <label for="trade_ticket_workflow_dir">Workflow Dir</label>
-              <input id="trade_ticket_workflow_dir" value="{DEFAULT_TRADE_WORKFLOW_DIR}">
-            </div>
-          </div>
           <label for="trade_ticket_account_hint">Account Hint</label>
           <input id="trade_ticket_account_hint" placeholder="optional Robinhood account number">
-          <button id="robinhood-sync-request-run" class="secondary" type="button">Request Robinhood Sync</button>
-          <label class="checkrow"><input id="trade_ticket_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
-          <label class="checkrow"><input id="trade_ticket_run_missing" type="checkbox"> Run analysis for missing reports</label>
-          <label class="checkrow"><input id="trade_ticket_refresh_stale" type="checkbox" checked> Refresh stale reports first</label>
+          <div class="quick-toggles">
+            <label class="checkrow"><input id="trade_ticket_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
+            <label class="checkrow"><input id="trade_ticket_run_missing" type="checkbox"> Run analysis for missing reports</label>
+            <label class="checkrow"><input id="trade_ticket_refresh_stale" type="checkbox" checked> Refresh reports older than max age</label>
+          </div>
           <p class="hint">Generates broker-gated tickets and a Codex review prompt. The UI never places Robinhood orders.</p>
-          <button id="trade-ticket-run" class="secondary" type="submit">Generate Tickets</button>
         </fieldset>
+
+        <details class="form-section">
+          <summary>Robinhood sync handoff</summary>
+          <div class="form-section-body">
+            <button id="robinhood-sync-request-run" class="secondary" type="button">Request Robinhood Sync</button>
+            <p class="hint">Creates a read-only Codex MCP sync prompt without placing orders.</p>
+          </div>
+        </details>
+
+        <details class="form-section">
+          <summary>Ticket files</summary>
+          <div class="form-section-body">
+            <label for="trade_ticket_sizing_config">Sizing Config</label>
+            <input id="trade_ticket_sizing_config" value="{DEFAULT_SIZING_CONFIG}">
+            <label for="trade_ticket_execution_config">Execution Config</label>
+            <input id="trade_ticket_execution_config" value="{DEFAULT_EXECUTION_CONFIG}">
+            <div class="grid2">
+              <div>
+                <label for="trade_ticket_tickets_dir">Tickets Dir</label>
+                <input id="trade_ticket_tickets_dir" value="{DEFAULT_TRADE_TICKETS_DIR}">
+              </div>
+              <div>
+                <label for="trade_ticket_workflow_dir">Workflow Dir</label>
+                <input id="trade_ticket_workflow_dir" value="{DEFAULT_TRADE_WORKFLOW_DIR}">
+              </div>
+            </div>
+          </div>
+        </details>
+        <div class="primary-actions">
+          <button id="trade-ticket-run" class="secondary" type="submit">Generate Tickets</button>
+        </div>
       </form>
     </aside>
     <section>
@@ -2081,13 +2526,24 @@ def _html_page() -> str:
 
     document.getElementById('best-buy-form').addEventListener('submit', async (event) => {{
       event.preventDefault();
+      await runBestBuyBatch(false);
+    }});
+
+    document.getElementById('best-buy-llm-run').addEventListener('click', async () => {{
+      await runBestBuyBatch(true);
+    }});
+
+    async function runBestBuyBatch(forceAllLlm) {{
       const status = document.getElementById('status');
       const run = document.getElementById('best-buy-run');
+      const llmRun = document.getElementById('best-buy-llm-run');
       const runMissing = document.getElementById('best_buy_run_missing').checked;
       const refreshStale = document.getElementById('best_buy_refresh_stale').checked;
       const jobId = `best-buy-${{Date.now()}}-${{Math.random().toString(16).slice(2)}}`;
-      status.textContent = runMissing || refreshStale ? 'Analyzing + ranking' : 'Ranking';
+      const shouldGenerate = forceAllLlm || runMissing || refreshStale;
+      status.textContent = forceAllLlm ? 'Generating LLM reports' : (shouldGenerate ? 'Analyzing + ranking' : 'Ranking');
       run.disabled = true;
+      llmRun.disabled = true;
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
       document.querySelector('[data-tab="best-buy"]').classList.add('active');
       for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
@@ -2095,11 +2551,30 @@ def _html_page() -> str:
       }}
       document.getElementById('best-buy').innerHTML = `
         <div class="dashboard-panel">
-          <h2>Best Buy progress</h2>
-          <div id="best-buy-progress">${{runMissing || refreshStale ? 'Starting needed analyses...' : 'Ranking cached reports...'}}</div>
+          <h2>${{forceAllLlm ? 'LLM report generation' : 'Best Buy progress'}}</h2>
+          <div id="best-buy-progress">${{forceAllLlm ? 'Starting LLM refresh for every watchlist symbol...' : (shouldGenerate ? 'Starting needed analyses...' : 'Ranking cached reports...')}}</div>
         </div>
       `;
-      startBestBuyPolling(jobId);
+      startBestBuyPolling(jobId, async (job) => {{
+        if (!forceAllLlm) return;
+        try {{
+          if (job.state === 'complete') {{
+            const resultRes = await fetch(`/api/best-buy-result?job_id=${{encodeURIComponent(jobId)}}`);
+            const result = await resultRes.json();
+            if (!resultRes.ok || !result.ok) throw new Error(result.error || 'Best Buy result unavailable');
+            renderBestBuy(result);
+            status.textContent = 'Ranked';
+          }} else {{
+            throw new Error(job.error || 'LLM report generation failed');
+          }}
+        }} catch (err) {{
+          document.getElementById('best-buy').innerHTML = `<div class="error">${{err.message}}</div>`;
+          status.textContent = 'Error';
+        }} finally {{
+          run.disabled = false;
+          llmRun.disabled = false;
+        }}
+      }});
       const factorWeights = {{}};
       document.querySelectorAll('[data-factor]').forEach(input => factorWeights[input.dataset.factor] = Number(input.value));
       const payload = {{
@@ -2107,18 +2582,21 @@ def _html_page() -> str:
         tickers: document.getElementById('watchlist').value,
         date: document.getElementById('best_buy_date').value,
         reports_glob: document.getElementById('best_buy_reports_glob').value,
+        max_report_age_days: Number(document.getElementById('best_buy_max_report_age_days').value),
         sizing_config: document.getElementById('best_buy_sizing_config').value,
         positions_path: document.getElementById('best_buy_positions_path').value,
         fetch_current_prices: document.getElementById('best_buy_fetch_prices').checked,
-        run_missing_reports: runMissing,
-        refresh_stale_reports: refreshStale,
+        run_missing_reports: forceAllLlm || runMissing,
+        refresh_stale_reports: forceAllLlm || refreshStale,
+        generate_all_reports: forceAllLlm,
+        force_refresh_reports: forceAllLlm,
         horizon: document.getElementById('horizon').value,
         data_provider: dataProvider.value,
         disable_options_scan: document.getElementById('disable_options_scan').checked,
         min_unusual_option_notional: Number(document.getElementById('min_unusual_option_notional').value),
         min_option_volume_oi_ratio: Number(document.getElementById('min_option_volume_oi_ratio').value),
-        enable_narrative: document.getElementById('enable_narrative').checked,
-        enable_llm_insights: document.getElementById('enable_llm_insights').checked,
+        enable_narrative: forceAllLlm || document.getElementById('enable_narrative').checked,
+        enable_llm_insights: forceAllLlm || document.getElementById('enable_llm_insights').checked,
         enable_tradingagents_review: document.getElementById('enable_tradingagents_review').checked,
         llm_provider: llmProvider.value,
         llm_model: getSelectedModel(),
@@ -2127,6 +2605,7 @@ def _html_page() -> str:
         portfolio_path: document.getElementById('portfolio_path').value,
         factor_weights: factorWeights
       }};
+      if (forceAllLlm) payload.async_job = true;
       try {{
         const res = await fetch('/api/best-buy', {{
           method: 'POST',
@@ -2135,16 +2614,23 @@ def _html_page() -> str:
         }});
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'Ranking failed');
+        if (forceAllLlm) {{
+          status.textContent = 'Generating LLM reports';
+          return;
+        }}
         renderBestBuy(data);
         status.textContent = 'Ranked';
       }} catch (err) {{
         document.getElementById('best-buy').innerHTML = `<div class="error">${{err.message}}</div>`;
         status.textContent = 'Error';
       }} finally {{
-        stopBestBuyPolling();
-        run.disabled = false;
+        if (!forceAllLlm) {{
+          stopBestBuyPolling();
+          run.disabled = false;
+          llmRun.disabled = false;
+        }}
       }}
-    }});
+    }}
 
     document.getElementById('trade-ticket-form').addEventListener('submit', async (event) => {{
       event.preventDefault();
@@ -2166,6 +2652,7 @@ def _html_page() -> str:
       const payload = {{
         date: document.getElementById('trade_ticket_date').value,
         reports_glob: document.getElementById('trade_ticket_reports_glob').value,
+        max_report_age_days: Number(document.getElementById('trade_ticket_max_report_age_days').value),
         positions_path: document.getElementById('trade_ticket_positions_path').value,
         sizing_config: document.getElementById('trade_ticket_sizing_config').value,
         execution_config: document.getElementById('trade_ticket_execution_config').value,
@@ -2174,7 +2661,20 @@ def _html_page() -> str:
         account_hint: document.getElementById('trade_ticket_account_hint').value,
         fetch_current_prices: document.getElementById('trade_ticket_fetch_prices').checked,
         run_missing_reports: document.getElementById('trade_ticket_run_missing').checked,
-        refresh_stale_reports: document.getElementById('trade_ticket_refresh_stale').checked
+        refresh_stale_reports: document.getElementById('trade_ticket_refresh_stale').checked,
+        horizon: document.getElementById('horizon').value,
+        data_provider: dataProvider.value,
+        disable_options_scan: document.getElementById('disable_options_scan').checked,
+        min_unusual_option_notional: Number(document.getElementById('min_unusual_option_notional').value),
+        min_option_volume_oi_ratio: Number(document.getElementById('min_option_volume_oi_ratio').value),
+        enable_narrative: document.getElementById('enable_narrative').checked,
+        enable_llm_insights: document.getElementById('enable_llm_insights').checked,
+        enable_tradingagents_review: document.getElementById('enable_tradingagents_review').checked,
+        llm_provider: llmProvider.value,
+        llm_model: getSelectedModel(),
+        no_state: document.getElementById('no_state').checked,
+        state_store: document.getElementById('state_store').value,
+        portfolio_path: document.getElementById('portfolio_path').value
       }};
       try {{
         const res = await fetch('/api/trade-tickets', {{
@@ -2231,14 +2731,21 @@ def _html_page() -> str:
       }}
     }});
 
-    function startBestBuyPolling(jobId) {{
+    function startBestBuyPolling(jobId, onDone) {{
       stopBestBuyPolling();
+      let doneHandled = false;
       const poll = async () => {{
         try {{
           const res = await fetch(`/api/best-buy-status?job_id=${{encodeURIComponent(jobId)}}`);
           const data = await res.json();
           renderBestBuyProgress(data);
-          if (data.state === 'complete' || data.state === 'error') stopBestBuyPolling();
+          if (data.state === 'complete' || data.state === 'error') {{
+            stopBestBuyPolling();
+            if (onDone && !doneHandled) {{
+              doneHandled = true;
+              await onDone(data);
+            }}
+          }}
         }} catch (_err) {{
           // Keep the main request in charge; polling is best-effort.
         }}
@@ -2375,10 +2882,12 @@ def _html_page() -> str:
                 ${{levelItem('Bull', fmtMoney(target.bull), 'sell-level')}}
                 ${{levelItem('Target confidence', fmtPct(target.confidence), '')}}
               </div>
-              <table>
-                <thead><tr><th>Source</th><th>Target</th><th>Weight</th></tr></thead>
-                <tbody>${{targetSources.slice(0, 5).map(s => `<tr><td>${{escapeHtml(s.name || '')}}</td><td>${{fmtMoney(s.target)}}</td><td>${{fmtNum(s.weight)}}</td></tr>`).join('')}}</tbody>
-              </table>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Source</th><th>Target</th><th>Weight</th></tr></thead>
+                  <tbody>${{targetSources.slice(0, 5).map(s => `<tr><td>${{escapeHtml(s.name || '')}}</td><td>${{fmtMoney(s.target)}}</td><td>${{fmtNum(s.weight)}}</td></tr>`).join('')}}</tbody>
+                </table>
+              </div>
             </div>
 
             <div class="dashboard-panel">
@@ -2424,10 +2933,12 @@ def _html_page() -> str:
 
         <details class="details-block">
           <summary>Detailed factor scorecard</summary>
-          <table>
-            <thead><tr><th>Factor</th><th>Pillar</th><th>Score</th><th>Weight</th><th>Weighted</th><th>Rationale</th></tr></thead>
-            <tbody>${{allFactors.map(f => `<tr><td>${{escapeHtml(f.factor)}}</td><td>${{escapeHtml(f.pillar)}}</td><td>${{fmtSigned(f.score)}}</td><td>${{fmtNum(f.weight)}}</td><td>${{fmtSigned(f.weighted_score)}}</td><td>${{escapeHtml(f.rationale || '')}}</td></tr>`).join('')}}</tbody>
-          </table>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Factor</th><th>Pillar</th><th>Score</th><th>Weight</th><th>Weighted</th><th>Rationale</th></tr></thead>
+              <tbody>${{allFactors.map(f => `<tr><td>${{escapeHtml(f.factor)}}</td><td>${{escapeHtml(f.pillar)}}</td><td>${{fmtSigned(f.score)}}</td><td>${{fmtNum(f.weight)}}</td><td>${{fmtSigned(f.weighted_score)}}</td><td>${{escapeHtml(f.rationale || '')}}</td></tr>`).join('')}}</tbody>
+            </table>
+          </div>
         </details>
 
         <p class="hint">Saved: ${{escapeHtml(data.json_path)}}<br>${{escapeHtml(data.markdown_path)}}</p>
@@ -2471,7 +2982,7 @@ def _html_page() -> str:
         <div class="dashboard-panel">
           <h2>Ranked watchlist</h2>
           <div class="rank-list">
-            ${{candidates.map(rankRow).join('') || '<p class="hint">No candidates available.</p>'}}
+            ${{candidates.map(rankRow).join('') || '<div class="empty-state">No candidates available.</div>'}}
           </div>
         </div>
         <div class="dashboard-panel">
@@ -2540,12 +3051,12 @@ def _html_page() -> str:
         <div class="dashboard-panel">
           <h2>Ready equity tickets</h2>
           ${{alignment.enabled ? `<p class="hint">BUY/ADD tickets are aligned to Best Buy: only the top ${{fmtNum(alignment.max_ready_buy_tickets || 0)}} buy candidate becomes ready. TRIM/EXIT tickets still surface independently.</p>` : ''}}
-          ${{ready.length ? tradeTicketTable(ready, true) : '<p class="hint">No ready equity tickets. Check blocked reasons below.</p>'}}
+          ${{ready.length ? tradeTicketTable(ready, true) : '<div class="empty-state">No ready equity tickets. Check blocked reasons below.</div>'}}
         </div>
 
         <div class="dashboard-panel">
           <h2>Blocked or intent only</h2>
-          ${{blocked.length ? tradeTicketTable(blocked, false) : '<p class="hint">No blocked tickets.</p>'}}
+          ${{blocked.length ? tradeTicketTable(blocked, false) : '<div class="empty-state">No blocked tickets.</div>'}}
         </div>
 
         <div class="dashboard-panel">
@@ -2620,7 +3131,7 @@ def _html_page() -> str:
         return `
           <div class="dashboard-panel">
             <h2>Report coverage</h2>
-            <p class="hint warn">No matching analysis report files were found. Generate analysis reports first, then regenerate trade tickets.</p>
+            <div class="empty-state">No matching analysis report files were found. Generate analysis reports first, then regenerate trade tickets.</div>
           </div>
         `;
       }}
@@ -2670,20 +3181,22 @@ def _html_page() -> str:
     function reportAgeTable(rows) {{
       const visible = rows.filter(row => row.status !== 'fresh').concat(rows.filter(row => row.status === 'fresh').slice(0, 8));
       return `
-        <table>
-          <thead><tr><th>Symbol</th><th>Status</th><th>Report date</th><th>Age</th><th>Source</th></tr></thead>
-          <tbody>
-            ${{visible.map(row => `
-              <tr>
-                <td>${{escapeHtml(row.symbol || '')}}</td>
-                <td>${{escapeHtml(row.status || '')}}</td>
-                <td>${{escapeHtml(row.as_of_date || '—')}}</td>
-                <td>${{row.age_days === null || row.age_days === undefined ? '—' : `${{fmtNum(row.age_days)}}d`}}</td>
-                <td>${{row.source_path ? `<a target="_blank" href="/report?fmt=json&path=${{encodeURIComponent(row.source_path)}}">${{escapeHtml(row.source_path)}}</a>` : '—'}}</td>
-              </tr>
-            `).join('')}}
-          </tbody>
-        </table>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Symbol</th><th>Status</th><th>Report date</th><th>Age</th><th>Source</th></tr></thead>
+            <tbody>
+              ${{visible.map(row => `
+                <tr>
+                  <td>${{escapeHtml(row.symbol || '')}}</td>
+                  <td>${{escapeHtml(row.status || '')}}</td>
+                  <td>${{escapeHtml(row.as_of_date || '—')}}</td>
+                  <td>${{row.age_days === null || row.age_days === undefined ? '—' : `${{fmtNum(row.age_days)}}d`}}</td>
+                  <td>${{row.source_path ? `<a target="_blank" href="/report?fmt=json&path=${{encodeURIComponent(row.source_path)}}">${{escapeHtml(row.source_path)}}</a>` : '—'}}</td>
+                </tr>
+              `).join('')}}
+            </tbody>
+          </table>
+        </div>
       `;
     }}
     function artifactRow(label, description, path, fmt) {{
@@ -2698,7 +3211,7 @@ def _html_page() -> str:
       `;
     }}
     function tradeTicketTable(tickets, ready) {{
-      const extraHeader = ready ? '' : '<th>Option rank</th><th>Option score</th>';
+      const extraHeader = ready ? '' : '<th>Contract</th><th>Option rank</th><th>Option score</th>';
       const rows = tickets.map(t => `
         <tr>
           <td><code>${{escapeHtml(t.ticket_id)}}</code></td>
@@ -2706,18 +3219,21 @@ def _html_page() -> str:
           <td>${{escapeHtml(t.symbol || '')}}</td>
           <td>${{escapeHtml(t.side || '')}}</td>
           <td>${{ticketQuantityLabel(t)}}</td>
+          <td>${{ticketPriceUsedLabel(t)}}</td>
           <td>${{fmtMoney(t.limit_price)}}</td>
           <td>${{escapeHtml(t.time_in_force || '')}}</td>
           <td>${{escapeHtml(t.source_action || '')}}</td>
-          ${{ready ? '' : `<td>${{optionIntentRank(t)}}</td><td>${{optionIntentScore(t)}}</td>`}}
+          ${{ready ? '' : `<td>${{optionContractLabel(t)}}</td><td>${{optionIntentRank(t)}}</td><td>${{optionIntentScore(t)}}</td>`}}
           <td>${{ready ? escapeHtml(t.rationale || '') : escapeHtml(t.blocked_reason || '')}}</td>
         </tr>
       `).join('');
       return `
-        <table>
-          <thead><tr><th>Ticket</th><th>Asset</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Limit</th><th>TIF</th><th>Source</th>${{extraHeader}}<th>${{ready ? 'Rationale' : 'Reason'}}</th></tr></thead>
-          <tbody>${{rows}}</tbody>
-        </table>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Ticket</th><th>Asset</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price used</th><th>Limit</th><th>TIF</th><th>Source</th>${{extraHeader}}<th>${{ready ? 'Rationale' : 'Reason'}}</th></tr></thead>
+            <tbody>${{rows}}</tbody>
+          </table>
+        </div>
       `;
     }}
     function optionIntentRank(t) {{
@@ -2730,6 +3246,23 @@ def _html_page() -> str:
       const label = details.option_intent_score_label ? ` ${{details.option_intent_score_label}}` : '';
       return `${{fmtNum(details.option_intent_score)}}/100${{escapeHtml(label)}}`;
     }}
+    function optionContractLabel(t) {{
+      if ((t.asset_type || '') !== 'option_intent') return '';
+      const details = t.details || {{}};
+      const expiry = details.expiry || '—';
+      const dte = details.dte === null || details.dte === undefined ? '—' : String(details.dte);
+      const source = t.source_action || details.type || '';
+      const longStrike = details.long_strike;
+      const shortStrike = details.short_strike;
+      if (longStrike !== null && longStrike !== undefined || shortStrike !== null && shortStrike !== undefined) {{
+        return `${{escapeHtml(expiry)}} / ${{escapeHtml(dte)}} DTE / ${{fmtMoney(longStrike)}}-${{fmtMoney(shortStrike)}} call spread`;
+      }}
+      if (details.strike === null || details.strike === undefined) return '';
+      let optionType = details.option_type || '';
+      if (!optionType && source === 'sell_put') optionType = 'put';
+      if (!optionType && (source === 'sell_call' || source === 'buy_call_spread')) optionType = 'call';
+      return `${{escapeHtml(expiry)}} / ${{escapeHtml(dte)}} DTE / ${{fmtMoney(details.strike)}}${{optionType ? ` ${{escapeHtml(optionType)}}` : ''}}`;
+    }}
     function ticketQuantityLabel(t) {{
       const qty = t.quantity || '—';
       const raw = t.details && t.details.raw_delta_shares !== null && t.details.raw_delta_shares !== undefined
@@ -2740,8 +3273,15 @@ def _html_page() -> str:
       }}
       return escapeHtml(qty);
     }}
+    function ticketPriceUsedLabel(t) {{
+      const details = t.details || {{}};
+      const price = details.last_close;
+      const source = details.price_source ? ` <span class="hint">${{escapeHtml(details.price_source)}}</span>` : '';
+      return `${{fmtMoney(price)}}${{source}}`;
+    }}
     function rankRow(c) {{
-      const stale = c.signal_age_days !== null && c.signal_age_days !== undefined && c.signal_age_days > 7 ? 'Stale' : '';
+      const maxAge = Number(c.max_report_age_days ?? 7);
+      const stale = c.signal_age_days !== null && c.signal_age_days !== undefined && c.signal_age_days > maxAge ? `Stale >${{maxAge}}d` : '';
       const notes = (c.notes || []).slice(0, 2);
       return `
         <div class="rank-row">
@@ -3028,11 +3568,17 @@ def _html_page() -> str:
             <div><dt>Max loss</dt><dd>${{fmtMoney(s.max_loss)}}</dd></div>
             <div><dt>Max profit</dt><dd>${{fmtMoney(s.max_profit)}}</dd></div>
             <div><dt>Est. POP</dt><dd>${{fmtPct(s.estimated_pop)}}</dd></div>
+            <div><dt>Score</dt><dd>${{strategyScore(s)}}</dd></div>
             <div><dt>Mid</dt><dd>${{fmtMoney(s.mid)}}</dd></div>
           </dl>
           <small>${{escapeHtml(s.reason || '')}}</small>
         </div>
       `;
+    }}
+    function strategyScore(s) {{
+      if (s.option_intent_score === null || s.option_intent_score === undefined) return '—';
+      const label = s.option_intent_score_label ? ` ${{escapeHtml(s.option_intent_score_label)}}` : '';
+      return `${{fmtNum(s.option_intent_score)}}/100${{label}}`;
     }}
     function strategyBreakevenLabel(s) {{
       if (s.type === 'sell_call') {{

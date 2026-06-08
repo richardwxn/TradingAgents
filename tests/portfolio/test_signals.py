@@ -20,6 +20,7 @@ from portfolio.signals import (
     load_latest_signals,
 )
 from portfolio.sizing import SizingConfig
+from portfolio.risk import SectorShock
 
 
 # ---------- load_latest_signals ----------
@@ -74,6 +75,83 @@ def test_load_latest_signals_handles_malformed_json(tmp_path):
     _write_report(tmp_path, symbol="NVDA", as_of="2026-05-22", direction="bullish", composite=0.48)
     signals = load_latest_signals(list(tmp_path.glob("*.json")), universe=["NVDA"])
     assert signals["NVDA"] is not None
+
+
+# ---------- load_latest_signals + calibration override (Section 28 fix) ----------
+
+
+def _write_calibration(tmp_path: Path) -> Path:
+    """Minimal isotonic calibration: ≤0 composite → 0.17 (base rate);
+    0.5+ composite → 1.0. Mimics the post-Section-28 calibrated curve."""
+    payload = {
+        "fit": [
+            {"x_lower": -1.0, "x_upper": 0.19, "hit_rate": 0.17, "n_obs": 100},
+            {"x_lower": 0.20, "x_upper": 0.49, "hit_rate": 0.71, "n_obs": 50},
+            {"x_lower": 0.50, "x_upper": 1.0, "hit_rate": 1.00, "n_obs": 20},
+        ]
+    }
+    p = tmp_path / "calib.json"
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_load_latest_signals_calibration_override_replaces_heuristic_confidence(tmp_path):
+    """Reports pre-Section-28-patch had heuristic confidence baked in.
+    Calibration applied at read time should REPLACE that with isotonic value."""
+    # Report has composite +0.6 with heuristic confidence 0.77 baked in.
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    cal = _write_calibration(tmp_path)
+    paths = list(tmp_path.glob("*.json"))
+    paths = [p for p in paths if p.name != cal.name]
+    signals = load_latest_signals(
+        paths, universe=["NVDA"], calibration_path=cal,
+    )
+    # Composite 0.6 falls in the [0.50, 1.0] isotonic segment → 1.0.
+    assert signals["NVDA"].confidence == 1.0
+
+
+def test_load_latest_signals_calibration_path_missing_falls_back_to_heuristic(tmp_path):
+    """When no calibration path is provided, behavior must match the
+    pre-fix contract: pass through baked-in confidence."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    paths = list(tmp_path.glob("*.json"))
+    signals = load_latest_signals(paths, universe=["NVDA"])  # no calibration_path
+    assert signals["NVDA"].confidence == 0.77
+
+
+def test_load_latest_signals_calibration_neutral_composite_downgrades_to_base_rate(tmp_path):
+    """The Unit B finding: composite ~0 should have confidence ≈ base
+    rate, not 0.5. Heuristic gave ~0.5; calibration says 0.17."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="neutral", confidence=0.50, composite=0.0,
+    )
+    cal = _write_calibration(tmp_path)
+    paths = [p for p in tmp_path.glob("*.json") if p.name != cal.name]
+    signals = load_latest_signals(paths, universe=["NVDA"], calibration_path=cal)
+    assert signals["NVDA"].confidence == 0.17
+
+
+def test_load_latest_signals_calibration_handles_missing_file(tmp_path):
+    """A non-existent calibration path should silently fall back —
+    not crash the daily-signals run."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    signals = load_latest_signals(
+        list(tmp_path.glob("*.json")),
+        universe=["NVDA"],
+        calibration_path=tmp_path / "no_such_file.json",
+    )
+    # Falls through cleanly to heuristic.
+    assert signals["NVDA"].confidence == 0.77
 
 
 # ---------- classify_action ----------
@@ -153,6 +231,47 @@ def test_compute_actions_emits_buy_for_new_bullish_signal():
     # AMD has no signal → SKIP with a "no report" note.
     assert by_sym["AMD"].action == "SKIP"
     assert any("No analysis report" in n for n in by_sym["AMD"].notes)
+
+
+def test_compute_actions_sector_shock_guard_stands_down_new_sector_buy():
+    cfg = SizingConfig(
+        max_per_name=0.10,
+        max_long_exposure=0.50,
+        min_position_weight=0.01,
+        sector_shock_new_buy_size_factor=0.0,
+    )
+    signals = {
+        "NVDA": Signal(
+            "NVDA",
+            "2026-06-05",
+            "bullish",
+            0.5,
+            0.7,
+            "x",
+            sector="Semiconductors",
+        )
+    }
+    actions, summary = compute_actions(
+        signals=signals,
+        positions={},
+        prices={"NVDA": _ctx(150.0, 145.0, 5.0)},
+        config=cfg,
+        cash=10_000.0,
+        as_of=date(2026, 6, 5),
+        sector_shocks={
+            "Semiconductors": SectorShock(
+                sector="Semiconductors",
+                trigger_symbol="SOXX",
+                pct_change=-0.051,
+                threshold=0.03,
+            )
+        },
+    )
+    a = actions[0]
+    assert a.action == "SKIP"
+    assert a.target_weight == 0.0
+    assert summary["n_sector_shock_adjusted"] == 1
+    assert any("Sector shock guard" in note for note in a.notes)
 
 
 def test_compute_actions_exits_held_name_that_turned_neutral():
@@ -478,3 +597,150 @@ def test_review_gate_veto_blocks_buy_but_not_trim_or_exit_intent():
         as_of=date(2026, 5, 24),
     )
     assert trim_actions[0].action in {"TRIM", "EXIT"}
+
+
+# ---------- mid-week shock refresh (daily_signals.maybe_refresh_held_composites) ----------
+
+
+def test_maybe_refresh_skips_when_disabled(monkeypatch, tmp_path):
+    import daily_signals as ds
+    # If we don't disable, the helper would call yfinance — so the disable
+    # path must short-circuit BEFORE any IO.
+    monkeypatch.setattr(ds, "detect_vix_spike",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("called when disabled")))
+    out = ds.maybe_refresh_held_composites(
+        positions={"NVDA": Position(shares=10, avg_cost=130.0)},
+        as_of=date.today(),
+        reports_dir=tmp_path,
+        config=None,
+        disable=True,
+    )
+    assert out == {}
+
+
+def test_maybe_refresh_skips_when_as_of_not_today(monkeypatch, tmp_path):
+    import daily_signals as ds
+    monkeypatch.setattr(ds, "detect_vix_spike",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("called when back-dated")))
+    out = ds.maybe_refresh_held_composites(
+        positions={"NVDA": Position(shares=10, avg_cost=130.0)},
+        as_of=date(2024, 6, 21),  # historical
+        reports_dir=tmp_path,
+        config=None,
+    )
+    assert out == {}
+
+
+def test_maybe_refresh_skips_when_no_positions(monkeypatch, tmp_path):
+    import daily_signals as ds
+    monkeypatch.setattr(ds, "detect_vix_spike",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("called when no positions")))
+    out = ds.maybe_refresh_held_composites(
+        positions={}, as_of=date.today(), reports_dir=tmp_path, config=None,
+    )
+    assert out == {}
+
+
+def test_maybe_refresh_skips_when_no_shock_detected(monkeypatch, tmp_path):
+    """No VIX spike AND no sector ETF drop → no subprocess fires."""
+    import daily_signals as ds
+    monkeypatch.setattr(ds, "detect_vix_spike",
+                        lambda **kw: (False, 15.0, 14.5, 0.034))
+    monkeypatch.setattr(ds, "_fetch_day_pct_change", lambda sym: -0.005)  # 0.5% drop, not a shock
+    import subprocess as sp
+    monkeypatch.setattr(sp, "run",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("subprocess.run called when no shock")))
+    out = ds.maybe_refresh_held_composites(
+        positions={"NVDA": Position(shares=10, avg_cost=130.0)},
+        as_of=date.today(),
+        reports_dir=tmp_path,
+        config=None,
+    )
+    assert out == {}
+
+
+def test_maybe_refresh_triggers_subprocess_on_vix_spike(monkeypatch, tmp_path):
+    """A VIX spike (15%+) triggers analysis_mvp.py for each held ticker."""
+    import daily_signals as ds
+    monkeypatch.setattr(ds, "detect_vix_spike",
+                        lambda **kw: (True, 28.0, 22.0, 0.27))
+    monkeypatch.setattr(ds, "_fetch_day_pct_change", lambda sym: 0.0)
+    called: list[str] = []
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        # cmd is the args list; ticker is at index 3 ("--ticker", "<sym>")
+        idx = cmd.index("--ticker")
+        called.append(cmd[idx + 1])
+        return _FakeProc()
+
+    import subprocess as sp
+    monkeypatch.setattr(sp, "run", _fake_run)
+
+    out = ds.maybe_refresh_held_composites(
+        positions={"NVDA": Position(shares=10, avg_cost=130.0),
+                   "AMD": Position(shares=5, avg_cost=170.0)},
+        as_of=date.today(),
+        reports_dir=tmp_path,
+        config=None,
+    )
+    assert set(called) == {"NVDA", "AMD"}
+    assert out == {"AMD": "refreshed", "NVDA": "refreshed"}
+
+
+def test_maybe_refresh_triggers_on_sector_etf_shock_even_without_vix_spike(monkeypatch, tmp_path):
+    """A sector ETF dropping more than the configured threshold triggers
+    refresh even when VIX is calm."""
+    import daily_signals as ds
+    monkeypatch.setattr(ds, "detect_vix_spike",
+                        lambda **kw: (False, 16.0, 15.5, 0.032))  # calm VIX
+    # XLK drops 4% — exceeds default 3% threshold.
+    monkeypatch.setattr(ds, "_fetch_day_pct_change", lambda sym: -0.04 if sym == "XLK" else 0.0)
+    called: list[str] = []
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    def _fake_run(cmd, **kw):
+        idx = cmd.index("--ticker")
+        called.append(cmd[idx + 1])
+        return _FakeProc()
+    import subprocess as sp
+    monkeypatch.setattr(sp, "run", _fake_run)
+
+    class _StubConfig:
+        sector_shock_etfs = {"Tech-MegaCap": "XLK", "Semiconductors": "XLK"}
+        sector_shock_drop_pct = 0.03
+
+    out = ds.maybe_refresh_held_composites(
+        positions={"NVDA": Position(shares=10, avg_cost=130.0)},
+        as_of=date.today(),
+        reports_dir=tmp_path,
+        config=_StubConfig(),
+    )
+    assert called == ["NVDA"]
+    assert out["NVDA"] == "refreshed"
+
+
+def test_maybe_refresh_handles_subprocess_failure(monkeypatch, tmp_path):
+    """A failed analysis_mvp.py run should not crash the daily script —
+    error gets recorded in the results dict."""
+    import daily_signals as ds
+    monkeypatch.setattr(ds, "detect_vix_spike", lambda **kw: (True, 30.0, 22.0, 0.36))
+    monkeypatch.setattr(ds, "_fetch_day_pct_change", lambda sym: 0.0)
+    class _FailProc:
+        returncode = 1
+        stdout = ""
+        stderr = "polygon timeout"
+    monkeypatch.setattr("subprocess.run", lambda cmd, **kw: _FailProc())
+    out = ds.maybe_refresh_held_composites(
+        positions={"NVDA": Position(shares=10, avg_cost=130.0)},
+        as_of=date.today(),
+        reports_dir=tmp_path,
+        config=None,
+    )
+    assert out["NVDA"].startswith("failed")

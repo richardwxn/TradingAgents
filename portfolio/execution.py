@@ -220,6 +220,7 @@ def ticket_from_action(
         )
     review_gate_status = getattr(action, "review_gate_status", None)
     review_gate_reason = getattr(action, "review_gate_reason", None)
+    review_meta = dict(getattr(action, "tradingagents_review", None) or {})
     review_caveats = [
         str(x)
         for x in (getattr(action, "review_execution_caveats", None) or [])
@@ -284,6 +285,8 @@ def ticket_from_action(
             "last_close": action.last_close,
             "sma20": action.sma20,
             "atr14": action.atr14,
+            "price_source": action.price_source,
+            "tradingagents_review": review_meta,
         },
     )
 
@@ -311,7 +314,7 @@ def option_intent_tickets_from_report(
         verdict = str(strategy.get("verdict") or "").lower()
         if verdict in {"unavailable"}:
             continue
-        score_details = _option_intent_score_details(report, strategy)
+        score_details = option_intent_score_details(report, strategy)
         ticket_id = stable_ticket_id(
             as_of=as_of,
             asset_type="option_intent",
@@ -376,7 +379,7 @@ def _rank_option_intents(tickets: list[ExecutionTicket]) -> list[ExecutionTicket
     return [*non_options, *with_rank]
 
 
-def _option_intent_score_details(
+def option_intent_score_details(
     report: dict[str, Any],
     strategy: dict[str, Any],
 ) -> dict[str, Any]:
@@ -415,10 +418,18 @@ def _option_intent_score_details(
     }
 
 
+def _option_intent_score_details(
+    report: dict[str, Any],
+    strategy: dict[str, Any],
+) -> dict[str, Any]:
+    return option_intent_score_details(report, strategy)
+
+
 def _option_direction_alignment(strategy_type: str, direction: str) -> float:
     table = {
         "sell_put": {"bullish": 1.0, "neutral": 0.55, "bearish": 0.20},
         "buy_call_spread": {"bullish": 1.0, "neutral": 0.35, "bearish": 0.10},
+        "leap_call": {"bullish": 0.90, "neutral": 0.35, "bearish": 0.10},
         "sell_call": {"bullish": 0.45, "neutral": 0.85, "bearish": 0.75},
     }
     return table.get(strategy_type, {}).get(direction, 0.40)

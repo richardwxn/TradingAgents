@@ -217,11 +217,17 @@ def summarize_all(
     return_fields: list[str] | None = None,
     neutral_band: float = 0.02,
 ) -> dict[str, Any]:
-    """Top-level summary across all bucketing dimensions and horizons."""
+    """Top-level summary across all bucketing dimensions and horizons.
+
+    Also adds a `return_metrics` block at top level keyed by horizon
+    with risk-adjusted Sharpe/Sortino/MaxDD/ProfitFactor stats (overall
+    plus per-direction). See `compute_return_metrics`.
+    """
     return_fields = return_fields or ["ret_5d", "ret_20d", "ret_60d"]
     out: dict[str, Any] = {
         "total_records": len(records),
         "by_horizon": {},
+        "return_metrics": {},
     }
     for field_name in return_fields:
         horizon_block: dict[str, Any] = {
@@ -263,6 +269,325 @@ def summarize_all(
                 neutral_band=neutral_band,
             )
         out["by_horizon"][field_name] = horizon_block
+        out["return_metrics"][field_name] = {
+            "overall": compute_return_metrics(
+                records,
+                horizon=field_name,
+                neutral_band=neutral_band,
+            ),
+            "by_direction": compute_return_metrics_by_direction(
+                records,
+                horizon=field_name,
+                neutral_band=neutral_band,
+            ),
+        }
+    return out
+
+
+# ---------- volatility / P&L-based risk-adjusted metrics ----------
+
+
+_TRADING_DAYS_PER_YEAR = 252
+
+
+def _parse_horizon_days(horizon: str) -> int | None:
+    """Extract trading-day count from a horizon string like 'ret_60d'.
+
+    Returns `None` if the string doesn't match the expected `ret_<N>d`
+    pattern. The Sharpe/Sortino annualization factor needs this; when
+    `None`, the metric is reported unannualized.
+    """
+    if not isinstance(horizon, str):
+        return None
+    s = horizon.strip().lower()
+    if s.startswith("ret_") and s.endswith("d"):
+        body = s[4:-1]
+        try:
+            n = int(body)
+            return n if n > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def _winsorize(values: list[float], *, p: float = 0.05) -> list[float]:
+    """Symmetric winsorize at `p` and `1-p` quantiles.
+
+    Returns the values clipped to those quantile bounds. With fewer than
+    `1/p` samples the bounds collapse to the min/max so the clip is a
+    no-op — that's the intended behavior for tiny buckets.
+
+    Specifically we clip the top `floor(p*n)` and bottom `floor(p*n)`
+    values: the lower bound is the `lo_idx`-th sorted value (with
+    `lo_idx = floor(p*n)`) and the upper bound is the
+    `(n - 1 - lo_idx)`-th sorted value.
+    """
+    if not values:
+        return []
+    if not 0.0 < p < 0.5:
+        return list(values)
+    n = len(values)
+    sorted_v = sorted(values)
+    k = int(p * n)
+    lo_idx = k
+    hi_idx = max(lo_idx, n - 1 - k)
+    lo = sorted_v[lo_idx]
+    hi = sorted_v[hi_idx]
+    return [min(hi, max(lo, v)) for v in values]
+
+
+def _max_drawdown_from_returns(returns_in_order: list[float]) -> float:
+    """Max drawdown on a cumulative-sum P&L curve.
+
+    `returns_in_order` is the sequence of per-period strategy returns,
+    treated as equal-sized bets so the cumulative P&L is just their
+    running sum. Returns a non-positive number; 0.0 means no drawdown
+    observed.
+
+    Why sum-based instead of compounded (1+r)? The backtest records are
+    many parallel bets per date, not one sequential portfolio. The
+    compounded interpretation blows up when a single bearish record's
+    P&L is below -100% (which is possible with sign-flipped raw returns
+    above 100%). Equal-sized-bet cumulative P&L stays numerically
+    well-defined for any return magnitude and aligns with
+    `portfolio/simulator.py` Section 16's "equal-weight basket" model.
+    """
+    if not returns_in_order:
+        return 0.0
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in returns_in_order:
+        cumulative += r
+        if cumulative > peak:
+            peak = cumulative
+        dd = cumulative - peak  # absolute drawdown in P&L units
+        if dd < max_dd:
+            max_dd = dd
+    return max_dd
+
+
+def _strategy_pnl(direction: str, forward_return: float) -> float:
+    """Convert a raw `forward_return` to the strategy's P&L for `direction`.
+
+    - bullish: long-the-stock → P&L = forward_return.
+    - bearish: short-the-stock → P&L = -forward_return.
+    - neutral / anything else: treated as "no strategy bet"; we pass the
+      raw return through so neutral-bucket stats describe the realized
+      outcomes of those records (not a P&L, just the realized return).
+
+    This direction-aware sign flip is what makes the bearish-bucket
+    Sharpe a meaningful "strategy did/didn't work" signal — on a bull
+    tape, calling bearish on stocks that actually rose is loss-making
+    for the short, so bearish Sharpe should go negative.
+    """
+    if direction == "bearish":
+        return -float(forward_return)
+    return float(forward_return)
+
+
+def compute_return_metrics(
+    records: Iterable[BacktestRecord],
+    *,
+    horizon: str,
+    direction_filter: str | None = None,
+    neutral_band: float = 0.02,
+    winsorize_p: float = 0.05,
+) -> dict[str, Any]:
+    """Risk-adjusted P&L metrics for `records` at one `horizon`.
+
+    Returns are interpreted as **strategy P&L**, not raw stock returns:
+    bearish records have their forward return sign-flipped (because the
+    bearish "strategy" is short-the-stock). Bullish and neutral records
+    pass the raw forward return through unchanged. This makes the Sharpe
+    / Sortino / profit-factor numbers comparable across direction
+    buckets and matches the convention used in `portfolio/simulator.py`.
+
+    Keys returned:
+    - `n_records`: total input count after `direction_filter` (if any).
+    - `n_with_return`: count that actually had a forward-return at `horizon`.
+    - `mean_return`, `median_return`: arithmetic stats on strategy P&L
+      (raw, not annualized).
+    - `sharpe`: annualized Sharpe = (mean / stdev) * sqrt(252 / horizon_days).
+      `None` when stdev is zero or fewer than 2 returns are present, or
+      when the horizon string isn't parseable as `ret_<N>d`.
+    - `sortino`: annualized Sortino = (mean / downside_stdev) * sqrt(252 / horizon_days).
+      Downside stdev uses returns < 0 with mean=0 (Sortino convention).
+    - `max_drawdown`: peak-to-trough drawdown on the cumulative sum of
+      strategy P&L with records ordered by `as_of_date` (then `symbol`
+      for stability). Equal-sized-bet convention so the metric stays
+      well-defined when individual records have extreme returns.
+      Non-positive; 0.0 = no drawdown.
+    - `winsorized_mean`: mean after 5/95-percentile winsorization.
+    - `hit_rate`: direction-aware hit-rate using `is_hit` on the raw
+      forward return. When `direction_filter` is set, all records share
+      that direction so the hit-rate is well-defined; otherwise the
+      per-record direction is used.
+    - `profit_factor`: sum(positive P&L) / |sum(negative P&L)|.
+      `None` when there are no losing trades (avoid div-by-zero); a
+      very large but finite number when losses are tiny.
+    - `n_positive`, `n_negative`, `n_zero`: count breakdown on the P&L.
+
+    `winsorize_p` controls the symmetric trim used for `winsorized_mean`
+    (default 0.05 = 5/95).
+
+    Pure helper — no I/O, no yfinance, no dependence on `forward_returns`
+    coming from any particular source.
+    """
+    horizon_days = _parse_horizon_days(horizon)
+    annualization = (
+        math.sqrt(_TRADING_DAYS_PER_YEAR / horizon_days)
+        if horizon_days and horizon_days > 0
+        else None
+    )
+    # Filter by direction first (so n_records reflects the filtered pool).
+    if direction_filter is not None:
+        records = [r for r in records if r.direction == direction_filter]
+    else:
+        records = list(records)
+
+    # Sort by (as_of_date, symbol) so the equity curve for max_drawdown
+    # is deterministic; this also matches the "time-series of bets"
+    # interpretation used by the rest of the file.
+    # `paired` carries (date, symbol, direction, raw_return, pnl_return).
+    paired: list[tuple[str, str, str, float, float]] = []
+    for r in records:
+        v = r.forward_returns.get(horizon)
+        if v is None:
+            continue
+        raw = float(v)
+        paired.append((r.as_of_date, r.symbol, r.direction, raw, _strategy_pnl(r.direction, raw)))
+    paired.sort(key=lambda t: (t[0], t[1]))
+
+    rets_in_order = [t[4] for t in paired]
+    n_records = len(records)
+    n_with_return = len(rets_in_order)
+
+    if n_with_return == 0:
+        return {
+            "n_records": n_records,
+            "n_with_return": 0,
+            "horizon_days": horizon_days,
+            "annualization_factor": annualization,
+            "mean_return": None,
+            "median_return": None,
+            "sharpe": None,
+            "sortino": None,
+            "max_drawdown": None,
+            "winsorized_mean": None,
+            "hit_rate": None,
+            "profit_factor": None,
+            "n_positive": 0,
+            "n_negative": 0,
+            "n_zero": 0,
+        }
+
+    mean_r = statistics.fmean(rets_in_order)
+    median_r = statistics.median(rets_in_order)
+
+    if n_with_return >= 2:
+        stdev_r = statistics.stdev(rets_in_order)
+    else:
+        stdev_r = 0.0
+
+    if stdev_r > 0 and annualization is not None:
+        sharpe = (mean_r / stdev_r) * annualization
+    elif stdev_r > 0:
+        # No horizon-days parse → report unannualized so callers still
+        # get a sensible signed ratio.
+        sharpe = mean_r / stdev_r
+    else:
+        sharpe = None
+
+    downside = [r for r in rets_in_order if r < 0]
+    if len(downside) >= 2:
+        # Sortino convention: RMS of negative returns relative to 0.
+        downside_var = sum(r * r for r in downside) / len(downside)
+        downside_std = math.sqrt(downside_var)
+    elif len(downside) == 1:
+        downside_std = abs(downside[0])
+    else:
+        downside_std = 0.0
+
+    if downside_std > 0 and annualization is not None:
+        sortino = (mean_r / downside_std) * annualization
+    elif downside_std > 0:
+        sortino = mean_r / downside_std
+    else:
+        sortino = None
+
+    max_dd = _max_drawdown_from_returns(rets_in_order)
+    winsorized_mean = statistics.fmean(_winsorize(rets_in_order, p=winsorize_p))
+
+    pos = [r for r in rets_in_order if r > 0]
+    neg = [r for r in rets_in_order if r < 0]
+    zero = [r for r in rets_in_order if r == 0]
+    sum_neg = sum(neg)
+    if neg and sum_neg < 0:
+        profit_factor = sum(pos) / abs(sum_neg)
+    else:
+        profit_factor = None
+
+    # Direction-aware hit-rate. When `direction_filter` is set, every
+    # record shares that direction so the hit definition is fixed; when
+    # not, we use the per-record direction stored on the record itself.
+    # Hit-rate operates on the RAW forward return (not the sign-flipped
+    # P&L) so the existing `is_hit` semantics stay intact.
+    hits: list[bool] = []
+    for _date, _sym, direction, raw, _pnl in paired:
+        d = direction_filter or direction
+        h = is_hit(d, raw, neutral_band=neutral_band)
+        if h is not None:
+            hits.append(h)
+    hit_rate = (sum(1 for h in hits if h) / len(hits)) if hits else None
+
+    return {
+        "n_records": n_records,
+        "n_with_return": n_with_return,
+        "horizon_days": horizon_days,
+        "annualization_factor": (
+            round(annualization, 6) if annualization is not None else None
+        ),
+        "mean_return": round(mean_r, 6),
+        "median_return": round(median_r, 6),
+        "sharpe": round(sharpe, 4) if sharpe is not None else None,
+        "sortino": round(sortino, 4) if sortino is not None else None,
+        "max_drawdown": round(max_dd, 6),
+        "winsorized_mean": round(winsorized_mean, 6),
+        "hit_rate": round(hit_rate, 4) if hit_rate is not None else None,
+        "profit_factor": (
+            round(profit_factor, 4) if profit_factor is not None else None
+        ),
+        "n_positive": len(pos),
+        "n_negative": len(neg),
+        "n_zero": len(zero),
+    }
+
+
+def compute_return_metrics_by_direction(
+    records: Iterable[BacktestRecord],
+    *,
+    horizon: str,
+    neutral_band: float = 0.02,
+    winsorize_p: float = 0.05,
+) -> dict[str, dict[str, Any]]:
+    """Per-direction risk-adjusted metrics at one horizon.
+
+    Always returns a dict with three keys (`bullish`, `bearish`,
+    `neutral`) so downstream renderers can iterate predictably even when
+    a direction bucket is empty (the value will be a metrics dict with
+    `n_records=0` / `n_with_return=0`).
+    """
+    records = list(records)
+    out: dict[str, dict[str, Any]] = {}
+    for direction in ("bullish", "bearish", "neutral"):
+        out[direction] = compute_return_metrics(
+            records,
+            horizon=horizon,
+            direction_filter=direction,
+            neutral_band=neutral_band,
+            winsorize_p=winsorize_p,
+        )
     return out
 
 
@@ -291,7 +616,58 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
         lines += _render_bucket_table("By direction", block.get("by_direction") or {})
         lines += _render_bucket_table("By confidence bucket", block.get("by_confidence") or {})
         lines += _render_bucket_table("By composite score bucket", block.get("by_composite") or {})
+        # Risk-adjusted (Sharpe/Sortino/MaxDD/ProfitFactor) per-horizon
+        # section. Only emitted when the caller populated
+        # `summary["return_metrics"][<horizon>]`. Schema matches the
+        # output of `compute_return_metrics` / `_by_direction`.
+        rm_for_horizon = (summary.get("return_metrics") or {}).get(horizon) or {}
+        lines += _render_return_metrics_section(rm_for_horizon)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_return_metrics_section(block: dict[str, Any]) -> list[str]:
+    """One Risk-adjusted-metrics section for a single horizon.
+
+    `block` shape (any subset of these may be missing — render what we
+    have): {"overall": {...}, "by_direction": {bullish: {...}, ...}}.
+    """
+    if not block:
+        return []
+    out: list[str] = ["", "**Risk-adjusted metrics**", ""]
+    overall = block.get("overall") or {}
+    by_dir = block.get("by_direction") or {}
+    rows = []
+    if overall:
+        rows.append(("overall", overall))
+    for direction in ("bullish", "bearish", "neutral"):
+        stats = by_dir.get(direction)
+        if not stats:
+            continue
+        rows.append((direction, stats))
+    if not rows:
+        return []
+    out.append(
+        "| Bucket | N | Mean | Winsor. mean | Sharpe (ann.) | "
+        "Sortino (ann.) | Max DD (R units) | Profit factor | Hit rate |"
+    )
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for label, stats in rows:
+        out.append(
+            "| {l} | {n} | {m} | {wm} | {sh} | {so} | {dd} | {pf} | {hr} |".format(
+                l=label,
+                n=stats.get("n_with_return") or 0,
+                m=_pct(stats.get("mean_return")),
+                wm=_pct(stats.get("winsorized_mean")),
+                sh=_fmt_signed(stats.get("sharpe"), digits=2),
+                so=_fmt_signed(stats.get("sortino"), digits=2),
+                # Max DD is cumulative-sum P&L (R units = each record's
+                # forward-return at 1R bet size), NOT a percentage.
+                dd=_fmt_signed(stats.get("max_drawdown"), digits=2),
+                pf=_fmt_signed(stats.get("profit_factor"), digits=2),
+                hr=_pct(stats.get("hit_rate")),
+            )
+        )
+    return out
 
 
 def _render_bucket_table(title: str, buckets: dict[str, dict]) -> list[str]:

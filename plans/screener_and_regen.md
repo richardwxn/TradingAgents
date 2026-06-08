@@ -699,6 +699,17 @@ discrete unit; pick freely.
    inversion and statement parsing are CPU-bound — bounded by the GIL
    today. Section 10 punted on process pools due to sandbox issues; those
    are gone now. **2-3x on CPU-heavy phases.**
+   - **Done 2026-06-04.** Added `--executor {process,thread}` to
+     `scripts/generate_corpus.py`; default is now `process`. JobTuple is
+     already picklable (basic types + None) — drop-in clean. Trade-off
+     documented inline: module-level caches in `providers.py`
+     (`_FINANCIALS_ALL_CACHE`, `_RATE_SERIES_CACHE`, `_VIX_SERIES_CACHE`,
+     `_POLYGON_DAILY_AGGS_CACHE`) don't cross process boundaries. `--workers`
+     help text updated to drop the stale "yfinance 2-3 thread cap" warning.
+     +7 tests (`tests/analysis_only/test_generate_corpus_executor.py`)
+     covering CLI parse + pickle round-trip. Smoke on NVDA × 2 Fridays
+     both paths: process 9s / thread 4s (per-process import overhead
+     dominates on 2-job smoke; amortizes to negligible on a real regen).
 6. **Polygon grouped-aggs endpoint** (`/v2/aggs/grouped/locale/us/market/
    stocks/{date}`) returns every symbol's daily aggs in one HTTP call.
    For corpus regen this is dramatic — one request per *date* instead of

@@ -7,10 +7,12 @@ import pytest
 from portfolio.risk import (
     RiskAdjustment,
     RiskLimits,
+    SectorShock,
     apply_all_risk_caps,
     apply_beta_budget,
     apply_correlation_cap,
     apply_sector_cap,
+    apply_sector_shock_guard,
     compute_beta_vs_benchmark,
     compute_pairwise_correlations,
     compute_portfolio_beta,
@@ -74,6 +76,56 @@ def test_sector_cap_no_op_when_under_limit():
     weights = {"NVDA": 0.20, "JPM": 0.10}
     sector_map = {"NVDA": "Tech", "JPM": "Financials"}
     out, notes = apply_sector_cap(weights, sector_map, max_sector_exposure=0.50)
+    assert out == weights
+    assert notes == {}
+
+
+# ---------- apply_sector_shock_guard ----------
+
+
+def test_sector_shock_guard_scales_new_buys_and_existing_positions():
+    weights = {"NVDA": 0.12, "AMD": 0.10, "JPM": 0.08}
+    sector_map = {"NVDA": "Semiconductors", "AMD": "Semiconductors", "JPM": "Financials"}
+    shocks = {
+        "Semiconductors": SectorShock(
+            sector="Semiconductors",
+            trigger_symbol="SOXX",
+            pct_change=-0.052,
+            threshold=0.03,
+        )
+    }
+    out, notes = apply_sector_shock_guard(
+        weights,
+        sector_map,
+        position_shares={"NVDA": 0, "AMD": 10},
+        shocks=shocks,
+        new_buy_size_factor=0.0,
+        existing_position_size_factor=0.5,
+    )
+    assert out["NVDA"] == 0.0
+    assert out["AMD"] == pytest.approx(0.05)
+    assert out["JPM"] == pytest.approx(0.08)
+    assert "new-buy" in notes["NVDA"]
+    assert "existing-position" in notes["AMD"]
+
+
+def test_sector_shock_guard_no_op_without_matching_sector():
+    weights = {"JPM": 0.08}
+    out, notes = apply_sector_shock_guard(
+        weights,
+        {"JPM": "Financials"},
+        position_shares={},
+        shocks={
+            "Semiconductors": SectorShock(
+                sector="Semiconductors",
+                trigger_symbol="SOXX",
+                pct_change=-0.05,
+                threshold=0.03,
+            )
+        },
+        new_buy_size_factor=0.0,
+        existing_position_size_factor=0.5,
+    )
     assert out == weights
     assert notes == {}
 

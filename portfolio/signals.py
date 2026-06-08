@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,7 +27,9 @@ from portfolio.sizing import (
 from portfolio.risk import (
     RiskAdjustment,
     RiskLimits,
+    SectorShock,
     apply_all_risk_caps,
+    apply_sector_shock_guard,
     compute_portfolio_beta,
     compute_sector_exposure,
 )
@@ -72,6 +74,7 @@ class PriceContext:
     last_close: float | None
     sma20: float | None
     atr14: float | None
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,12 +102,14 @@ class Action:
     sma20: float | None
     atr14: float | None
     signal_age_days: int | None
+    price_source: str | None = None
     notes: list[str] = field(default_factory=list)
     target_shares_exact: float | None = None
     delta_shares_exact: float | None = None
     review_gate_status: str | None = None
     review_gate_reason: str | None = None
     review_execution_caveats: list[str] = field(default_factory=list)
+    tradingagents_review: dict[str, Any] = field(default_factory=dict)
 
 
 # Action precedence for the report ordering (BUY first, then EXIT, etc.).
@@ -178,19 +183,77 @@ def _safe_int(v: Any) -> int | None:
         return None
 
 
+def _calibrated_confidence_from_composite(
+    composite: float | None,
+    *,
+    calibration: dict[str, Any] | None,
+) -> float | None:
+    """Look up calibrated confidence from an isotonic-fit JSON.
+
+    Reports generated BEFORE the calibration plumbing fix (Section 28
+    `--confidence-calibration-path` not yet threaded through
+    `generate_corpus.py`) have heuristic confidence baked in. The daily
+    signals layer would then over-allocate to weakly-bullish names
+    (heuristic predicts 50-70% confidence; calibrated says 17% at the
+    corpus base rate). This helper re-derives confidence from the
+    composite via the calibration curve at READ time, so the daily
+    layer benefits without a corpus regen.
+
+    Returns None when calibration is unavailable or composite is None —
+    caller falls back to the baked-in heuristic value.
+    """
+    if composite is None or calibration is None:
+        return None
+    fits = calibration.get("fit") or []
+    if not fits:
+        return None
+    # PAV isotonic: each segment is a flat plateau [x_lower, x_upper] →
+    # hit_rate. Pick the segment whose range contains composite; if none
+    # match exactly (gaps between segments), use the largest segment with
+    # x_lower <= composite.
+    best = None
+    for seg in fits:
+        lo, hi = seg.get("x_lower"), seg.get("x_upper")
+        if lo is None or hi is None:
+            continue
+        if lo <= composite <= hi:
+            best = seg
+            break
+        if lo <= composite:
+            if best is None or lo > best["x_lower"]:
+                best = seg
+    if best is None:
+        return None
+    return float(best.get("hit_rate") or 0.0)
+
+
 def load_latest_signals(
     report_paths: Iterable[Path | str],
     *,
     universe: Iterable[str],
     as_of: date | None = None,
+    calibration_path: str | Path | None = None,
 ) -> dict[str, Signal | None]:
     """For each ticker in `universe`, return the most recent Signal whose
     `as_of_date <= as_of` (defaults to today). Missing tickers map to None.
 
     Reports past `as_of` are filtered out so historical replays don't
     leak future composites into a back-dated report.
+
+    When `calibration_path` points to a valid `configs/
+    confidence_calibration.json`, the heuristic confidence baked into
+    each report is REPLACED with the calibrated value derived from the
+    isotonic curve. This corrects for reports generated before the
+    calibration plumbing fix (no corpus regen needed).
     """
     cutoff = as_of or date.today()
+    calibration: dict[str, Any] | None = None
+    if calibration_path:
+        try:
+            calibration = json.loads(Path(calibration_path).read_text())
+        except Exception:
+            calibration = None
+
     by_symbol: dict[str, Signal] = {}
     for raw in report_paths:
         path = Path(raw)
@@ -203,6 +266,16 @@ def load_latest_signals(
         existing = by_symbol.get(sig.symbol)
         if existing is None or sig.as_of_date > existing.as_of_date:
             by_symbol[sig.symbol] = sig
+
+    if calibration is not None:
+        # Override heuristic confidence in-place with the calibrated value.
+        # Leave composite/direction alone — those are correct as emitted.
+        for sym, sig in list(by_symbol.items()):
+            cal = _calibrated_confidence_from_composite(
+                sig.composite, calibration=calibration,
+            )
+            if cal is not None:
+                by_symbol[sym] = replace(sig, confidence=cal)
     return {sym.upper(): by_symbol.get(sym.upper()) for sym in universe}
 
 
@@ -277,6 +350,7 @@ def compute_actions(
     risk_limits: RiskLimits | None = None,
     beta_map: dict[str, float | None] | None = None,
     correlation_matrix: dict[str, dict[str, float]] | None = None,
+    sector_shocks: dict[str, SectorShock] | None = None,
 ) -> tuple[list[Action], dict[str, Any]]:
     """Compute per-ticker actions + a portfolio summary.
 
@@ -366,22 +440,43 @@ def compute_actions(
                     f"({old_w*100:.1f}% → {target_weights[sym]*100:.1f}%)."
                 )
 
-    # 1c) Portfolio-level risk caps (Section 26). Apply sector,
+    # 1c) Same-day sector shock guard. This is an execution-layer circuit
+    # breaker: when a sector ETF drops through the configured threshold,
+    # new buys can be stood down and existing-position targets can be cut.
+    sector_shock_notes: dict[str, str] = {}
+    sector_map_for_guards = {
+        sym: (sig.sector if sig is not None else None)
+        for sym, sig in signals.items()
+    }
+    if (
+        getattr(config, "sector_shock_guard_enabled", True)
+        and sector_shocks
+    ):
+        target_weights, sector_shock_notes = apply_sector_shock_guard(
+            target_weights,
+            sector_map_for_guards,
+            position_shares={sym: pos.shares for sym, pos in positions.items()},
+            shocks=sector_shocks,
+            new_buy_size_factor=getattr(
+                config, "sector_shock_new_buy_size_factor", 0.0
+            ),
+            existing_position_size_factor=getattr(
+                config, "sector_shock_existing_position_size_factor", 0.5
+            ),
+        )
+
+    # 1d) Portfolio-level risk caps (Section 26). Apply sector,
     # beta, and correlation caps to the post-earnings target weights.
     # Trimmed weight becomes uninvested (cash), not redistributed —
     # consistent with the long-or-cash mode.
     risk_notes: dict[str, str] = {}
     risk_diagnostic: dict[str, Any] = {}
     if risk_limits is not None:
-        sector_map = {
-            sym: (sig.sector if sig is not None else None)
-            for sym, sig in signals.items()
-        }
         beta_map = beta_map or {}
         correlation_matrix = correlation_matrix or {}
         adj = apply_all_risk_caps(
             target_weights,
-            sector_map=sector_map,
+            sector_map=sector_map_for_guards,
             beta_map=beta_map,
             correlation_matrix=correlation_matrix,
             limits=risk_limits,
@@ -477,6 +572,8 @@ def compute_actions(
             notes.append(earnings_adjustment_notes[sym])
         if sym in risk_notes:
             notes.append(risk_notes[sym])
+        if sym in sector_shock_notes:
+            notes.append(sector_shock_notes[sym])
         if sym in review_gate_notes:
             notes.append(review_gate_notes[sym])
 
@@ -499,6 +596,7 @@ def compute_actions(
             last_close=ctx.last_close,
             sma20=ctx.sma20,
             atr14=ctx.atr14,
+            price_source=ctx.source,
             signal_age_days=signal_age,
             notes=notes,
             target_shares_exact=target_shares_exact,
@@ -518,6 +616,7 @@ def compute_actions(
                 for x in (review_gate.get("execution_caveats") or [])
                 if str(x).strip()
             ],
+            tradingagents_review={},
         ))
 
     for sym in positions:
@@ -543,6 +642,7 @@ def compute_actions(
             last_close=ctx.last_close,
             sma20=ctx.sma20,
             atr14=ctx.atr14,
+            price_source=ctx.source,
             signal_age_days=None,
             notes=["Held but outside the configured universe — manual review required."],
         ))
@@ -570,6 +670,16 @@ def compute_actions(
         "n_earnings_adjusted": len(earnings_adjustment_notes),
         "n_risk_capped": len(risk_notes),
         "n_review_gate_adjusted": len(review_gate_notes),
+        "n_sector_shock_adjusted": len(sector_shock_notes),
+        "sector_shocks": {
+            sector: {
+                "trigger_symbol": shock.trigger_symbol,
+                "pct_change": shock.pct_change,
+                "threshold": shock.threshold,
+                "source": shock.source,
+            }
+            for sector, shock in (sector_shocks or {}).items()
+        },
     }
     return actions, summary
 
@@ -656,6 +766,10 @@ def format_daily_report(
     risk_diag = (summary.get("risk_diagnostic") or {}) if summary else {}
     if risk_diag:
         lines.extend(_render_risk_section(risk_diag, summary))
+        lines.append("")
+    sector_shocks = (summary or {}).get("sector_shocks") or {}
+    if sector_shocks:
+        lines.extend(_render_sector_shock_section(sector_shocks, summary))
         lines.append("")
     if summary.get("n_review_gate_adjusted", 0):
         lines.append("## TradingAgents review gate")
@@ -976,4 +1090,29 @@ def _render_risk_section(
             )
             indicator = " ← at cap" if at_cap else ""
             lines.append(f"- {sector}: {_fmt_weight(exposure)}{indicator}")
+    return lines
+
+
+def _render_sector_shock_section(
+    sector_shocks: dict[str, Any],
+    summary: dict[str, Any] | None,
+) -> list[str]:
+    """Render same-day sector shock guard diagnostics."""
+    n_adjusted = (summary or {}).get("n_sector_shock_adjusted", 0)
+    lines = ["## Sector shock guard", ""]
+    lines.append(
+        f"- **{n_adjusted}** target(s) were reduced by same-day sector shock rules."
+    )
+    for sector, raw in sorted(sector_shocks.items()):
+        shock = raw or {}
+        pct_change = shock.get("pct_change")
+        threshold = shock.get("threshold")
+        pct_label = "n/a" if pct_change is None else f"{float(pct_change)*100:.1f}%"
+        threshold_label = (
+            "n/a" if threshold is None else f"-{float(threshold)*100:.1f}%"
+        )
+        lines.append(
+            f"- {sector}: {shock.get('trigger_symbol', 'n/a')} "
+            f"{pct_label} (trigger {threshold_label})"
+        )
     return lines

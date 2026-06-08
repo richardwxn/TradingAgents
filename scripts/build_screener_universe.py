@@ -403,8 +403,14 @@ def fetch_adv_usd(
 ) -> float | None:
     """Median daily dollar volume (close * volume) over trailing N sessions.
 
-    Uses the daily aggs endpoint. We pull ~lookback_days * 1.6 calendar days
-    of bars and take the trailing N by date to handle weekends/holidays.
+    Uses the per-symbol daily aggs endpoint. We pull ~lookback_days * 1.6
+    calendar days of bars and take the trailing N by date to handle
+    weekends/holidays.
+
+    **Note (Future-work #6):** for universe-scale builds (3000+ tickers)
+    `precompute_adv_via_grouped` is dramatically faster — one HTTP call
+    per date returns ALL tickers' aggs vs one call per ticker here.
+    This function stays for fallback / single-ticker callers.
     """
     start = (end_date - timedelta(days=int(lookback_days * 1.8))).isoformat()
     end = end_date.isoformat()
@@ -418,8 +424,17 @@ def fetch_adv_usd(
     rows = payload.get("results") or []
     if not rows:
         return None
+    return _median_dollar_volume(rows[-lookback_days:])
+
+
+def _median_dollar_volume(rows: list[dict[str, Any]]) -> float | None:
+    """Median `close × volume` across the given Polygon agg rows.
+
+    Common helper between the per-symbol fetch and the grouped batched
+    path. Returns None when no row has positive close × volume.
+    """
     dollar_vols: list[float] = []
-    for row in rows[-lookback_days:]:
+    for row in rows:
         try:
             close = float(row.get("c") or 0.0)
             vol = float(row.get("v") or 0.0)
@@ -435,6 +450,73 @@ def fetch_adv_usd(
     if n % 2 == 1:
         return dollar_vols[mid]
     return (dollar_vols[mid - 1] + dollar_vols[mid]) / 2.0
+
+
+def precompute_adv_via_grouped(
+    client: PolygonClient,
+    *,
+    end_date: date_cls,
+    lookback_days: int = 20,
+) -> dict[str, float]:
+    """Compute ADV (median dollar volume) for ALL tickers via grouped aggs.
+
+    Future-work #6 batched path: replaces N per-ticker HTTP calls with
+    ~lookback_days * 1.6 per-date calls returning every ticker's row in
+    one shot. For a 3000-ticker universe scan that's ~3000 → ~32 HTTP
+    calls (~100x reduction). For ticker symbols not seen on any of the
+    fetched dates (e.g. delisted before window), they simply won't
+    appear in the returned dict.
+
+    Returns dict[symbol_upper, median_dollar_volume].
+    """
+    # Walk back lookback_days*1.8 calendar days to absorb weekends and
+    # holidays, same as `fetch_adv_usd`'s per-symbol path.
+    cur = end_date
+    horizon = end_date - timedelta(days=int(lookback_days * 1.8))
+    dates_iso: list[str] = []
+    while cur >= horizon:
+        # Skip weekends — Polygon returns empty for Sat/Sun but no point
+        # in burning HTTP calls on them.
+        if cur.weekday() < 5:
+            dates_iso.append(cur.isoformat())
+        cur = cur - timedelta(days=1)
+
+    print(
+        f"  precompute_adv_via_grouped: fetching {len(dates_iso)} trading "
+        f"dates' grouped aggs ({horizon.isoformat()}..{end_date.isoformat()})",
+        file=sys.stderr,
+    )
+    per_ticker_rows: dict[str, list[dict[str, Any]]] = {}
+    for date_iso in dates_iso:
+        url = (
+            "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/"
+            f"{date_iso}"
+        )
+        payload = client.get(url, params={"adjusted": "true"})
+        if not payload:
+            continue
+        rows = payload.get("results") or []
+        for row in rows:
+            sym = (row.get("T") or "").upper()
+            if sym:
+                per_ticker_rows.setdefault(sym, []).append(row)
+
+    # Trailing N dates per ticker (some symbols won't have a full window
+    # — pre-IPO portions, delisted before window). `_median_dollar_volume`
+    # gracefully returns None on insufficient data.
+    out: dict[str, float] = {}
+    for sym, rows in per_ticker_rows.items():
+        # Already date-major sorted desc by our outer loop; reverse to asc
+        # then take trailing N, matching `fetch_adv_usd[-lookback_days:]`.
+        rows_asc = list(reversed(rows))
+        adv = _median_dollar_volume(rows_asc[-lookback_days:])
+        if adv is not None:
+            out[sym] = adv
+    print(
+        f"  precompute_adv_via_grouped: computed ADV for {len(out)} symbols",
+        file=sys.stderr,
+    )
+    return out
 
 
 def build_universe(
@@ -473,6 +555,14 @@ def build_universe(
     }
     kept: list[dict[str, Any]] = []
 
+    # Future-work #6: precompute ADV for every ticker via grouped-aggs
+    # endpoint in a single ~20-30 HTTP call burst (one per trading date)
+    # instead of one per-ticker call inside the loop. ~100x reduction on
+    # HTTP requests for a 3000-name universe.
+    adv_map = precompute_adv_via_grouped(
+        client, end_date=as_of, lookback_days=adv_lookback_days,
+    )
+
     for i, t in enumerate(tickers, start=1):
         symbol = str(t.get("ticker") or "").strip().upper()
         if not symbol:
@@ -500,12 +590,18 @@ def build_universe(
         if mc < market_cap_min_usd:
             stats["dropped_market_cap"] += 1
             continue
-        adv_usd = fetch_adv_usd(
-            client,
-            symbol,
-            end_date=as_of,
-            lookback_days=adv_lookback_days,
-        )
+        # Look up ADV from the precomputed map (Future-work #6 batched
+        # path). Fall back to the legacy per-symbol fetch if the symbol
+        # wasn't in the grouped-aggs window (rare: pre-IPO mid-window,
+        # delisted, etc.).
+        adv_usd = adv_map.get(symbol)
+        if adv_usd is None:
+            adv_usd = fetch_adv_usd(
+                client,
+                symbol,
+                end_date=as_of,
+                lookback_days=adv_lookback_days,
+            )
         if adv_usd is None or adv_usd < adv_min_usd:
             stats["dropped_adv"] += 1
             continue

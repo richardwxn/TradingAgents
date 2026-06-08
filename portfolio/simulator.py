@@ -17,6 +17,13 @@ Design contract:
 - Stale-composite handling: any composite older than
   `stale_composite_weeks` weeks is treated as neutral (drops the
   ticker from the bullish set), mirroring the daily signals layer.
+- Position-level stops (Section 16): when `stop_loss_atr_multiple > 0`
+  AND the observation carries `atr_14`, each long position has a hard
+  stop at `entry - atr_14 * stop_loss_atr_multiple`. If the
+  intra-week min close drops to or below the stop, the position
+  exits at the stop level (not next Friday's close); per-week
+  `n_stops_hit` is tracked. Stops fire on long-side positions only
+  (the model is structurally long-only per handoff Section 15/16).
 """
 
 from __future__ import annotations
@@ -38,7 +45,13 @@ from portfolio.sizing import SizingConfig, compute_target_weights
 class WeeklyObservation:
     """One (ticker, week) signal observation. Price comes from the
     PriceTable, not from this struct, so the simulator can compute
-    returns across weeks where no fresh composite was emitted."""
+    returns across weeks where no fresh composite was emitted.
+
+    `atr_14` is optional; when present and combined with
+    `SimulationConfig.stop_loss_atr_multiple > 0`, the simulator
+    enables intra-week stop-loss exits on long positions held in this
+    ticker. Stops are sized off the entry price (this Friday's close
+    in `prices`)."""
 
     ticker: str
     week: date
@@ -46,6 +59,7 @@ class WeeklyObservation:
     composite: float | None
     confidence: float | None
     composite_age_weeks: int  # 0 = fresh this week; >0 = carried forward
+    atr_14: float | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +70,12 @@ class SimulationConfig:
     stale_composite_weeks: int = 2
     risk_free_annual: float = 0.0
     trading_weeks_per_year: int = 52
+    # Position-level intra-week stop (Section 16). Stop level for each
+    # long position = entry_price - atr_14 * stop_loss_atr_multiple. If
+    # the week's intra-week min close drops to or below the stop, the
+    # position exits at the stop level instead of next Friday's close.
+    # Set to 0.0 to disable stops entirely (legacy behavior).
+    stop_loss_atr_multiple: float = 1.5
 
 
 @dataclass(frozen=True)
@@ -67,6 +87,7 @@ class WeeklyState:
     realized_return: float  # this week's return contribution
     one_way_turnover: float
     cost_paid: float
+    n_stops_hit: int = 0  # number of positions that hit ATR stop this week
 
 
 @dataclass(frozen=True)
@@ -130,12 +151,21 @@ def run_simulation(
     sim_config: SimulationConfig | None = None,
     policy_name: str | None = None,
     benchmark_only: bool = False,
+    intra_week_min_close: dict[date, dict[str, float]] | None = None,
 ) -> SimulationResult:
     """Walk forward week-by-week through `weeks`, applying the policy.
 
     `benchmark_only=True` ignores the sizing policy and runs a
     100%-`sim_config.benchmark` buy-and-hold instead. The benchmark
     must be a column in `prices`.
+
+    `intra_week_min_close` (optional) is `{week: {ticker: float}}`
+    giving the minimum daily close observed between this Friday
+    (exclusive) and next Friday (inclusive). When supplied AND the
+    per-week observation carries `atr_14` AND
+    `sim_config.stop_loss_atr_multiple > 0`, long positions exit at
+    the stop level if the min close pierces it. Passing `None` (or
+    leaving entries missing) disables stops for those tickers/weeks.
 
     Returns a fully-populated SimulationResult. Returns over the last
     week of `weeks` are computed if a next-week price is available;
@@ -152,6 +182,8 @@ def run_simulation(
     states: list[WeeklyState] = []
 
     cost_rate = float(sim_config.cost_per_side_bps) / 10_000.0
+    stop_mult = float(sim_config.stop_loss_atr_multiple)
+    stops_enabled = stop_mult > 0.0 and not benchmark_only
 
     for i, w in enumerate(weeks):
         if benchmark_only:
@@ -180,8 +212,11 @@ def run_simulation(
         # returns from this Friday to next Friday. The final week has no
         # next observation → realized return defaults to 0.
         realized = 0.0
+        n_stops_hit = 0
         if i + 1 < len(weeks):
             w_next = weeks[i + 1]
+            week_mins = (intra_week_min_close or {}).get(w, {}) if stops_enabled else {}
+            week_obs = observations.get(w, {}) if stops_enabled else {}
             for t, weight in target.items():
                 if weight == 0.0:
                     continue
@@ -191,7 +226,30 @@ def run_simulation(
                 p_next = prices.at[w_next, t] if w_next in prices.index else None
                 if p_now is None or p_next is None or pd.isna(p_now) or pd.isna(p_next) or p_now <= 0:
                     continue
-                realized += float(weight) * (float(p_next) / float(p_now) - 1.0)
+                p_now_f = float(p_now)
+                p_exit = float(p_next)
+
+                # Position-level stop check (long-only). Stops fire if
+                # the intra-week min close drops to or below the stop
+                # level, in which case the exit price is the stop, not
+                # next Friday's close. Requires both an ATR on the
+                # observation and a min-close for this week+ticker.
+                if stops_enabled and weight > 0.0:
+                    obs_for_t = week_obs.get(t)
+                    atr = obs_for_t.atr_14 if obs_for_t is not None else None
+                    min_close = week_mins.get(t)
+                    if (
+                        atr is not None
+                        and atr > 0
+                        and min_close is not None
+                        and not pd.isna(min_close)
+                    ):
+                        stop_price = p_now_f - float(atr) * stop_mult
+                        if float(min_close) <= stop_price and stop_price > 0:
+                            p_exit = stop_price
+                            n_stops_hit += 1
+
+                realized += float(weight) * (p_exit / p_now_f - 1.0)
             equity *= (1.0 + realized)
 
         states.append(WeeklyState(
@@ -202,6 +260,7 @@ def run_simulation(
             realized_return=realized,
             one_way_turnover=turnover,
             cost_paid=cost_paid,
+            n_stops_hit=n_stops_hit,
         ))
         prev_weights = target
 
@@ -263,6 +322,7 @@ def compute_metrics(
     avg_long_exposure = (
         sum(sum(max(0.0, w) for w in s.target_weights.values()) for s in states) / n_weeks
     )
+    n_stops_hit = sum(int(getattr(s, "n_stops_hit", 0)) for s in states)
 
     return {
         "start_equity": float(sim_config.initial_capital),
@@ -274,6 +334,7 @@ def compute_metrics(
         "total_one_way_turnover": float(total_turnover),
         "total_cost_paid": float(total_cost),
         "avg_long_exposure": float(avg_long_exposure),
+        "n_stops_hit": int(n_stops_hit),
         "start_week": weeks[0].isoformat() if isinstance(weeks[0], date) else str(weeks[0]),
         "end_week": weeks[-1].isoformat() if isinstance(weeks[-1], date) else str(weeks[-1]),
     }
@@ -358,7 +419,7 @@ def render_policy_comparison_markdown(
     lines.append("")
     headers = [
         "Policy", "End equity", "CAGR", "Sharpe", "Max DD",
-        "Avg long", "Total turnover", "Costs paid",
+        "Avg long", "Total turnover", "Costs paid", "Stops hit",
     ]
     excess_cols = ["Excess CAGR", "Info ratio"]
     if benchmark:
@@ -380,6 +441,7 @@ def render_policy_comparison_markdown(
             f"{m.get('avg_long_exposure', 0.0) * 100:.1f}%",
             f"{m.get('total_one_way_turnover', 0.0):.2f}x",
             f"${m.get('total_cost_paid', 0.0):,.0f}",
+            f"{int(m.get('n_stops_hit', 0))}",
         ]
         if benchmark:
             if r.policy_name == benchmark.policy_name:

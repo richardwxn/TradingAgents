@@ -8,6 +8,8 @@ from tradingagents.analysis_only.backtest import (
     bucket_by_composite,
     bucket_by_confidence,
     bucket_by_direction,
+    compute_return_metrics,
+    compute_return_metrics_by_direction,
     explode_records_to_factors,
     fit_weights_from_records,
     ic_signed_weights,
@@ -1599,3 +1601,278 @@ def test_walk_forward_timeline_serializes_to_dict():
         # Weights JSON-serializable.
         import json as _json
         _json.dumps(payload)
+
+
+# ---------- Unit X4: compute_return_metrics ----------
+
+
+def _rm_record(symbol, as_of, direction, ret, horizon="ret_60d"):
+    return BacktestRecord(
+        symbol=symbol,
+        as_of_date=as_of,
+        direction=direction,
+        confidence=0.7,
+        composite_score=0.3 if direction == "bullish" else (-0.3 if direction == "bearish" else 0.0),
+        forward_returns={horizon: ret},
+    )
+
+
+def test_compute_return_metrics_empty_records():
+    out = compute_return_metrics([], horizon="ret_60d")
+    assert out["n_records"] == 0
+    assert out["n_with_return"] == 0
+    assert out["mean_return"] is None
+    assert out["sharpe"] is None
+    assert out["sortino"] is None
+    assert out["profit_factor"] is None
+
+
+def test_compute_return_metrics_basic_sharpe_math():
+    # Six bullish records with known mean/stdev so we can hand-check.
+    # rets = [0.10, 0.05, -0.02, 0.08, 0.03, 0.04]
+    # mean = 0.04666..., stdev (sample) ~ 0.04274
+    # raw Sharpe ~ 1.0918, annualized at 60d: * sqrt(252/60) ~ 2.049
+    # final Sharpe ~ 2.237
+    rets = [0.10, 0.05, -0.02, 0.08, 0.03, 0.04]
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "bullish", r)
+        for i, r in enumerate(rets)
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d")
+    assert out["n_with_return"] == 6
+    assert out["mean_return"] == pytest.approx(0.046667, abs=1e-4)
+    assert out["sharpe"] is not None
+    # Sharpe should be positive and annualized to roughly 2.2.
+    assert 1.5 < out["sharpe"] < 3.0
+    # Annualization factor for 60-day horizon.
+    assert out["annualization_factor"] == pytest.approx(2.0494, abs=1e-3)
+    # Hit-rate for bullish records on these returns: 5 / 6 are > 0.
+    assert out["hit_rate"] == pytest.approx(5 / 6, abs=1e-4)
+
+
+def test_compute_return_metrics_profit_factor_and_dd():
+    rets = [0.10, -0.05, 0.08, -0.02, 0.04]
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "bullish", r)
+        for i, r in enumerate(rets)
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d")
+    # profit factor = (0.10+0.08+0.04) / (0.05+0.02) = 0.22 / 0.07 ~ 3.143
+    assert out["profit_factor"] == pytest.approx(3.1428, abs=1e-3)
+    # Cumulative P&L (sum): 0.10, 0.05, 0.13, 0.11, 0.15.
+    # Drawdown after 0.10 peak: -0.05 (cum 0.05 vs peak 0.10).
+    # Drawdown after 0.13 peak: -0.02 (cum 0.11 vs peak 0.13).
+    # Max DD is the larger magnitude: -0.05.
+    assert out["max_drawdown"] == pytest.approx(-0.05, abs=1e-6)
+    assert out["n_positive"] == 3
+    assert out["n_negative"] == 2
+    assert out["n_zero"] == 0
+
+
+def test_compute_return_metrics_all_zero_returns():
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "neutral", 0.0)
+        for i in range(5)
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d")
+    assert out["n_with_return"] == 5
+    assert out["mean_return"] == 0.0
+    # Zero variance → Sharpe / Sortino undefined.
+    assert out["sharpe"] is None
+    assert out["sortino"] is None
+    # No negative returns → profit factor undefined (avoid div by zero).
+    assert out["profit_factor"] is None
+    assert out["max_drawdown"] == 0.0
+
+
+def test_compute_return_metrics_all_positive_no_profit_factor():
+    # Profit factor needs at least one negative return.
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "bullish", 0.02 + i * 0.01)
+        for i in range(5)
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d")
+    assert out["profit_factor"] is None
+    assert out["n_negative"] == 0
+    assert out["sortino"] is None  # No downside returns.
+
+
+def test_compute_return_metrics_missing_returns_skipped():
+    # Some records have ret_60d, some don't (have ret_20d only).
+    recs = [
+        BacktestRecord(
+            symbol="A", as_of_date="2025-01-01", direction="bullish",
+            confidence=0.7, composite_score=0.3,
+            forward_returns={"ret_60d": 0.05},
+        ),
+        BacktestRecord(
+            symbol="B", as_of_date="2025-01-02", direction="bullish",
+            confidence=0.7, composite_score=0.3,
+            forward_returns={"ret_20d": 0.02},  # No ret_60d.
+        ),
+        BacktestRecord(
+            symbol="C", as_of_date="2025-01-03", direction="bullish",
+            confidence=0.7, composite_score=0.3,
+            forward_returns={"ret_60d": 0.08},
+        ),
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d")
+    assert out["n_records"] == 3
+    assert out["n_with_return"] == 2
+    # Only the two with ret_60d returns contribute to the mean.
+    assert out["mean_return"] == pytest.approx(0.065, abs=1e-4)
+
+
+def test_compute_return_metrics_direction_filter():
+    recs = [
+        _rm_record("A", "2025-01-01", "bullish", 0.10),
+        _rm_record("B", "2025-01-02", "bearish", -0.05),
+        _rm_record("C", "2025-01-03", "bullish", 0.04),
+        _rm_record("D", "2025-01-04", "bearish", 0.03),
+    ]
+    bull = compute_return_metrics(recs, horizon="ret_60d", direction_filter="bullish")
+    assert bull["n_records"] == 2
+    assert bull["n_with_return"] == 2
+    assert bull["mean_return"] == pytest.approx(0.07, abs=1e-4)
+    # Direction filter pins hit-rate to that direction's rule (both > 0 = bullish hits).
+    assert bull["hit_rate"] == 1.0
+    bear = compute_return_metrics(recs, horizon="ret_60d", direction_filter="bearish")
+    assert bear["n_records"] == 2
+    # bearish hit = ret < 0. One of the two bearish records has -0.05 (hit),
+    # the other has +0.03 (miss). hit_rate = 0.5.
+    assert bear["hit_rate"] == pytest.approx(0.5, abs=1e-4)
+
+
+def test_compute_return_metrics_winsorized_mean_clips_outliers():
+    # Mix of normal and one extreme return; winsorized mean should be
+    # smaller than raw mean. We use 10 samples and p=0.1 so the top
+    # outlier sits exactly in the trimmed bucket.
+    rets = [0.02, 0.03, 0.04, 0.05, 0.06, 0.03, 0.04, 0.05, 0.06, 1.00]
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "bullish", r)
+        for i, r in enumerate(rets)
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d", winsorize_p=0.1)
+    raw_mean = sum(rets) / len(rets)
+    assert out["mean_return"] == pytest.approx(raw_mean, abs=1e-4)
+    # Winsorized mean clips top/bottom 10% → outlier should pull down.
+    assert out["winsorized_mean"] < raw_mean
+
+
+def test_compute_return_metrics_horizon_parse_unannualized_fallback():
+    # An unrecognized horizon string returns unannualized Sharpe.
+    rets = [0.10, 0.05, -0.02, 0.08, 0.03, 0.04]
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "bullish", r, horizon="custom_key")
+        for i, r in enumerate(rets)
+    ]
+    out = compute_return_metrics(recs, horizon="custom_key")
+    assert out["n_with_return"] == 6
+    assert out["horizon_days"] is None
+    assert out["annualization_factor"] is None
+    # Sharpe is still computed (unannualized).
+    assert out["sharpe"] is not None
+    # Unannualized Sharpe ≈ 1.092
+    assert 0.5 < out["sharpe"] < 2.0
+
+
+def test_compute_return_metrics_max_drawdown_monotonic_up():
+    # A monotonic up-sequence has zero drawdown.
+    rets = [0.01, 0.02, 0.03, 0.04, 0.05]
+    recs = [
+        _rm_record("S", f"2025-01-{i+1:02d}", "bullish", r)
+        for i, r in enumerate(rets)
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d")
+    assert out["max_drawdown"] == 0.0
+
+
+def test_compute_return_metrics_by_direction_returns_all_three_keys():
+    recs = [
+        _rm_record("A", "2025-01-01", "bullish", 0.05),
+        _rm_record("B", "2025-01-02", "bearish", -0.04),
+        _rm_record("C", "2025-01-03", "neutral", 0.01),
+    ]
+    out = compute_return_metrics_by_direction(recs, horizon="ret_60d")
+    assert set(out.keys()) == {"bullish", "bearish", "neutral"}
+    assert out["bullish"]["n_with_return"] == 1
+    assert out["bearish"]["n_with_return"] == 1
+    assert out["neutral"]["n_with_return"] == 1
+    assert out["bullish"]["mean_return"] == pytest.approx(0.05)
+
+
+def test_compute_return_metrics_by_direction_empty_bucket_present():
+    # Only bullish records — bearish/neutral buckets still appear in output.
+    recs = [
+        _rm_record("A", "2025-01-01", "bullish", 0.05),
+        _rm_record("B", "2025-01-02", "bullish", 0.06),
+    ]
+    out = compute_return_metrics_by_direction(recs, horizon="ret_60d")
+    assert out["bearish"]["n_records"] == 0
+    assert out["bearish"]["n_with_return"] == 0
+    assert out["bearish"]["mean_return"] is None
+    assert out["neutral"]["mean_return"] is None
+    assert out["bullish"]["n_with_return"] == 2
+
+
+def test_summarize_all_includes_return_metrics_block():
+    recs = [
+        _rm_record("A", "2025-01-01", "bullish", 0.05),
+        _rm_record("B", "2025-01-02", "bullish", 0.03),
+        _rm_record("C", "2025-01-03", "bullish", -0.02),
+        _rm_record("D", "2025-01-04", "bearish", -0.04),
+    ]
+    summary = summarize_all(recs, return_fields=["ret_60d"])
+    assert "return_metrics" in summary
+    assert "ret_60d" in summary["return_metrics"]
+    block = summary["return_metrics"]["ret_60d"]
+    assert "overall" in block and "by_direction" in block
+    assert block["overall"]["n_with_return"] == 4
+    assert set(block["by_direction"].keys()) == {"bullish", "bearish", "neutral"}
+
+
+def test_compute_return_metrics_bearish_pnl_flips_sign():
+    # All bearish records with positive forward returns (anti-predictive
+    # case). Strategy P&L should be NEGATIVE since shorting a stock that
+    # rose loses money. Sharpe should be negative or near zero.
+    recs = [
+        _rm_record("A", "2025-01-01", "bearish", 0.05),
+        _rm_record("B", "2025-01-02", "bearish", 0.08),
+        _rm_record("C", "2025-01-03", "bearish", 0.03),
+        _rm_record("D", "2025-01-04", "bearish", -0.02),  # The only winning short.
+    ]
+    out = compute_return_metrics(recs, horizon="ret_60d", direction_filter="bearish")
+    assert out["n_with_return"] == 4
+    # Mean strategy P&L: (-0.05 -0.08 -0.03 + 0.02) / 4 = -0.035
+    assert out["mean_return"] == pytest.approx(-0.035, abs=1e-4)
+    assert out["sharpe"] is not None and out["sharpe"] < 0
+    # Hit rate uses raw returns: bearish hit when raw < 0. Only D hits.
+    assert out["hit_rate"] == pytest.approx(0.25)
+
+
+def test_compute_return_metrics_bullish_pnl_unchanged():
+    # Bullish records: P&L = raw return, so the sign-flip is a no-op.
+    recs = [
+        _rm_record("A", "2025-01-01", "bullish", 0.05),
+        _rm_record("B", "2025-01-02", "bullish", 0.08),
+        _rm_record("C", "2025-01-03", "bullish", -0.02),
+    ]
+    out_filter = compute_return_metrics(
+        recs, horizon="ret_60d", direction_filter="bullish"
+    )
+    # Mean P&L = mean raw = (0.05 + 0.08 - 0.02) / 3 = 0.0367.
+    assert out_filter["mean_return"] == pytest.approx(0.0367, abs=1e-4)
+    assert out_filter["sharpe"] is not None and out_filter["sharpe"] > 0
+
+
+def test_render_summary_markdown_emits_risk_adjusted_section():
+    recs = [
+        _rm_record("A", "2025-01-01", "bullish", 0.05),
+        _rm_record("B", "2025-01-02", "bullish", 0.03),
+        _rm_record("C", "2025-01-03", "bearish", -0.04),
+    ]
+    summary = summarize_all(recs, return_fields=["ret_60d"])
+    md = render_summary_markdown(summary)
+    assert "Risk-adjusted metrics" in md
+    assert "Sharpe (ann.)" in md
+    assert "Profit factor" in md

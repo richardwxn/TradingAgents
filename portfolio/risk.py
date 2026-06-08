@@ -62,6 +62,17 @@ class RiskAdjustment:
     portfolio_beta: float | None = None
 
 
+@dataclass(frozen=True)
+class SectorShock:
+    """Triggered same-day sector shock used by the trade/sizing layer."""
+
+    sector: str
+    trigger_symbol: str
+    pct_change: float
+    threshold: float
+    source: str = "yfinance"
+
+
 # ---------- pure computations ----------
 
 
@@ -237,6 +248,51 @@ def apply_correlation_cap(
             f"Correlation cap (ρ={rho:.2f} with anchor {anchor}, "
             f"limit ρ ≥ {max_pair_correlation:.2f}) → scaled "
             f"{old_w*100:.1f}% → {out[sym]*100:.1f}%."
+        )
+    return out, notes
+
+
+def apply_sector_shock_guard(
+    weights: dict[str, float],
+    sector_map: dict[str, str | None],
+    *,
+    position_shares: dict[str, float],
+    shocks: dict[str, SectorShock],
+    new_buy_size_factor: float,
+    existing_position_size_factor: float,
+) -> tuple[dict[str, float], dict[str, str]]:
+    """Reduce target weights in sectors hit by a same-day ETF shock.
+
+    New buys and existing holdings intentionally have separate multipliers:
+    on a shock day, the common desired behavior is to stop opening fresh
+    exposure while allowing existing holdings to be held or trimmed instead
+    of forcing a full exit.
+    """
+    out = dict(weights)
+    notes: dict[str, str] = {}
+    if not shocks:
+        return out, notes
+    new_factor = max(0.0, min(1.0, float(new_buy_size_factor)))
+    existing_factor = max(0.0, min(1.0, float(existing_position_size_factor)))
+    for sym, old_w in list(out.items()):
+        if old_w <= 0:
+            continue
+        sector = sector_map.get(sym) or "unknown"
+        shock = shocks.get(sector)
+        if shock is None:
+            continue
+        held = float(position_shares.get(sym, 0.0) or 0.0) > 0
+        factor = existing_factor if held else new_factor
+        if factor >= 1.0:
+            continue
+        new_w = old_w * factor
+        out[sym] = new_w
+        holding_label = "existing-position" if held else "new-buy"
+        notes[sym] = (
+            f"Sector shock guard ({sector} via {shock.trigger_symbol} "
+            f"{shock.pct_change*100:.1f}% <= -{shock.threshold*100:.1f}% "
+            f"threshold) scaled {holding_label} target "
+            f"{old_w*100:.1f}% -> {new_w*100:.1f}%."
         )
     return out, notes
 

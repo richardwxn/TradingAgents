@@ -15,6 +15,7 @@ from tradingagents.analysis_only.scoring import (
     brier_score,
     bucket_for_score,
     compute_composite,
+    compute_ticker_fear_greed,
     confidence_for,
     direction_for_composite,
     factor_correlation_matrix,
@@ -30,7 +31,10 @@ from tradingagents.analysis_only.scoring import (
     score_iv_rank,
     score_iv_skew,
     score_iv_term_structure,
+    compute_news_sentiment,
+    score_news_sentiment,
     score_sales_multiple_vs_growth,
+    score_ticker_fear_greed_regime,
 )
 
 
@@ -482,11 +486,12 @@ def test_iv_term_structure_promoted_in_v1_5():
     assert DEFAULT_FACTOR_WEIGHTS["options_iv_term_structure"] == 0.04
 
 
-def test_iv_rank_promoted_in_v1_3():
-    # v1.3 commits options_iv_rank at 0.04 after Phase 1 IC validated the
-    # placeholder sign: +0.154 IC at 20d (n=597), +0.107 per-ticker median
-    # across 11 tickers with 63.6% sign consistency.
-    assert DEFAULT_FACTOR_WEIGHTS["options_iv_rank"] == 0.04
+def test_iv_rank_reduced_in_v1_8():
+    # v1.8 (2026-06-06): reduced 0.04 → 0.02 after multi-regime IC
+    # degradation. The Phase 1 +0.107 signal didn't generalize forward;
+    # combined corpus core IC = −0.017 (sign-cons 54% — random). Cutting
+    # weight rather than zeroing pending further evidence.
+    assert DEFAULT_FACTOR_WEIGHTS["options_iv_rank"] == 0.02
 
 
 def test_fear_greed_restored_in_v1_4():
@@ -637,6 +642,326 @@ def test_regime_threshold_is_strict_less_than():
     assert regime_for_market_context(mc_at) == REGIME_CHOP
 
 
+# ---------- apply_regime_to_factor_scores (v1.7 candidate) ----------
+
+
+def _flip_test_factors():
+    return [
+        {
+            "factor": "market_fear_greed_regime", "pillar": "context",
+            "score": 0.4, "weight": 0.05, "weighted_score": 0.02,
+            "data_available": True, "rationale": "Greed (momentum-bullish).",
+        },
+        {
+            "factor": "fund_profit_margins", "pillar": "fundamental",
+            "score": 0.5, "weight": 0.08, "weighted_score": 0.04,
+            "data_available": True, "rationale": "Strong margins.",
+        },
+        {
+            "factor": "options_iv_rank", "pillar": "options",
+            "score": 0.5, "weight": 0.04, "weighted_score": 0.02,
+            "data_available": True, "rationale": "Low IV rank.",
+        },
+        {
+            "factor": "trend_price_vs_sma20", "pillar": "technical",
+            "score": 1.0, "weight": 0.08, "weighted_score": 0.08,
+            "data_available": True, "rationale": "Above SMA20.",
+        },
+    ]
+
+
+def _flip_test_weights():
+    return {
+        "market_fear_greed_regime": 0.05,
+        "fund_profit_margins": 0.08,
+        "options_iv_rank": 0.04,
+        "trend_price_vs_sma20": 0.08,
+    }
+
+
+def test_apply_regime_trend_on_is_passthrough():
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = _flip_test_factors()
+    out = apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_TREND_ON)
+    # trend_on has no flips → output equals input (identity, not even a copy
+    # since no flips means no work needed).
+    assert out == fs
+
+
+def test_apply_regime_unknown_is_passthrough():
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = _flip_test_factors()
+    out = apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_UNKNOWN)
+    assert out == fs
+
+
+def test_apply_regime_chop_flips_three_factors_and_keeps_others():
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = _flip_test_factors()
+    weights = _flip_test_weights()
+    out = apply_regime_to_factor_scores(fs, weights, REGIME_CHOP)
+    by = {f["factor"]: f for f in out}
+    # Three configured factors should flip sign and recompute weighted_score.
+    assert by["market_fear_greed_regime"]["score"] == -0.4
+    assert by["market_fear_greed_regime"]["weighted_score"] == pytest.approx(-0.02)
+    assert by["fund_profit_margins"]["score"] == -0.5
+    assert by["fund_profit_margins"]["weighted_score"] == pytest.approx(-0.04)
+    assert by["options_iv_rank"]["score"] == -0.5
+    assert by["options_iv_rank"]["weighted_score"] == pytest.approx(-0.02)
+    # Untouched factor stays identical.
+    assert by["trend_price_vs_sma20"]["score"] == 1.0
+    assert by["trend_price_vs_sma20"]["weighted_score"] == 0.08
+
+
+def test_apply_regime_chop_does_not_mutate_input():
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = _flip_test_factors()
+    original = [dict(f) for f in fs]
+    apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_CHOP)
+    assert fs == original  # input untouched
+
+
+def test_apply_regime_chop_skips_unavailable_factors():
+    """A factor with data_available=False should not be flipped — keeps
+    score=0 and a 'no signal' rationale."""
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = [
+        {
+            "factor": "market_fear_greed_regime", "pillar": "context",
+            "score": 0.0, "weight": 0.05, "weighted_score": 0.0,
+            "data_available": False, "rationale": "F&G unavailable.",
+        },
+    ]
+    out = apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_CHOP)
+    assert out == fs
+
+
+def test_apply_regime_chop_rationale_annotated():
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = _flip_test_factors()
+    out = apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_CHOP)
+    fg = next(f for f in out if f["factor"] == "market_fear_greed_regime")
+    assert "regime=chop" in fg["rationale"]
+    assert "sign flipped" in fg["rationale"]
+
+
+def test_regime_sign_flips_constant_shape():
+    """Sanity: every flip target must be in DEFAULT_FACTOR_WEIGHTS (else
+    the lookup `weights.get(name, 0.0)` would silently return 0)."""
+    from tradingagents.analysis_only.scoring import REGIME_SIGN_FLIPS
+    for regime, flips in REGIME_SIGN_FLIPS.items():
+        for name, mult in flips.items():
+            assert name in DEFAULT_FACTOR_WEIGHTS, (
+                f"{regime}.{name} not in DEFAULT_FACTOR_WEIGHTS"
+            )
+            assert mult in (-1, 1), f"{regime}.{name} sign must be ±1"
+
+
+# ---------- direction_for_composite_regime_gated (v1.7 bear-side gate) ----------
+
+
+def test_regime_gate_bullish_call_is_passthrough():
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    # Bullish candidate always passes through regardless of regime/F&G.
+    assert direction_for_composite_regime_gated(
+        0.6, regime=REGIME_TREND_ON, fear_greed_score=0.4,
+    ) == "bullish"
+    assert direction_for_composite_regime_gated(
+        0.6, regime=REGIME_CHOP, fear_greed_score=-0.4,
+    ) == "bullish"
+
+
+def test_regime_gate_neutral_call_is_passthrough():
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    assert direction_for_composite_regime_gated(
+        0.05, regime=REGIME_TREND_ON, fear_greed_score=None,
+    ) == "neutral"
+
+
+def test_regime_gate_bearish_blocked_in_trend_on():
+    """Section 15: bearish in trend_on is anti-predictive. Gate blocks it."""
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    out = direction_for_composite_regime_gated(
+        -0.4, regime=REGIME_TREND_ON, fear_greed_score=-0.4,
+    )
+    assert out == "neutral"
+
+
+def test_regime_gate_bearish_blocked_in_chop_when_fear_greed_neutral():
+    """Chop + neutral F&G is not enough — need fear signal too."""
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    out = direction_for_composite_regime_gated(
+        -0.4, regime=REGIME_CHOP, fear_greed_score=0.0,
+    )
+    assert out == "neutral"
+
+
+def test_regime_gate_bearish_blocked_in_chop_when_greed():
+    """Chop + greed = ambiguous risk-off signal, gate keeps blocking."""
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    out = direction_for_composite_regime_gated(
+        -0.4, regime=REGIME_CHOP, fear_greed_score=+0.2,
+    )
+    assert out == "neutral"
+
+
+def test_regime_gate_bearish_passes_in_chop_with_fear():
+    """The intended pass-through case: chop AND F&G at fear or worse."""
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    # F&G at exactly -0.2 (fear bucket) clears the threshold.
+    out = direction_for_composite_regime_gated(
+        -0.4, regime=REGIME_CHOP, fear_greed_score=-0.2,
+    )
+    assert out == "bearish"
+    # Extreme fear (-0.4) also passes.
+    out2 = direction_for_composite_regime_gated(
+        -0.4, regime=REGIME_CHOP, fear_greed_score=-0.4,
+    )
+    assert out2 == "bearish"
+
+
+def test_regime_gate_unknown_regime_falls_back_to_standard():
+    """When the classifier returns 'unknown' (missing inputs), don't
+    silently gate — fall back to standard direction logic."""
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    out = direction_for_composite_regime_gated(
+        -0.4, regime=REGIME_UNKNOWN, fear_greed_score=None,
+    )
+    assert out == "bearish"
+
+
+def test_regime_gate_none_regime_falls_back_to_standard():
+    """When the caller doesn't pass regime at all, behavior must match
+    `direction_for_composite` exactly (no surprise default-gate)."""
+    from tradingagents.analysis_only.scoring import direction_for_composite_regime_gated
+    out = direction_for_composite_regime_gated(-0.4)
+    assert out == "bearish"
+
+
+# ---------- direction-conditional isotonic calibration (Section 29) ----------
+
+
+def test_fit_calibration_by_direction_emits_top_level_and_by_direction():
+    from tradingagents.analysis_only.scoring import (
+        fit_isotonic_calibration_by_direction,
+    )
+    n = 60
+    composites = [(i - n / 2) / (n / 2) for i in range(n)]  # span [-1, 1]
+    hits = [1 if c > 0 else 0 for c in composites]
+    directions = ["bullish" if c > 0.15 else "bearish" if c < -0.15 else "neutral" for c in composites]
+    cal = fit_isotonic_calibration_by_direction(
+        composites, hits, directions, min_obs_per_direction=5,
+    )
+    assert cal["method"] == "isotonic_pav_by_direction"
+    assert "fit" in cal           # top-level all-directions still present
+    assert "by_direction" in cal
+    assert set(cal["by_direction"].keys()) == {"bullish", "bearish", "neutral"}
+
+
+def test_fit_calibration_by_direction_undersampled_falls_back():
+    from tradingagents.analysis_only.scoring import (
+        fit_isotonic_calibration_by_direction,
+    )
+    composites = [0.6, 0.4, -0.3, 0.0]
+    hits = [1, 1, 0, 0]
+    directions = ["bullish", "bullish", "bearish", "neutral"]
+    cal = fit_isotonic_calibration_by_direction(
+        composites, hits, directions, min_obs_per_direction=30,
+    )
+    # Each per-direction fit will be fallback=True (n<30).
+    for d in ("bullish", "bearish", "neutral"):
+        assert cal["by_direction"][d].get("fallback") is True
+
+
+def test_apply_calibration_directional_uses_direction_curve_when_available():
+    from tradingagents.analysis_only.scoring import (
+        apply_isotonic_calibration_directional,
+    )
+    cal = {
+        "fit": [
+            {"x_lower": -1.0, "x_upper": 1.0, "hit_rate": 0.30, "n_obs": 100},
+        ],
+        "by_direction": {
+            "bullish": {
+                "fit": [{"x_lower": 0.2, "x_upper": 1.0, "hit_rate": 0.78, "n_obs": 60}],
+                "fallback": False,
+            },
+            "bearish": {
+                # Anti-predictive: low confidence regardless of composite.
+                "fit": [{"x_lower": -1.0, "x_upper": -0.2, "hit_rate": 0.18, "n_obs": 25}],
+                "fallback": False,
+            },
+        },
+    }
+    # Bullish composite uses bullish curve → 0.78.
+    assert apply_isotonic_calibration_directional(0.5, "bullish", calibration=cal) == 0.78
+    # Bearish composite uses bearish curve → 0.18.
+    assert apply_isotonic_calibration_directional(-0.5, "bearish", calibration=cal) == 0.18
+
+
+def test_apply_calibration_directional_falls_back_when_direction_missing():
+    from tradingagents.analysis_only.scoring import (
+        apply_isotonic_calibration_directional,
+    )
+    cal = {
+        "fit": [
+            {"x_lower": -1.0, "x_upper": 1.0, "hit_rate": 0.30, "n_obs": 100},
+        ],
+        "by_direction": {
+            # No 'neutral' key → fall back to top-level fit.
+        },
+    }
+    out = apply_isotonic_calibration_directional(0.0, "neutral", calibration=cal)
+    assert out == 0.30
+
+
+def test_apply_calibration_directional_falls_back_on_fallback_subfit():
+    """Even when 'bullish' key exists, if it's fallback=True (undersampled)
+    we should NOT use it — fall back to the top-level curve."""
+    from tradingagents.analysis_only.scoring import (
+        apply_isotonic_calibration_directional,
+    )
+    cal = {
+        "fit": [
+            {"x_lower": -1.0, "x_upper": 1.0, "hit_rate": 0.30, "n_obs": 100},
+        ],
+        "by_direction": {
+            "bullish": {"fit": [], "fallback": True, "fallback_reason": "n<30"},
+        },
+    }
+    out = apply_isotonic_calibration_directional(0.5, "bullish", calibration=cal)
+    assert out == 0.30
+
+
+def test_confidence_for_uses_direction_curve_when_provided():
+    """confidence_for(direction=...) routes through the directional lookup
+    when the calibration has a by_direction block."""
+    cal = {
+        "fit": [{"x_lower": -1.0, "x_upper": 1.0, "hit_rate": 0.50, "n_obs": 100}],
+        "by_direction": {
+            "bullish": {
+                "fit": [{"x_lower": 0.2, "x_upper": 1.0, "hit_rate": 0.85, "n_obs": 60}],
+                "fallback": False,
+            },
+            "bearish": {
+                "fit": [{"x_lower": -1.0, "x_upper": -0.2, "hit_rate": 0.15, "n_obs": 30}],
+                "fallback": False,
+            },
+        },
+    }
+    # Same composite +0.6 — bullish curve says 0.85, top-level says 0.50.
+    bull = confidence_for(0.6, coverage=1.0, calibration=cal, direction="bullish")
+    top  = confidence_for(0.6, coverage=1.0, calibration=cal)  # no direction
+    assert bull == 0.85
+    # Top-level falls back through the directional path too when direction
+    # isn't provided. It picks the all-directions curve → 0.50, then mixes
+    # with coverage 1.0 → 0.50. Bound by floor/cap.
+    assert top == 0.50
+    # Sanity: bear gets the bear-curve hit rate.
+    bear = confidence_for(-0.6, coverage=1.0, calibration=cal, direction="bearish")
+    assert bear == 0.50  # 0.15 floor-clamped to 0.5
+
+
 # ---------- Phase 5 isotonic calibration ----------
 
 
@@ -732,3 +1057,406 @@ def test_confidence_for_uses_calibration_when_supplied():
     assert 0.5 <= calibrated <= 0.95
     # And different from heuristic (we'd be surprised if they coincide exactly).
     assert heuristic != calibrated or cal["fallback"]
+
+
+# ---------- compute_ticker_fear_greed (v1.7) ----------
+
+
+def test_ticker_fear_greed_extreme_fear_when_all_inputs_maxed_fear():
+    out = compute_ticker_fear_greed(
+        iv_rank=0.95,                  # top quintile  -> 10
+        iv_skew=0.20,                  # extreme put-skew -> 10
+        drawdown_from_52w_high=-0.40,  # 40% off high -> 10
+        rsi_14=22.0,                   # oversold -> 10
+        net_flow_notional=-3_000_000,  # heavy put flow -> 10
+    )
+    assert out["status"] == "ok"
+    assert out["available_components"] == 5
+    assert out["rating"] == "extreme_fear"
+    assert out["score"] <= 25.0
+    # All 5 sub-scores should be present.
+    assert set(out["components"].keys()) == {
+        "iv_rank",
+        "iv_skew",
+        "drawdown_from_52w_high",
+        "rsi_14",
+        "net_flow_notional",
+    }
+
+
+def test_ticker_fear_greed_extreme_greed_when_all_inputs_maxed_greed():
+    out = compute_ticker_fear_greed(
+        iv_rank=0.10,                  # bottom quintile -> 90
+        iv_skew=-0.10,                 # strong call-skew -> 90
+        drawdown_from_52w_high=-0.01,  # near 52w high -> 90
+        rsi_14=82.0,                   # overbought -> 90
+        net_flow_notional=3_500_000,   # heavy call flow -> 90
+    )
+    assert out["status"] == "ok"
+    assert out["available_components"] == 5
+    assert out["rating"] == "extreme_greed"
+    assert out["score"] >= 75.0
+
+
+def test_ticker_fear_greed_neutral_when_inputs_mid_range():
+    out = compute_ticker_fear_greed(
+        iv_rank=0.50,                  # mid -> 50
+        iv_skew=0.04,                  # ~normal positive -> 50
+        drawdown_from_52w_high=-0.10,  # 10% drawdown -> 50
+        rsi_14=55.0,                   # constructive -> 60
+        net_flow_notional=0.0,         # mixed -> 50
+    )
+    assert out["status"] == "ok"
+    assert out["available_components"] == 5
+    # Score in [0, 100] and (with these inputs) sits in the neutral
+    # band around 50-55.
+    assert 45.0 <= out["score"] <= 65.0
+    # The exact rating bucket depends on whether the mean lands in
+    # neutral (45..55) or greed (>55); both are acceptable for "mid".
+    assert out["rating"] in {"neutral", "greed"}
+
+
+def test_ticker_fear_greed_missing_components_skipped():
+    # 3 inputs available, 2 missing -> still emits but with only 3 components.
+    out = compute_ticker_fear_greed(
+        iv_rank=0.90,                  # -> 10
+        iv_skew=None,                  # skipped
+        drawdown_from_52w_high=-0.20,  # -> 30
+        rsi_14=None,                   # skipped
+        net_flow_notional=-1_500_000,  # -> 25
+    )
+    assert out["status"] == "ok"
+    assert out["available_components"] == 3
+    assert set(out["components"].keys()) == {
+        "iv_rank",
+        "drawdown_from_52w_high",
+        "net_flow_notional",
+    }
+    # Mean of 10, 30, 25 ≈ 21.67 → extreme_fear.
+    assert out["rating"] == "extreme_fear"
+
+
+def test_ticker_fear_greed_requires_min_components():
+    # Only 2 inputs available -> unavailable.
+    out = compute_ticker_fear_greed(
+        iv_rank=0.50,
+        iv_skew=0.04,
+        drawdown_from_52w_high=None,
+        rsi_14=None,
+        net_flow_notional=None,
+    )
+    assert out["status"] == "unavailable"
+    assert out["available_components"] == 2
+    # The components dict still captures what we did get, for debugging.
+    assert set(out["components"].keys()) == {"iv_rank", "iv_skew"}
+    # Score / rating must NOT be present when unavailable.
+    assert "score" not in out
+    assert "rating" not in out
+
+
+def test_ticker_fear_greed_all_missing_unavailable():
+    out = compute_ticker_fear_greed()
+    assert out["status"] == "unavailable"
+    assert out["available_components"] == 0
+    assert out["components"] == {}
+
+
+def test_ticker_fear_greed_score_bounded_to_unit_range():
+    # Sweep across a few realistic combinations and confirm the score
+    # never escapes [0, 100].
+    cases = [
+        dict(iv_rank=0.0, iv_skew=-0.10, drawdown_from_52w_high=0.0,
+             rsi_14=99.0, net_flow_notional=10_000_000),
+        dict(iv_rank=1.0, iv_skew=0.50, drawdown_from_52w_high=-0.99,
+             rsi_14=0.0, net_flow_notional=-10_000_000),
+        dict(iv_rank=0.6, iv_skew=0.10, drawdown_from_52w_high=-0.12,
+             rsi_14=40.0, net_flow_notional=500_000),
+    ]
+    for kwargs in cases:
+        out = compute_ticker_fear_greed(**kwargs)
+        assert out["status"] == "ok"
+        assert 0.0 <= out["score"] <= 100.0
+
+
+def test_ticker_fear_greed_custom_min_components():
+    # Caller can require all 5 for the strictest acceptance gate.
+    out = compute_ticker_fear_greed(
+        iv_rank=0.5,
+        iv_skew=0.0,
+        drawdown_from_52w_high=-0.05,
+        rsi_14=50.0,
+        net_flow_notional=None,
+        min_components=5,
+    )
+    assert out["status"] == "unavailable"
+    assert out["available_components"] == 4
+
+
+# ---------- score_ticker_fear_greed_regime (v1.7) ----------
+
+
+@pytest.mark.parametrize(
+    "score,expected_score,expected_available",
+    [
+        # v1.8 (2026-06-06): sign INVERTED to classical contrarian after
+        # multi-regime IC analysis (core IC -0.095, 73% sign-cons).
+        # Fear → bullish (mean reversion), greed → bearish (extension).
+        (10.0, 0.4, True),    # extreme fear → bullish
+        (35.0, 0.2, True),    # fear → mild bullish
+        (50.0, 0.0, True),    # neutral
+        (65.0, -0.2, True),   # greed → mild bearish
+        (85.0, -0.4, True),   # extreme greed → bearish
+    ],
+)
+def test_score_ticker_fear_greed_regime_buckets_v1_8(
+    score, expected_score, expected_available
+):
+    actual_score, rationale, available = score_ticker_fear_greed_regime(score)
+    assert actual_score == expected_score
+    assert available is expected_available
+    assert rationale
+
+
+def test_score_ticker_fear_greed_regime_extreme_greed_is_bearish_v1_8():
+    """v1.8: extreme greed (score≥75) maps to −0.4 (extension-risk bearish)."""
+    s, rationale, avail = score_ticker_fear_greed_regime(90.0)
+    assert s == -0.4
+    assert avail is True
+    assert "v1.8 inverted" in rationale
+
+
+def test_score_ticker_fear_greed_regime_extreme_fear_is_bullish_v1_8():
+    """v1.8: extreme fear (score≤25) maps to +0.4 (mean-reversion bullish)."""
+    s, rationale, avail = score_ticker_fear_greed_regime(5.0)
+    assert s == 0.4
+    assert avail is True
+    assert "v1.8 inverted" in rationale
+
+
+def test_score_ticker_fear_greed_regime_unavailable():
+    s, rationale, avail = score_ticker_fear_greed_regime(None)
+    assert s == 0.0
+    assert avail is False
+    assert rationale
+
+
+# ---------- v1.8 weight commit guards ----------
+
+
+def test_ticker_fear_greed_regime_promoted_in_v1_8():
+    """v1.8 (2026-06-06): promoted from 0.00 to 0.02 after multi-regime
+    cohort IC analysis (combined corpus, 10,241 records) showed stable
+    negative IC (-0.095, 73% sign-cons) across both bull and chop regimes.
+    Sign inverted in `score_ticker_fear_greed_regime` at the same time.
+    Conservative weight relative to |IC|."""
+    assert DEFAULT_FACTOR_WEIGHTS["ticker_fear_greed_regime"] == 0.02
+
+
+def _news_item(
+    title: str = "",
+    description: str = "",
+    published_utc: str = "2025-08-20T12:00:00Z",
+    insights: list[dict] | None = None,
+) -> dict:
+    item: dict = {
+        "title": title,
+        "description": description,
+        "published_utc": published_utc,
+    }
+    if insights is not None:
+        item["insights"] = insights
+    return item
+
+
+def test_news_sentiment_weight_present_in_defaults_at_zero():
+    # Section 28 discipline: ship at weight=0 pending IC validation.
+    assert DEFAULT_FACTOR_WEIGHTS.get("news_sentiment") == 0.0
+
+
+def test_compute_news_sentiment_positive_via_insights():
+    items = [
+        _news_item(insights=[{"sentiment": "positive"}], published_utc="2025-08-19T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "positive"}], published_utc="2025-08-20T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "negative"}], published_utc="2025-08-21T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "positive"}], published_utc="2025-08-21T11:00:00Z"),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 4
+    assert out["n_positive"] == 3
+    assert out["n_negative"] == 1
+    assert out["n_with_insights"] == 4
+    assert out["n_keyword_fallback"] == 0
+    assert out["net_sentiment"] == pytest.approx(0.5)
+    assert out["window_end"] == "2025-08-22"
+
+
+def test_compute_news_sentiment_negative_via_insights():
+    items = [
+        _news_item(insights=[{"sentiment": "negative"}], published_utc="2025-08-20T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "negative"}], published_utc="2025-08-20T11:00:00Z"),
+        _news_item(insights=[{"sentiment": "negative"}], published_utc="2025-08-21T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "positive"}], published_utc="2025-08-21T11:00:00Z"),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 4
+    assert out["net_sentiment"] == pytest.approx(-0.5)
+
+
+def test_compute_news_sentiment_neutral_when_balanced():
+    items = [
+        _news_item(insights=[{"sentiment": "positive"}], published_utc="2025-08-20T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "negative"}], published_utc="2025-08-21T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "neutral"}], published_utc="2025-08-21T11:00:00Z"),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 3
+    assert out["n_neutral"] == 1
+    assert out["n_positive"] == 1
+    assert out["n_negative"] == 1
+    assert out["net_sentiment"] == pytest.approx(0.0)
+
+
+def test_compute_news_sentiment_keyword_fallback_when_insights_missing():
+    items = [
+        _news_item(title="Acme beats earnings, raises guidance",
+                   published_utc="2025-08-20T10:00:00Z"),
+        _news_item(title="Acme misses badly, downgrade incoming",
+                   published_utc="2025-08-21T10:00:00Z"),
+        _news_item(title="Acme inks new partnership and growth deal",
+                   published_utc="2025-08-21T11:00:00Z"),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 3
+    assert out["n_with_insights"] == 0
+    assert out["n_keyword_fallback"] == 3
+    # 2 positive + 1 negative → net = +1/3
+    assert out["net_sentiment"] == pytest.approx(0.3333, abs=1e-3)
+    assert out["n_positive"] == 2
+    assert out["n_negative"] == 1
+
+
+def test_compute_news_sentiment_keyword_neutral_no_signal_words():
+    items = [
+        _news_item(title="Acme files report with regulators",
+                   published_utc="2025-08-20T10:00:00Z"),
+        _news_item(title="Acme attends industry conference",
+                   published_utc="2025-08-21T10:00:00Z"),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 2
+    assert out["n_neutral"] == 2
+    assert out["net_sentiment"] == pytest.approx(0.0)
+
+
+def test_compute_news_sentiment_filters_outside_window():
+    items = [
+        _news_item(insights=[{"sentiment": "positive"}],
+                   published_utc="2025-07-01T10:00:00Z"),  # too old
+        _news_item(insights=[{"sentiment": "negative"}],
+                   published_utc="2025-08-21T10:00:00Z"),
+        _news_item(insights=[{"sentiment": "positive"}],
+                   published_utc="2025-09-01T10:00:00Z"),  # in the future
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    # Only the 2025-08-21 article falls inside (2025-08-08, 2025-08-22].
+    assert out["n_articles"] == 1
+    assert out["n_negative"] == 1
+    assert out["net_sentiment"] == pytest.approx(-1.0)
+
+
+def test_compute_news_sentiment_empty_returns_no_articles():
+    out = compute_news_sentiment([], as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 0
+    assert out["net_sentiment"] is None
+    assert out["window_end"] == "2025-08-22"
+
+
+def test_compute_news_sentiment_drops_items_without_timestamps():
+    items = [
+        {"title": "no timestamp", "insights": [{"sentiment": "positive"}]},
+        _news_item(insights=[{"sentiment": "positive"}],
+                   published_utc="2025-08-20T10:00:00Z"),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 1
+
+
+def test_compute_news_sentiment_bad_as_of_returns_no_articles():
+    out = compute_news_sentiment(
+        [_news_item(insights=[{"sentiment": "positive"}])],
+        as_of_date="not-a-date",
+    )
+    assert out["n_articles"] == 0
+    assert out["net_sentiment"] is None
+
+
+def test_compute_news_sentiment_insights_mixed_signs():
+    # Two insights on the same article — net negative within the article.
+    items = [
+        _news_item(
+            insights=[
+                {"sentiment": "positive"},
+                {"sentiment": "negative"},
+                {"sentiment": "negative"},
+            ],
+            published_utc="2025-08-20T10:00:00Z",
+        ),
+    ]
+    out = compute_news_sentiment(items, as_of_date="2025-08-22", lookback_days=14)
+    assert out["n_articles"] == 1
+    assert out["n_negative"] == 1
+    assert out["n_with_insights"] == 1
+
+
+def test_score_news_sentiment_insufficient_articles_not_available():
+    # Default min_articles=3.
+    score, rationale, available = score_news_sentiment(net_score=0.5, n_articles=2)
+    assert score == 0.0
+    assert available is False
+    assert rationale
+
+
+def test_score_news_sentiment_strong_positive():
+    score, rationale, available = score_news_sentiment(net_score=0.6, n_articles=10)
+    assert score == 0.7
+    assert available is True
+    assert "positive" in rationale.lower()
+
+
+def test_score_news_sentiment_mild_positive():
+    score, _r, available = score_news_sentiment(net_score=0.25, n_articles=5)
+    assert score == 0.4
+    assert available is True
+
+
+def test_score_news_sentiment_strong_negative():
+    score, _r, available = score_news_sentiment(net_score=-0.7, n_articles=12)
+    assert score == -0.7
+    assert available is True
+
+
+def test_score_news_sentiment_mild_negative():
+    score, _r, available = score_news_sentiment(net_score=-0.3, n_articles=4)
+    assert score == -0.4
+    assert available is True
+
+
+def test_score_news_sentiment_neutral_band_is_data_available():
+    score, _r, available = score_news_sentiment(net_score=0.1, n_articles=6)
+    assert score == 0.0
+    # Still data_available=True — mixed sentiment is a real signal of "no signal".
+    assert available is True
+
+
+def test_score_news_sentiment_min_articles_override():
+    score, _r, available = score_news_sentiment(
+        net_score=0.6, n_articles=3, min_articles=5,
+    )
+    assert score == 0.0
+    assert available is False
+
+
+def test_score_news_sentiment_none_net_not_available():
+    score, _r, available = score_news_sentiment(net_score=None, n_articles=10)
+    assert score == 0.0
+    assert available is False

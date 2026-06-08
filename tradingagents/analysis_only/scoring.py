@@ -85,9 +85,37 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     # v1.3 (Section 21): promoted from 0.00 to 0.04 after Phase 1 IC
     # validated the placeholder sign: low IV rank → bullish forward
     # returns. Headline IC +0.154 at 20d (n=597); per-ticker median
-    # +0.107, 63.6% sign consistency across 11 tickers. Magnitude
-    # comparable to peer_relative_momentum (weight 0.05).
-    "options_iv_rank": 0.04,
+    # +0.107, 63.6% sign consistency across 11 tickers.
+    #
+    # v1.8 (2026-06-06): reduced 0.04 → 0.02 after multi-regime IC
+    # degradation. Combined corpus core IC = −0.017 with 54% sign-cons
+    # (random); v1.7-only IC also ~0. The Phase 1 +0.107 signal didn't
+    # generalize forward — likely a single-corpus regime artifact.
+    # Cutting weight rather than zeroing pending further evidence;
+    # the factor data path is healthy, just the signal has rotated out.
+    "options_iv_rank": 0.02,
+    # X1 (2026-06-04): Polygon news-sentiment factor. Per-ticker net
+    # sentiment over a trailing 14d window, computed from Polygon's
+    # `insights[].sentiment` classifications with a keyword-based
+    # fallback. Ships at weight=0 pending IC validation on a regenerated
+    # corpus (matches v1.5-v1.7 discipline).
+    "news_sentiment": 0.00,
+    # v1.7: new per-ticker fear/greed composite — aggregates 5 per-ticker
+    # signals (IV rank, 25Δ IV skew, drawdown from 52w high, RSI(14), net
+    # option flow) into a 0-100 score, analogous to CNN's market-wide F&G
+    # but per-ticker. Shipped at weight=0 with momentum-following placeholder
+    # sign pending IC validation.
+    #
+    # v1.8 (2026-06-06): promoted to weight 0.02 + sign INVERTED in
+    # `score_ticker_fear_greed_regime`. Multi-regime cohort IC analysis on
+    # the combined corpus (10,241 records, 4 regimes): core IC −0.095 with
+    # 73% sign-consistency across 26 tickers; canary IC −0.117 (cross-sector
+    # signs agree); v1.7-only matched at −0.102 / 76% — most stable signal
+    # in the v1.8 candidate set. Negative IC + consistent sign + current
+    # placeholder sign was momentum-following → flip to classical contrarian
+    # (fear → bullish via mean reversion, greed → bearish via extension risk).
+    # Conservative 0.02 weight relative to |IC|=0.095.
+    "ticker_fear_greed_regime": 0.02,
 }
 
 
@@ -328,6 +356,474 @@ def score_iv_rank(
     return 0.0, "IV rank in mid range.", True
 
 
+# ---------- News sentiment factor (X1) ----------
+#
+# Keyword fallback lists used when an item lacks Polygon `insights`.
+# Intentionally small + market-flavored — broader lexica add noise on the
+# small-sample windows we score over (≤50 items per ticker).
+_POSITIVE_NEWS_KEYWORDS: tuple[str, ...] = (
+    "beat", "beats", "raise", "raised", "raises", "upgrade", "upgraded",
+    "outperform", "buy rating", "record", "surge", "surged", "rally",
+    "soared", "jumps", "gains", "growth", "profit", "profits",
+    "strong", "wins", "win", "expand", "expansion", "partnership",
+    "approval", "approved", "exceed", "exceeded", "boost",
+    "bullish", "tops", "topped", "breakthrough", "innovation",
+)
+_NEGATIVE_NEWS_KEYWORDS: tuple[str, ...] = (
+    "miss", "misses", "missed", "cut", "cuts", "downgrade", "downgraded",
+    "underperform", "sell rating", "plunge", "plunged", "drop", "dropped",
+    "fall", "fell", "decline", "declined", "loss", "losses",
+    "weak", "lawsuit", "probe", "investigation", "fraud",
+    "warn", "warning", "warned", "delay", "delayed", "halt", "halted",
+    "bearish", "concerns", "fears", "recall", "risk", "risks",
+    "disappointing", "shortfall",
+)
+
+
+def _keyword_sentiment_score(text: str) -> int:
+    """Return positive_hits - negative_hits on a lowercased token-pass."""
+    if not text:
+        return 0
+    lowered = text.lower()
+    pos = sum(1 for kw in _POSITIVE_NEWS_KEYWORDS if kw in lowered)
+    neg = sum(1 for kw in _NEGATIVE_NEWS_KEYWORDS if kw in lowered)
+    return pos - neg
+
+
+def _polygon_insight_sentiment(item: dict[str, Any]) -> int | None:
+    """Map Polygon `insights[].sentiment` to {+1, 0, -1}.
+
+    When an article has multiple insights, take the sign of the sum
+    (positive minus negative count). Returns None when no insight has
+    a usable sentiment string.
+    """
+    insights = item.get("insights")
+    if not isinstance(insights, list) or not insights:
+        return None
+    pos = 0
+    neg = 0
+    seen_any = False
+    for ins in insights:
+        if not isinstance(ins, dict):
+            continue
+        sentiment = ins.get("sentiment")
+        if not isinstance(sentiment, str):
+            continue
+        seen_any = True
+        s = sentiment.strip().lower()
+        if s == "positive":
+            pos += 1
+        elif s == "negative":
+            neg += 1
+        # "neutral" or any other value contributes 0
+    if not seen_any:
+        return None
+    if pos > neg:
+        return 1
+    if neg > pos:
+        return -1
+    return 0
+
+
+def _parse_news_timestamp(value: Any) -> str | None:
+    """Polygon's `published_utc` is RFC3339, e.g. '2025-08-21T13:45:00Z'.
+    Returns the ISO date portion (YYYY-MM-DD) or None on parse failure.
+    """
+    if not isinstance(value, str) or len(value) < 10:
+        return None
+    candidate = value[:10]
+    # cheap shape check
+    if candidate[4] != "-" or candidate[7] != "-":
+        return None
+    return candidate
+
+
+def compute_news_sentiment(
+    news_items: Sequence[dict[str, Any]],
+    as_of_date: str,
+    *,
+    lookback_days: int = 14,
+) -> dict[str, Any]:
+    """Aggregate per-article sentiment into a net score over a trailing window.
+
+    Strategy:
+    - For each article published in (as_of_date - lookback_days, as_of_date],
+      score in {+1, 0, -1}.
+    - Prefer Polygon `insights[].sentiment` when present (publisher-supplied
+      classification). Otherwise fall back to keyword counts on
+      `title + ' ' + description`.
+    - `net_sentiment` = mean of per-article signs, in [-1, 1].
+
+    Returns a dict with `net_sentiment`, `n_articles`, `n_positive`,
+    `n_negative`, `n_neutral`, `n_with_insights`, `n_keyword_fallback`,
+    `window_start`, `window_end`. `net_sentiment` is None when no
+    articles fall inside the window.
+    """
+    # Parse `as_of_date` with stdlib date math (no external imports needed).
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        y, m, d = (int(x) for x in as_of_date.split("-"))
+        end = _date(y, m, d)
+    except Exception:
+        return {
+            "net_sentiment": None,
+            "n_articles": 0,
+            "n_positive": 0,
+            "n_negative": 0,
+            "n_neutral": 0,
+            "n_with_insights": 0,
+            "n_keyword_fallback": 0,
+            "window_start": None,
+            "window_end": as_of_date,
+        }
+    start = end - _td(days=max(1, int(lookback_days)))
+    window_start = start.isoformat()
+
+    n_pos = 0
+    n_neg = 0
+    n_neu = 0
+    n_insight = 0
+    n_keyword = 0
+    n_total = 0
+    for item in news_items or []:
+        if not isinstance(item, dict):
+            continue
+        published_date = _parse_news_timestamp(item.get("published_utc"))
+        if not published_date:
+            continue
+        if published_date <= window_start or published_date > as_of_date:
+            # Strictly inside (window_start, as_of_date] — `> as_of_date`
+            # filter is defense in depth for callers that didn't pre-filter
+            # via Polygon `published_utc.lte`.
+            continue
+        n_total += 1
+        sign = _polygon_insight_sentiment(item)
+        if sign is not None:
+            n_insight += 1
+        else:
+            title = item.get("title") or ""
+            desc = item.get("description") or ""
+            text = f"{title} {desc}".strip()
+            kw = _keyword_sentiment_score(text)
+            if kw > 0:
+                sign = 1
+            elif kw < 0:
+                sign = -1
+            else:
+                sign = 0
+            n_keyword += 1
+        if sign > 0:
+            n_pos += 1
+        elif sign < 0:
+            n_neg += 1
+        else:
+            n_neu += 1
+
+    if n_total == 0:
+        net = None
+    else:
+        net = round((n_pos - n_neg) / n_total, 4)
+
+    return {
+        "net_sentiment": net,
+        "n_articles": n_total,
+        "n_positive": n_pos,
+        "n_negative": n_neg,
+        "n_neutral": n_neu,
+        "n_with_insights": n_insight,
+        "n_keyword_fallback": n_keyword,
+        "window_start": window_start,
+        "window_end": as_of_date,
+    }
+
+
+def score_news_sentiment(
+    net_score: float | None,
+    n_articles: int,
+    *,
+    min_articles: int = 3,
+) -> tuple[float, str, bool]:
+    """Factor score function for the news_sentiment factor.
+
+    Requires ≥`min_articles` (default 3) in the window to emit a non-zero
+    score. Below that threshold the factor is `data_available=False`
+    (score=0) so it doesn't pollute the composite.
+
+    Score band mapping (chosen conservatively — IC will validate):
+       net ≥ +0.50  →  +0.7  (strongly positive)
+       net ≥ +0.20  →  +0.4  (mildly positive)
+       net ≤ -0.50  →  -0.7  (strongly negative)
+       net ≤ -0.20  →  -0.4  (mildly negative)
+       otherwise    →   0.0  (mixed / neutral, but data_available=True)
+    """
+    if n_articles < int(min_articles) or net_score is None:
+        return 0.0, (
+            f"News sentiment unavailable (n={n_articles} < {int(min_articles)})."
+        ), False
+    if net_score >= 0.5:
+        return 0.7, "Strongly positive news sentiment.", True
+    if net_score >= 0.2:
+        return 0.4, "Mildly positive news sentiment.", True
+    if net_score <= -0.5:
+        return -0.7, "Strongly negative news sentiment.", True
+    if net_score <= -0.2:
+        return -0.4, "Mildly negative news sentiment.", True
+    return 0.0, "News sentiment is mixed / neutral.", True
+
+
+# ---------- v1.7 per-ticker fear/greed composite ----------
+#
+# Component sub-scoring discretizes each input into a 0-100 fear/greed
+# sub-score (0 = extreme fear, 100 = extreme greed) using a small number
+# of buckets that mirror the discretization the existing single-input
+# factor scorers use (e.g. `score_iv_rank`, `score_iv_skew`). Aggregating
+# the available sub-scores by simple mean keeps the composite robust to
+# missing components — when a ticker only has 3 of 5 inputs we still
+# emit a meaningful score, but require ≥3 to avoid 1-component noise.
+#
+# Inputs and their fear→greed mapping:
+#   iv_rank (0-1)           : high rank → fear (uncertainty premium up)
+#   iv_skew (~ −0.05..0.20) : high put-skew → fear (tail-risk premium up)
+#   drawdown_from_52w_high  : deep drawdown (negative) → fear
+#                              (positive value means up from low base)
+#   rsi_14 (0-100)          : low → fear, high → greed
+#   net_flow_notional (USD) : call-heavy positive → greed, put-heavy → fear
+
+
+def _bucket_iv_rank_fg(iv_rank: float | None) -> float | None:
+    """Map IV rank ∈ [0, 1] to a 0-100 fear/greed sub-score.
+
+    High IV rank means options are pricing elevated uncertainty -> fear.
+    Buckets mirror `score_iv_rank` (top quintile, mid, bottom 20-40%,
+    bottom quintile).
+    """
+    if iv_rank is None:
+        return None
+    r = float(iv_rank)
+    if r >= 0.80:
+        return 10.0   # extreme fear
+    if r >= 0.60:
+        return 30.0   # fear
+    if r >= 0.40:
+        return 50.0   # neutral
+    if r >= 0.20:
+        return 70.0   # greed
+    return 90.0       # extreme greed (compressed vol)
+
+
+def _bucket_iv_skew_fg(skew: float | None) -> float | None:
+    """Map 25Δ put-call IV skew to a 0-100 fear/greed sub-score.
+
+    Stocks normally show small positive skew (~0.00..0.05). Wide positive
+    skew means puts are priced rich vs calls — tail-risk premium up —
+    fear. Strong negative skew (calls > puts) is upside-chase greed.
+    """
+    if skew is None:
+        return None
+    s = float(skew)
+    if s >= 0.15:
+        return 10.0
+    if s >= 0.08:
+        return 30.0
+    if s >= 0.00:
+        return 50.0
+    if s >= -0.05:
+        return 70.0
+    return 90.0
+
+
+def _bucket_drawdown_fg(drawdown: float | None) -> float | None:
+    """Map drawdown-from-52w-high to a 0-100 fear/greed sub-score.
+
+    `drawdown` is signed and ≤ 0 by construction: 0 = at 52w high,
+    -0.30 = 30% below 52w high. Deeper drawdown → fear. Anything within
+    2% of the high is greed territory.
+    """
+    if drawdown is None:
+        return None
+    d = float(drawdown)
+    if d <= -0.30:
+        return 10.0
+    if d <= -0.15:
+        return 30.0
+    if d <= -0.05:
+        return 50.0
+    if d <= -0.02:
+        return 70.0
+    return 90.0
+
+
+def _bucket_rsi_fg(rsi_14: float | None) -> float | None:
+    """Map RSI(14) ∈ [0, 100] to a 0-100 fear/greed sub-score.
+
+    Bucket boundaries mirror the `momentum_rsi` factor's discretization
+    in pipeline.py (oversold < 30, constructive 45-68, overbought > 75)
+    but in fear/greed space (low RSI = fear, high RSI = greed).
+    """
+    if rsi_14 is None:
+        return None
+    r = float(rsi_14)
+    if r < 30.0:
+        return 10.0
+    if r < 45.0:
+        return 30.0
+    if r <= 68.0:
+        return 60.0
+    if r <= 75.0:
+        return 75.0
+    return 90.0
+
+
+def _bucket_net_flow_fg(net_flow_notional: float | None) -> float | None:
+    """Map net call-put options notional ($) to a 0-100 fear/greed sub-score.
+
+    Threshold ±1M USD mirrors the `options_net_flow` factor in
+    pipeline.py (which fires call-heavy / put-heavy at ±$1M). Strong
+    call-heavy → greed, put-heavy → fear, mixed → neutral.
+    """
+    if net_flow_notional is None:
+        return None
+    v = float(net_flow_notional)
+    if v >= 2_000_000:
+        return 90.0
+    if v >= 1_000_000:
+        return 75.0
+    if v > -1_000_000:
+        return 50.0
+    if v > -2_000_000:
+        return 25.0
+    return 10.0
+
+
+# Rating cutoffs match the CNN F&G convention used by `FearGreedProvider`
+# (extreme fear ≤ 25, fear < 45, neutral 45-55, greed > 55, extreme greed
+# ≥ 75) so downstream code reading the rating string can reuse existing
+# patterns.
+def _rating_for_fg_score(score: float) -> str:
+    if score <= 25.0:
+        return "extreme_fear"
+    if score < 45.0:
+        return "fear"
+    if score <= 55.0:
+        return "neutral"
+    if score < 75.0:
+        return "greed"
+    return "extreme_greed"
+
+
+def compute_ticker_fear_greed(
+    *,
+    iv_rank: float | None = None,
+    iv_skew: float | None = None,
+    drawdown_from_52w_high: float | None = None,
+    rsi_14: float | None = None,
+    net_flow_notional: float | None = None,
+    min_components: int = 3,
+) -> dict[str, Any]:
+    """Aggregate per-ticker fear/greed sub-scores into a composite.
+
+    Inputs are the already-available per-ticker signals from the
+    pipeline:
+      iv_rank                : `key_features.options_iv.iv_rank_252d`
+      iv_skew                : `key_features.options_iv.skew_25d_30d`
+      drawdown_from_52w_high : derived from price history (signed, ≤ 0)
+      rsi_14                 : `key_features.technical.rsi_14`
+      net_flow_notional      : `key_features.options_flow.net_call_put_notional`
+
+    Returns one of:
+      {
+        "status": "ok",
+        "score": <0-100 float>,
+        "rating": "extreme_fear|fear|neutral|greed|extreme_greed",
+        "components": {<name>: <0-100>, ...},  # only available ones
+        "available_components": N,
+      }
+      {
+        "status": "unavailable",
+        "available_components": N,  # 0..(min_components-1)
+        "components": {<name>: <0-100>, ...},
+      }
+
+    Components with `None` input are skipped (not 50.0-defaulted) so a
+    ticker with no options data doesn't get a spurious neutral pull.
+    Requires `>= min_components` available sub-scores to emit a score.
+    """
+    components: dict[str, float] = {}
+    bucketed: list[tuple[str, float | None]] = [
+        ("iv_rank", _bucket_iv_rank_fg(iv_rank)),
+        ("iv_skew", _bucket_iv_skew_fg(iv_skew)),
+        ("drawdown_from_52w_high", _bucket_drawdown_fg(drawdown_from_52w_high)),
+        ("rsi_14", _bucket_rsi_fg(rsi_14)),
+        ("net_flow_notional", _bucket_net_flow_fg(net_flow_notional)),
+    ]
+    for name, sub in bucketed:
+        if sub is not None:
+            components[name] = round(float(sub), 2)
+
+    n_available = len(components)
+    if n_available < min_components:
+        return {
+            "status": "unavailable",
+            "available_components": n_available,
+            "components": components,
+        }
+
+    score = sum(components.values()) / n_available
+    score_clipped = max(0.0, min(100.0, score))
+    return {
+        "status": "ok",
+        "score": round(score_clipped, 2),
+        "rating": _rating_for_fg_score(score_clipped),
+        "components": components,
+        "available_components": n_available,
+    }
+
+
+def score_ticker_fear_greed_regime(
+    score: float | None,
+) -> tuple[float, str, bool]:
+    """Score the per-ticker fear/greed composite into a factor signal.
+
+    **v1.8 (2026-06-06): sign INVERTED from the v1.7 placeholder.** Phase 2
+    multi-regime cohort IC analysis (4,931 v1.7 + 5,310 extended = 10,241
+    records) shows:
+      - Combined core IC = −0.095, 73% sign-cons across 26 tickers.
+      - v1.7-only core IC = −0.102, 76% sign-cons.
+      - Canary cohort IC = −0.117 (cross-sector signs agree).
+
+    Cross-corpus + cross-cohort stable negative IC means the placeholder
+    momentum-following sign (greed → +) was emitting the OPPOSITE of what
+    predicts forward returns. v1.8 commits the classical contrarian
+    mapping: ticker in extreme fear → +0.4 (mean-reversion bullish);
+    extreme greed → -0.4 (extension bearish). Weight bumped from 0.00 to
+    0.02 — small relative to the IC magnitude (0.095) so the bet is
+    proportional to the evidence.
+
+    `score` is the 0-100 ticker F&G composite from `compute_ticker_fear_greed`.
+    """
+    if score is None:
+        return 0.0, "Per-ticker fear/greed composite unavailable.", False
+    s = float(score)
+    if s <= 25.0:
+        return (
+            0.4,
+            "Ticker in extreme fear — contrarian mean-reversion bullish (v1.8 inverted).",
+            True,
+        )
+    if s < 45.0:
+        return 0.2, "Ticker in fear regime — mild contrarian bullish (v1.8 inverted).", True
+    if s >= 75.0:
+        return (
+            -0.4,
+            "Ticker in extreme greed — extension-risk bearish (v1.8 inverted).",
+            True,
+        )
+    if s > 55.0:
+        return -0.2, "Ticker in greed regime — mild extension-risk bearish (v1.8 inverted).", True
+    return 0.0, "Ticker fear/greed composite neutral.", True
+
+
 def direction_for_composite(
     composite_score: float,
     threshold: float = 0.15,
@@ -365,6 +861,7 @@ def confidence_for(
     slope: float = 0.45,
     cap: float = 0.95,
     calibration: dict[str, Any] | None = None,
+    direction: str | None = None,
 ) -> float:
     """Map composite + coverage to a calibrated confidence in [floor, cap].
 
@@ -377,12 +874,23 @@ def confidence_for(
     that instead of the heuristic formula. Coverage is still mixed in
     multiplicatively as a sanity weight: low coverage should pull the
     confidence toward 0.5 even when the calibrated hit-rate is high.
+
+    Section 29 (direction-conditional): when `calibration` contains a
+    `by_direction` block and `direction` is provided, use the
+    direction-specific curve. Bearish bucket is anti-predictive in this
+    corpus (Section 14/15) — directional lookup exposes that asymmetry
+    in the emitted confidence values.
     """
     coverage = max(0.0, min(1.0, coverage))
     if calibration:
-        calibrated = apply_isotonic_calibration(
-            composite_score, calibration=calibration,
-        )
+        if direction is not None and (calibration.get("by_direction") or {}):
+            calibrated = apply_isotonic_calibration_directional(
+                composite_score, direction, calibration=calibration,
+            )
+        else:
+            calibrated = apply_isotonic_calibration(
+                composite_score, calibration=calibration,
+            )
         if calibrated is not None:
             adjusted = 0.5 + (calibrated - 0.5) * coverage
             return round(max(floor, min(cap, adjusted)), 2)
@@ -483,6 +991,74 @@ def fit_isotonic_calibration(
         "fit": fit_segments,
         "fallback": False,
     }
+
+
+def fit_isotonic_calibration_by_direction(
+    composite_scores: Sequence[float],
+    realized_hits: Sequence[int | bool],
+    directions: Sequence[str],
+    *,
+    min_obs_per_direction: int = 30,
+) -> dict[str, Any]:
+    """Fit per-direction isotonic curves (bullish / bearish / neutral).
+
+    Section 14/15 found that bearish calls are anti-predictive in this
+    corpus (~33% hit vs 50% base rate). A single calibration curve
+    averages over directions and obscures that asymmetry. Fitting
+    separately exposes the structure: the bearish curve will likely be
+    nearly flat (low confidence everywhere), the bullish curve will
+    show the meaningful rising slope, and neutral lives at the base
+    rate.
+
+    Output extends the single-direction calibration JSON with a
+    ``by_direction`` block. Apps that use `apply_isotonic_calibration`
+    (single-curve) still work — the top-level ``fit`` field carries the
+    all-directions curve as the fallback.
+    """
+    if not (len(composite_scores) == len(realized_hits) == len(directions)):
+        raise ValueError("composite_scores / realized_hits / directions length mismatch")
+    out: dict[str, Any] = fit_isotonic_calibration(
+        composite_scores, realized_hits, min_obs=min_obs_per_direction,
+    )
+    out["method"] = "isotonic_pav_by_direction"
+    out["version"] = 2
+    by_dir: dict[str, Any] = {}
+    for dirn in ("bullish", "bearish", "neutral"):
+        sub_scores: list[float] = []
+        sub_hits: list[int | bool] = []
+        for s, h, d in zip(composite_scores, realized_hits, directions):
+            if d == dirn:
+                sub_scores.append(float(s))
+                sub_hits.append(h)
+        by_dir[dirn] = fit_isotonic_calibration(
+            sub_scores, sub_hits, min_obs=min_obs_per_direction,
+        )
+    out["by_direction"] = by_dir
+    return out
+
+
+def apply_isotonic_calibration_directional(
+    composite_score: float,
+    direction: str | None,
+    *,
+    calibration: dict[str, Any],
+) -> float | None:
+    """Look up calibrated hit-rate using direction-conditional curve.
+
+    Prefers `calibration["by_direction"][direction]` when populated and
+    not fallback. Falls back to the top-level `calibration` if the
+    direction-specific curve is missing / undersampled. Returns None on
+    total cache miss.
+    """
+    if calibration is None:
+        return None
+    by_dir = calibration.get("by_direction") or {}
+    sub = by_dir.get(direction) if direction else None
+    if sub and sub.get("fit") and not sub.get("fallback"):
+        v = apply_isotonic_calibration(composite_score, calibration=sub)
+        if v is not None:
+            return v
+    return apply_isotonic_calibration(composite_score, calibration=calibration)
 
 
 def apply_isotonic_calibration(
@@ -612,6 +1188,136 @@ REGIME_TREND_ON = "trend_on"
 REGIME_CHOP = "chop"
 REGIME_UNKNOWN = "unknown"
 VIX_CALM_THRESHOLD = 20.0
+
+
+# Per-regime sign multipliers for factors where the chop-cohort IC fit
+# (Priority #1, `backtest/results/v1_7_regime/`) disagreed in SIGN with the
+# global v1.6 weights. Wholesale weight replacement failed the +0.5pp gate
+# (the chop fit's magnitudes were noisy on a single corpus), but the SIGN
+# disagreement on a handful of well-established factors is robust to that
+# noise: in chop, these factors show clear OPPOSITE-direction predictive
+# power vs trend_on. So the conservative v1.7 commit is sign-flip only,
+# magnitudes unchanged.
+#
+# Selection criteria (all three must hold):
+#   1. Chop-regime IC magnitude >= 0.13 (strong signal in chop).
+#   2. Sign of chop IC DISAGREES with sign of current weight (in trend_on
+#      this factor predicts +; in chop it predicts −).
+#   3. NOT a trend factor — chop "trends fail" intuition is real but a
+#      wholesale trend-factor flip is too aggressive on one corpus.
+#
+# Three factors qualify per `/tmp/regime_weights_v1_5.json`:
+#   - `market_fear_greed_regime`: chop IC −0.17 vs trend_on commit +0.05
+#     (v1.4 momentum-following inverted on trend_on; chop wants the
+#      original contrarian story back — fear → bullish in chop).
+#   - `fund_profit_margins`: chop IC −0.17 vs trend_on +0.08
+#     (high-margin names mean-revert in chop).
+#   - `options_iv_rank`: chop IC −0.14 vs trend_on +0.04
+#     (low IV = complacency = bullish in trend_on; in chop, low IV =
+#      regime expansion incoming = bearish).
+#
+# Applied AFTER weight resolution but BEFORE compute_composite by
+# `apply_regime_to_factor_scores`. Walk-forward gated before commit.
+REGIME_SIGN_FLIPS: dict[str, dict[str, int]] = {
+    REGIME_CHOP: {
+        "market_fear_greed_regime": -1,
+        "fund_profit_margins": -1,
+        "options_iv_rank": -1,
+    },
+    # REGIME_TREND_ON: {} — global weights already trend_on-tuned.
+    # REGIME_UNKNOWN: {} — fall back to global weights when classifier can't decide.
+}
+
+
+def direction_for_composite_regime_gated(
+    composite_score: float,
+    *,
+    threshold: float = 0.15,
+    regime: str | None = None,
+    fear_greed_score: float | None = None,
+    fear_greed_bearish_threshold: float = -0.2,
+    bullish_threshold: float | None = None,
+    bearish_threshold: float | None = None,
+) -> str:
+    """`direction_for_composite` with a bear-side regime gate.
+
+    Bearish calls in this corpus hit ~33% (anti-predictive vs 50% base
+    rate; Section 14/15 finding). The default direction logic emits
+    bearish whenever composite < −threshold. This gate keeps bullish
+    and neutral logic untouched, but DOWNGRADES bearish candidates to
+    neutral unless BOTH:
+      - regime is `chop` (not `trend_on`)
+      - `fear_greed_score` is fear or extreme_fear (post v1.4 inversion
+        that maps to score ≤ −0.2)
+
+    When regime is None or `unknown`, no gate is applied — fall back to
+    standard behavior so we don't silently change behavior on records
+    that pre-date the regime classifier.
+    """
+    direction = direction_for_composite(
+        composite_score,
+        threshold=threshold,
+        bullish_threshold=bullish_threshold,
+        bearish_threshold=bearish_threshold,
+    )
+    if direction != "bearish":
+        return direction
+    # Bearish candidate — apply the gate
+    if regime is None or regime == REGIME_UNKNOWN:
+        return direction
+    if regime == REGIME_CHOP:
+        if fear_greed_score is not None and fear_greed_score <= fear_greed_bearish_threshold:
+            return direction
+    return "neutral"
+
+
+def apply_regime_to_factor_scores(
+    factor_scores: list[dict[str, Any]],
+    weights: dict[str, float],
+    regime: str,
+) -> list[dict[str, Any]]:
+    """Return factor_scores with regime-conditional sign flips applied.
+
+    For each factor in `REGIME_SIGN_FLIPS[regime]`, negate its score AND
+    recompute `weighted_score = score × weight` (since `weighted_score`
+    is pre-computed at emission time in `pipeline.add_factor`, not by
+    `compute_composite`). The rationale string is appended with the flip
+    annotation so downstream renderers / debugging can trace the change.
+
+    Returns a NEW list — does NOT mutate `factor_scores`. Records with
+    `data_available=False` are left untouched (no point flipping a zero
+    score).
+
+    See `REGIME_SIGN_FLIPS` for the selection criteria and source data.
+    """
+    flips = REGIME_SIGN_FLIPS.get(regime, {})
+    if not flips:
+        return factor_scores
+    out: list[dict[str, Any]] = []
+    for f in factor_scores:
+        name = f.get("factor")
+        if name in flips and f.get("data_available", True) and f.get("score") is not None:
+            flipped = dict(f)
+            try:
+                new_score = -float(f["score"]) * flips[name] / abs(flips[name])
+            except (TypeError, ValueError):
+                out.append(f)
+                continue
+            # The sign multiplier is ±1; equivalent to: new_score = -score
+            # when flip=-1. Kept arithmetic explicit so future +1 entries
+            # (no-op safeguards) work without special-casing.
+            new_score = float(f["score"]) * flips[name]
+            flipped["score"] = round(new_score, 6)
+            weight = float(weights.get(name, 0.0))
+            flipped["weighted_score"] = round(new_score * weight, 6)
+            rationale = f.get("rationale") or ""
+            flipped["rationale"] = (
+                f"{rationale} [regime={regime}: sign flipped per Phase-4 IC]"
+            )
+            out.append(flipped)
+        else:
+            out.append(f)
+    return out
 
 
 def regime_for_market_context(

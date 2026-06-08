@@ -450,6 +450,39 @@ def build_review_prompt(
     return prompt, payload
 
 
+def report_context_from_payload(report: dict[str, Any]) -> dict[str, Any]:
+    """Build the report-review context from a saved analysis report payload."""
+    key_features = report.get("key_features") or {}
+    scoring = key_features.get("model_scoring") or {}
+    factor_scores = scoring.get("factor_scores") or []
+    top_factors = sorted(
+        (f for f in factor_scores if isinstance(f, dict) and f.get("data_available")),
+        key=lambda f: abs(f.get("weighted_score") or 0.0),
+        reverse=True,
+    )[:12]
+    return {
+        "symbol": report.get("symbol"),
+        "as_of_date": report.get("as_of_date"),
+        "direction": report.get("direction"),
+        "confidence": report.get("confidence"),
+        "composite_score": scoring.get("composite_score"),
+        "coverage": (report.get("data_quality") or {}).get("scoring_coverage"),
+        "pillar_scores": scoring.get("pillar_scores") or {},
+        "top_factors": top_factors,
+        "technicals": key_features.get("technical") or {},
+        "fundamentals": key_features.get("fundamental") or {},
+        "options_flow": key_features.get("options_flow") or {},
+        "market_context": key_features.get("market_context") or {},
+        "industry_context": key_features.get("industry_context") or {},
+        "competitor_summary": (
+            (key_features.get("competitor_analysis") or {}).get("summary") or {}
+        ),
+        "risk_flags": report.get("risk_flags") or [],
+        "earnings_calendar": key_features.get("earnings_calendar") or {},
+        "data_quality": report.get("data_quality") or {},
+    }
+
+
 def _extract_graph_state(
     *,
     context: dict[str, Any],

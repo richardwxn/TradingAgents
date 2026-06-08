@@ -1,19 +1,15 @@
 """Phase 6: evaluate the LLM critic against the corpus.
 
-Computes the three metrics gated in the Accuracy Ladder plan:
-  1. Standalone Spearman IC of each critic field vs forward returns.
+Computes critic metrics against direction-signed forward returns:
+  1. Standalone Spearman IC of each critic field.
   2. Incremental Spearman IC of each critic field vs the residual of
-     `forward_return ~ composite_score` (i.e., what's left after the
-     composite has been explained away).
-  3. Veto efficacy: average realized direction-signed loss (and hit
-     rate) on the records the critic vetoed, vs the same records with
-     veto ignored — measures whether the veto reduces realized loss.
+     `signed_forward_return ~ composite_score`.
+  3. Legacy veto efficacy when old v1.0 veto fields are present.
 
 Ships the result as `backtest/results/critic_eval.{json,md}` plus
-stdout. Phase 6 gate (per plan):
-  - Incremental IC > 0.03 on walk-forward OOS slice (any horizon).
-  - Veto, when fired, reduces realized loss in negative-return cases
-    by >= 20% vs no-veto baseline.
+stdout. Phase 6 gate:
+  - v1.1-compatible expected-sign incremental IC > 0.03 on walk-forward
+    OOS at ret_20d or ret_60d, with at least 500 critic-covered records.
 """
 from __future__ import annotations
 
@@ -35,6 +31,9 @@ from tradingagents.analysis_only.backtest import (  # noqa: E402
 from tradingagents.analysis_only.scoring import (  # noqa: E402
     _spearman_pairwise,
 )
+
+
+PHASE6_GATE_HORIZONS = ("ret_20d", "ret_60d")
 
 
 def _olst_residuals(
@@ -82,6 +81,17 @@ def _olst_residuals_two(
     return [y[i] - (a + b1 * x1[i] + b2 * x2[i]) for i in range(n)]
 
 
+def _direction_signed_return(record, horizon: str) -> float | None:
+    ret = record.forward_returns.get(horizon)
+    if ret is None:
+        return None
+    if record.direction == "bullish":
+        return float(ret)
+    if record.direction == "bearish":
+        return -float(ret)
+    return None
+
+
 def _stats_for_critic_field(
     records: list,
     *,
@@ -96,7 +106,7 @@ def _stats_for_critic_field(
         if v is None:
             continue
         comp = r.composite_score
-        ret = r.forward_returns.get(horizon)
+        ret = _direction_signed_return(r, horizon)
         if comp is None or ret is None:
             continue
         paired.append((float(v), float(comp), float(ret)))
@@ -144,7 +154,7 @@ def _stats_for_disagreement_field(
         if v is None:
             continue
         comp = r.composite_score
-        ret = r.forward_returns.get(horizon)
+        ret = _direction_signed_return(r, horizon)
         if comp is None or ret is None:
             continue
         critic_inv = (
@@ -249,6 +259,59 @@ def _veto_efficacy(records: list, *, horizon: str) -> dict:
     return out
 
 
+def _phase6_gate_evaluation(
+    horizons: dict,
+    *,
+    min_n: int,
+    threshold: float,
+) -> tuple[bool, list[dict], dict | None, list[str]]:
+    candidates: list[dict] = []
+    for horizon in PHASE6_GATE_HORIZONS:
+        fields = horizons.get(horizon) or {}
+        inv = fields.get("invalidation_prob_30d") or {}
+        conf = fields.get("confidence_adjustment") or {}
+        inv_ic = inv.get("ic_incremental")
+        conf_ic = conf.get("ic_incremental")
+        if inv.get("n", 0) >= min_n and inv_ic is not None:
+            candidates.append({
+                "horizon": horizon,
+                "field": "invalidation_prob_30d",
+                "n": inv.get("n"),
+                "ic_incremental": inv_ic,
+                "expected_signed_ic": -float(inv_ic),
+                "expected_direction": "negative",
+            })
+        if conf.get("n", 0) >= min_n and conf_ic is not None:
+            candidates.append({
+                "horizon": horizon,
+                "field": "confidence_adjustment",
+                "n": conf.get("n"),
+                "ic_incremental": conf_ic,
+                "expected_signed_ic": float(conf_ic),
+                "expected_direction": "positive",
+            })
+    best = max(candidates, key=lambda c: c["expected_signed_ic"], default=None)
+    gate_pass = bool(best is not None and best["expected_signed_ic"] > threshold)
+    if best is None:
+        notes = [
+            "no ret_20d/ret_60d critic field met the minimum OOS sample count "
+            f"({min_n}) with a computable incremental IC",
+        ]
+    else:
+        notes = [
+            f"expected-sign incremental IC gate (>{threshold}): "
+            f"{'PASS' if gate_pass else 'FAIL'}",
+            (
+                f"best={best['horizon']} {best['field']} "
+                f"n={best['n']} ic={best['ic_incremental']} "
+                f"expected_signed_ic={best['expected_signed_ic']:.4f}"
+            ),
+            "legacy veto efficacy is reported for old records but is not part "
+            "of the v1.1 gate",
+        ]
+    return gate_pass, candidates, best, notes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reports-glob", default="reports/analysis_mvp/*.json")
@@ -274,7 +337,7 @@ def main() -> int:
     parser.add_argument("--wf-min-n", type=int, default=50)
     parser.add_argument("--wf-min-abs-ic", type=float, default=0.05)
     parser.add_argument("--incremental-ic-gate", type=float, default=0.03)
-    parser.add_argument("--loss-reduction-gate", type=float, default=0.20)
+    parser.add_argument("--min-critic-oos-n", type=int, default=500)
     parser.add_argument(
         "--disagreement-ic-gate", type=float, default=0.02,
         help="Phase 7 gate: incremental IC of llm_disagreement vs composite + critic.",
@@ -325,7 +388,8 @@ def main() -> int:
         "disagreement": {},
         "gates": {
             "incremental_ic_threshold": args.incremental_ic_gate,
-            "loss_reduction_threshold": args.loss_reduction_gate,
+            "min_critic_oos_n": args.min_critic_oos_n,
+            "phase6_horizons": list(PHASE6_GATE_HORIZONS),
             "disagreement_ic_threshold": args.disagreement_ic_gate,
         },
     }
@@ -355,36 +419,20 @@ def main() -> int:
             ),
         }
 
-    # Phase 6 gate evaluation
-    primary = args.primary_horizon
-    if primary not in summary["horizons"]:
-        summary["gate_pass"] = False
-        summary["gate_notes"] = [
-            f"primary horizon {primary} not in {horizons_str}",
-        ]
-    else:
-        inv = (summary["horizons"][primary]
-               .get("invalidation_prob_30d") or {})
-        conf = (summary["horizons"][primary]
-                .get("confidence_adjustment") or {})
-        veto = summary["veto"].get(primary) or {}
-        ic_passes = max(
-            abs((inv.get("ic_incremental") or 0.0)),
-            abs((conf.get("ic_incremental") or 0.0)),
-        ) > args.incremental_ic_gate
-        loss_red = veto.get("loss_reduction_ratio")
-        veto_passes = (
-            loss_red is not None and loss_red >= args.loss_reduction_gate
-        )
-        summary["gate_pass"] = bool(ic_passes and veto_passes)
-        summary["gate_notes"] = [
-            f"incremental IC gate (>{args.incremental_ic_gate}): "
-            f"{'PASS' if ic_passes else 'FAIL'}",
-            f"veto loss-reduction gate (>={args.loss_reduction_gate}): "
-            f"{'PASS' if veto_passes else 'FAIL'}",
-        ]
+    # Phase 6 gate evaluation. v1.1 critic removed the stale veto bit, so the
+    # production gate uses expected-sign incremental IC only.
+    gate_pass, phase6_candidates, best, gate_notes = _phase6_gate_evaluation(
+        summary["horizons"],
+        min_n=args.min_critic_oos_n,
+        threshold=args.incremental_ic_gate,
+    )
+    summary["phase6_gate_candidates"] = phase6_candidates
+    summary["phase6_best_candidate"] = best
+    summary["gate_pass"] = gate_pass
+    summary["gate_notes"] = gate_notes
 
     # Phase 7 disagreement gate evaluation (gated on n_with_disagreement > 0)
+    primary = args.primary_horizon
     dis_primary = summary["disagreement"].get(primary, {})
     if summary["n_with_disagreement"] == 0:
         summary["disagreement_gate_pass"] = None
