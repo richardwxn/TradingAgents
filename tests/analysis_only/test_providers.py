@@ -598,6 +598,128 @@ def test_polygon_daily_aggs_http_error_returns_empty(monkeypatch):
         logger=log,
     )
     assert out.empty
+
+
+# ---------- Polygon grouped-aggs cache (Future-work #6) ----------
+
+
+from tradingagents.analysis_only.providers import (  # noqa: E402
+    fetch_polygon_grouped_aggs_cached,
+    reset_polygon_grouped_aggs_cache,
+)
+
+
+def _grouped_aggs_payload(date_iso="2024-06-21"):
+    return {
+        "results": [
+            {"T": "SPY", "o": 540.0, "h": 545.0, "l": 538.0, "c": 543.0, "v": 1e7},
+            {"T": "QQQ", "o": 480.0, "h": 485.0, "l": 478.0, "c": 483.0, "v": 9e6},
+            {"T": "NVDA", "o": 130.0, "h": 132.0, "l": 128.0, "c": 131.0, "v": 5e8},
+        ]
+    }
+
+
+def test_polygon_grouped_aggs_cache_dedupes_repeat_dates(monkeypatch):
+    reset_polygon_grouped_aggs_cache()
+    calls = {"n": 0}
+
+    def fake_loader(date_iso, api_key, logger):
+        calls["n"] += 1
+        return {r["T"]: r for r in _grouped_aggs_payload()["results"]}
+
+    monkeypatch.setattr(
+        _polygon_providers, "_load_polygon_grouped_aggs", fake_loader,
+    )
+    a = fetch_polygon_grouped_aggs_cached("2024-06-21", "key")
+    b = fetch_polygon_grouped_aggs_cached("2024-06-21", "key")
+    c = fetch_polygon_grouped_aggs_cached("2024-06-21", "key")
+    assert calls["n"] == 1
+    assert a is b is c  # same cached dict identity
+    assert a["SPY"]["c"] == 543.0
+
+
+def test_polygon_grouped_aggs_distinct_dates_fetch_independently(monkeypatch):
+    reset_polygon_grouped_aggs_cache()
+    calls: list[str] = []
+
+    def fake_loader(date_iso, api_key, logger):
+        calls.append(date_iso)
+        return {"NVDA": {"T": "NVDA", "c": 100.0 + len(calls)}}
+
+    monkeypatch.setattr(
+        _polygon_providers, "_load_polygon_grouped_aggs", fake_loader,
+    )
+    fetch_polygon_grouped_aggs_cached("2024-06-19", "k")
+    fetch_polygon_grouped_aggs_cached("2024-06-20", "k")
+    fetch_polygon_grouped_aggs_cached("2024-06-21", "k")
+    fetch_polygon_grouped_aggs_cached("2024-06-19", "k")  # cache hit
+    assert calls == ["2024-06-19", "2024-06-20", "2024-06-21"]
+
+
+def test_polygon_grouped_aggs_weekend_empty_is_cached(monkeypatch):
+    """A weekend/holiday legitimately returns zero rows. Cache it so we
+    don't re-fetch — distinct from the per-symbol cache which DOES retry
+    empty results."""
+    reset_polygon_grouped_aggs_cache()
+    calls = {"n": 0}
+
+    def fake_loader(date_iso, api_key, logger):
+        calls["n"] += 1
+        return {}  # weekend
+
+    monkeypatch.setattr(
+        _polygon_providers, "_load_polygon_grouped_aggs", fake_loader,
+    )
+    fetch_polygon_grouped_aggs_cached("2024-06-22", "k")  # Saturday
+    fetch_polygon_grouped_aggs_cached("2024-06-22", "k")  # cache hit
+    fetch_polygon_grouped_aggs_cached("2024-06-22", "k")
+    assert calls["n"] == 1
+
+
+def test_polygon_grouped_aggs_no_api_key_returns_empty():
+    reset_polygon_grouped_aggs_cache()
+    log = logging.getLogger("test_grouped_no_key")
+    out = _polygon_providers._load_polygon_grouped_aggs(
+        "2024-06-21", api_key="", logger=log,
+    )
+    assert out == {}
+
+
+def test_polygon_grouped_aggs_parses_response(monkeypatch):
+    reset_polygon_grouped_aggs_cache()
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return _grouped_aggs_payload()
+
+    monkeypatch.setattr(
+        _polygon_providers.requests, "get", lambda *a, **kw: _Resp(),
+    )
+    log = logging.getLogger("test_grouped_parse")
+    out = _polygon_providers._load_polygon_grouped_aggs(
+        "2024-06-21", api_key="key", logger=log,
+    )
+    assert set(out.keys()) == {"SPY", "QQQ", "NVDA"}
+    assert out["NVDA"]["c"] == 131.0
+
+
+def test_polygon_grouped_aggs_http_error_returns_empty(monkeypatch):
+    class _FakeResp:
+        def raise_for_status(self):
+            raise RuntimeError("HTTP 500")
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(
+        _polygon_providers.requests, "get", lambda *a, **kw: _FakeResp(),
+    )
+    log = logging.getLogger("test_grouped_err")
+    out = _polygon_providers._load_polygon_grouped_aggs(
+        "2024-06-21", api_key="dummy", logger=log,
+    )
+    assert out == {}
+
+
 # ---------- SECFilingsProvider ----------
 
 
@@ -836,3 +958,151 @@ def test_sec_unknown_ticker_returns_none(monkeypatch):
     p = SECFilingsProvider(user_agent="TestUA test@example.com")
     out = p.get_latest_filing("ZZZZ", as_of_date="2024-06-21")
     assert out is None
+
+
+# ---------- Polygon news cache (X1) ----------
+
+
+from tradingagents.analysis_only.providers import (  # noqa: E402
+    PolygonNewsProvider,
+    reset_polygon_news_cache,
+)
+
+
+class _NewsFakeResponse:
+    def __init__(self, payload, *, status_code: int = 200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"http {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+class _NewsFakeSession:
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+        self.calls: list[dict] = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append({"url": url, "params": dict(params or {}), "timeout": timeout})
+        if not self._payloads:
+            return _NewsFakeResponse({"results": []})
+        payload = self._payloads.pop(0)
+        if isinstance(payload, Exception):
+            raise payload
+        return _NewsFakeResponse(payload)
+
+
+@pytest.fixture(autouse=True)
+def _clear_polygon_news_cache():
+    reset_polygon_news_cache()
+    yield
+    reset_polygon_news_cache()
+
+
+def test_polygon_news_no_api_key_returns_empty(monkeypatch):
+    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    provider = PolygonNewsProvider(api_key="")
+    assert provider.get_news("NVDA") == []
+
+
+def test_polygon_news_passes_pit_filter():
+    session = _NewsFakeSession([{"results": [{"title": "AAA", "published_utc": "2025-08-21T13:00:00Z"}]}])
+    provider = PolygonNewsProvider(api_key="key", session=session)
+    out = provider.get_news(
+        "NVDA", limit=50, published_before="2025-08-22T23:59:59Z",
+    )
+    assert len(out) == 1
+    assert session.calls, "expected http call"
+    params = session.calls[0]["params"]
+    assert params["ticker"] == "NVDA"
+    assert params["limit"] == 50
+    assert params["published_utc.lte"] == "2025-08-22T23:59:59Z"
+    assert params["apiKey"] == "key"
+
+
+def test_polygon_news_caches_repeat_calls():
+    payload = {"results": [
+        {"title": "T1", "published_utc": "2025-08-21T13:00:00Z"},
+        {"title": "T2", "published_utc": "2025-08-21T14:00:00Z"},
+    ]}
+    session = _NewsFakeSession([payload, payload])
+    provider = PolygonNewsProvider(api_key="key", session=session)
+    first = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    second = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert first == second
+    # Only the first call should hit the network; the second is cached.
+    assert len(session.calls) == 1
+
+
+def test_polygon_news_cache_keyed_on_inputs():
+    session = _NewsFakeSession([
+        {"results": [{"title": "A", "published_utc": "2025-08-20T10:00:00Z"}]},
+        {"results": [{"title": "B", "published_utc": "2025-08-21T10:00:00Z"}]},
+        {"results": [{"title": "C", "published_utc": "2025-08-21T11:00:00Z"}]},
+    ])
+    provider = PolygonNewsProvider(api_key="key", session=session)
+    # Different `published_before` → different cache slot → distinct HTTP call.
+    provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    provider.get_news("NVDA", limit=50, published_before="2025-08-23T23:59:59Z")
+    # Different symbol → different cache slot.
+    provider.get_news("AAPL", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert len(session.calls) == 3
+
+
+def test_polygon_news_cache_returns_independent_copy():
+    payload = {"results": [{"title": "A", "published_utc": "2025-08-21T10:00:00Z"}]}
+    session = _NewsFakeSession([payload])
+    provider = PolygonNewsProvider(api_key="key", session=session)
+    first = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    first.clear()  # mutate the returned list; cache must NOT be affected
+    second = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert len(second) == 1
+
+
+def test_polygon_news_http_error_returns_empty_and_caches():
+    session = _NewsFakeSession([RuntimeError("boom")])
+    provider = PolygonNewsProvider(api_key="key", session=session)
+    out = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert out == []
+    # The failure path also writes a cache entry (empty list) — second call
+    # is a cache hit, no second HTTP call.
+    out2 = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert out2 == []
+    assert len(session.calls) == 1
+
+
+def test_polygon_news_parses_insights_and_description():
+    payload = {"results": [
+        {
+            "title": "NVDA beats estimates",
+            "description": "Q2 EPS topped expectations.",
+            "published_utc": "2025-08-21T13:00:00Z",
+            "insights": [
+                {"ticker": "NVDA", "sentiment": "positive"}
+            ],
+        },
+    ]}
+    session = _NewsFakeSession([payload])
+    provider = PolygonNewsProvider(api_key="key", session=session)
+    out = provider.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert out[0]["title"] == "NVDA beats estimates"
+    assert out[0]["insights"][0]["sentiment"] == "positive"
+    assert out[0]["description"] == "Q2 EPS topped expectations."
+
+
+def test_reset_polygon_news_cache_clears_entries():
+    payload = {"results": [{"title": "A", "published_utc": "2025-08-21T10:00:00Z"}]}
+    session1 = _NewsFakeSession([payload])
+    provider1 = PolygonNewsProvider(api_key="key", session=session1)
+    provider1.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")
+    assert len(session1.calls) == 1
+
+    reset_polygon_news_cache()
+    session2 = _NewsFakeSession([payload])
+    provider2 = PolygonNewsProvider(api_key="key", session=session2)
+    provider2.get_news("NVDA", limit=50, published_before="2025-08-22T23:59:59Z")

@@ -43,6 +43,23 @@ risk_limits:
   max_portfolio_beta: 1.60        # cash-drag-inclusive weighted-avg beta
   max_pair_correlation: 0.85      # cap correlated secondary names vs the largest holding
 
+# Same-day sector shock circuit breaker. If a mapped sector ETF drops at
+# least drop_pct during the current session, new buys in that sector are
+# stood down and existing-position target sizes are cut. This is meant for
+# shock days such as broad semiconductor selloffs where the weekly/swing
+# composite may still be bullish but execution should wait.
+sector_shock_guard:
+  enabled: true
+  drop_pct: 0.03                  # trigger when sector ETF is down 3% or more
+  new_buy_size_factor: 0.0        # 0 = no fresh buys in a shocked sector
+  existing_position_size_factor: 0.5
+  etfs:
+    Semiconductors: SOXX
+    Photonics: SOXX
+    Tech-MegaCap: XLK
+    Software: IGV
+    Networking: XLK
+
 universe:
   - NVDA
   - AMD

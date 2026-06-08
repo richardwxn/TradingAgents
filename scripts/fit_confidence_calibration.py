@@ -33,6 +33,7 @@ from tradingagents.analysis_only.scoring import (  # noqa: E402
     brier_score,
     confidence_for,
     fit_isotonic_calibration,
+    fit_isotonic_calibration_by_direction,
     reliability_diagram,
     save_isotonic_calibration,
 )
@@ -112,6 +113,7 @@ def main() -> int:
     composites: list[float] = []
     hits: list[int] = []
     coverages: list[float] = []
+    directions: list[str] = []
     for r in records:
         if r.composite_score is None:
             continue
@@ -121,6 +123,7 @@ def main() -> int:
             continue
         composites.append(float(r.composite_score))
         hits.append(hit)
+        directions.append(str(r.direction or "neutral").lower())
         # Coverage approximation: assume 1.0 unless we can derive it
         # from factor_scores (which we do here for honesty).
         if r.factor_scores:
@@ -144,11 +147,26 @@ def main() -> int:
         )
         return 1
 
-    cal = fit_isotonic_calibration(
-        composites, hits, min_obs=args.min_obs,
+    # Section 29: produce a direction-conditional calibration. Output
+    # retains the top-level `fit` (all-directions curve) as a fallback
+    # AND adds `by_direction` with separate curves per direction. The
+    # bearish curve is expected to be nearly flat (Section 14/15
+    # finding); seeing it explicitly in the fit lets the daily layer
+    # downweight bearish exposure properly.
+    cal = fit_isotonic_calibration_by_direction(
+        composites, hits, directions, min_obs_per_direction=args.min_obs,
     )
     save_isotonic_calibration(cal, args.output)
-    print(f"Wrote {args.output} (segments={len(cal.get('fit') or [])})")
+    by_dir = cal.get("by_direction") or {}
+    summary = ", ".join(
+        f"{d}: {len(by_dir.get(d, {}).get('fit') or [])} segs"
+        for d in ("bullish", "bearish", "neutral")
+    )
+    print(
+        f"Wrote {args.output} "
+        f"(all-direction segments={len(cal.get('fit') or [])}; "
+        f"by-direction: {summary})"
+    )
 
     # Acceptance gate (per Phase 5 spec) is on the raw calibration map
     # composite -> realized hit rate. Baseline is the simplest naive forecast:

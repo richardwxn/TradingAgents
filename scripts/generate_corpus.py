@@ -19,7 +19,11 @@ import os
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -207,9 +211,28 @@ def main() -> int:
     parser.add_argument(
         "--workers", type=int, default=2,
         help=(
-            "Thread pool size. Default: 2 (yfinance is unreliable above 2-3 "
-            "concurrent threads — Yahoo throttles + returns Invalid Crumb "
-            "401s that corrupt downstream parsing)."
+            "Executor pool size. Default: 2. The prior 'yfinance unreliable "
+            "above 2-3 threads' warning no longer applies: (a) market context "
+            "(SPY / sector ETFs) was moved off yfinance to Polygon "
+            "(handoff Section 28), and (b) `--executor process` (the default) "
+            "isolates remaining yfinance state per process, so concurrent "
+            "yfinance crumb handshakes no longer collide. Scaling 4-8 workers "
+            "is reasonable on the paid Polygon tier."
+        ),
+    )
+    parser.add_argument(
+        "--executor",
+        default="process",
+        choices=["process", "thread"],
+        help=(
+            "Worker pool type. Default: process (Future-work #5). Process "
+            "pool gives true parallelism for the CPU-bound BSM IV inversion "
+            "+ statement parsing (2-3x speedup on those phases); trade-off "
+            "is that module-level caches in providers.py (_FINANCIALS_ALL_CACHE, "
+            "_RATE_SERIES_CACHE, _VIX_SERIES_CACHE, _POLYGON_DAILY_AGGS_CACHE) "
+            "don't cross process boundaries. On a full regen the CPU win "
+            "dominates. Use --executor thread to fall back to the legacy "
+            "shared-memory path."
         ),
     )
     parser.add_argument(
@@ -378,7 +401,10 @@ def main() -> int:
     print(f"Tickers ({len(tickers)}): {' '.join(tickers)}")
     print(f"Date range: {args.start} → {args.end}  ({len(dates)} Fridays)")
     print(f"Total jobs: {len(jobs)}  |  already done: {len(already)}  |  pending: {len(pending)}")
-    print(f"Workers: {args.workers}  |  output_dir: {output_dir}")
+    print(
+        f"Workers: {args.workers}  |  executor: {args.executor}  |  "
+        f"output_dir: {output_dir}"
+    )
     print(f"Errors log: {errors_log}")
 
     if args.dry_run:
@@ -398,7 +424,14 @@ def main() -> int:
     print(f"\nStarting corpus generation at {datetime.now().isoformat(timespec='seconds')}\n")
     print(f"{'#':>4} {'ticker':<6} {'date':<10} {'status':<18} {'elapsed':>8}  {'eta':>10}")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    # Future-work #5: ProcessPoolExecutor gives true parallelism for
+    # CPU-bound BSM IV inversion + statement parsing. Module-level caches
+    # in providers.py don't cross process boundaries — accept the trade-off
+    # because the CPU win dominates on a full regen.
+    executor_cls = (
+        ProcessPoolExecutor if args.executor == "process" else ThreadPoolExecutor
+    )
+    with executor_cls(max_workers=args.workers) as pool:
         future_map = {pool.submit(_generate_one, job): job for job in pending}
         for fut in as_completed(future_map):
             result = fut.result()

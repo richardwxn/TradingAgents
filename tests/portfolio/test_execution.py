@@ -139,6 +139,29 @@ def test_review_gate_blocks_ready_buy_ticket_with_metadata():
     assert ticket.review_execution_caveats == ["Risk critique."]
 
 
+def test_review_gate_metadata_is_written_to_ticket_details():
+    cfg = ExecutionConfig(tradingagents_review_apply_to_tickets=False)
+    ticket = ticket_from_action(
+        _action(
+            review_gate_status="manual_review",
+            review_gate_reason="Needs human confirmation.",
+            tradingagents_review={
+                "enabled": True,
+                "mode": "shadow",
+                "enforced": False,
+                "status": "ok",
+                "gate": {"ticket_gate": "manual_review"},
+            },
+        ),
+        as_of="2026-05-31",
+        config=cfg,
+    )
+    assert ticket is not None
+    assert ticket.status == "ready"
+    assert ticket.details["tradingagents_review"]["mode"] == "shadow"
+    assert ticket.details["tradingagents_review"]["gate"]["ticket_gate"] == "manual_review"
+
+
 def test_review_gate_does_not_block_exit_ticket():
     cfg = ExecutionConfig()
     ticket = ticket_from_action(

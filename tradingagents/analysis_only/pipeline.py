@@ -17,6 +17,7 @@ from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.analysis_only.providers import (
     FearGreedProvider,
     PolygonFinancialsProvider,
+    PolygonNewsProvider,
     SECFetchError,
     SECFilingsProvider,
     VIXFearGreedProvider,
@@ -25,15 +26,22 @@ from tradingagents.analysis_only.providers import (
 )
 from tradingagents.analysis_only.state_store import StateStore, SymbolState
 from tradingagents.analysis_only.scoring import (
+    apply_regime_to_factor_scores,
     compute_composite,
+    compute_news_sentiment,
+    regime_for_market_context,
+    compute_ticker_fear_greed,
     confidence_for,
     direction_for_composite,
+    direction_for_composite_regime_gated,
     resolve_factor_weights,
     score_fear_greed_regime,
     score_iv_rank,
     score_iv_skew,
     score_iv_term_structure,
+    score_news_sentiment,
     score_sales_multiple_vs_growth,
+    score_ticker_fear_greed_regime,
 )
 from tradingagents.analysis_only.forecast import (
     build_option_strategies,
@@ -104,6 +112,7 @@ class AnalysisOnlyMVP:
         cache_dir: str | None = None,
         enable_data_cache: bool = True,
         enable_news_fetching: bool = True,
+        enable_news_factor: bool = True,
         enable_filings_fetching: bool = True,
         enable_intraday_context: bool = True,
         enable_peer_competitor_analysis: bool = True,
@@ -118,6 +127,11 @@ class AnalysisOnlyMVP:
         # anyway, and news is mostly empty under PIT filtering for
         # older dates). Live runs should keep both on.
         self.enable_news_fetching = enable_news_fetching
+        # X1 (2026-06-04): distinct from `enable_news_fetching` (which gates
+        # the LLM-context news payload). This flag controls the Polygon
+        # news-sentiment factor specifically — kept separate so backfill
+        # regens with `--skip-news` still emit the factor.
+        self.enable_news_factor = enable_news_factor
         self.enable_filings_fetching = enable_filings_fetching
         # Skipping intraday-context (hourly bars over a 7-day window) and
         # peer-competitor analysis (yfinance per-peer .info fetches) is
@@ -156,6 +170,14 @@ class AnalysisOnlyMVP:
         self.vix_fear_greed_provider = VIXFearGreedProvider(logger=self.logger)
         self.polygon_financials_provider = (
             PolygonFinancialsProvider(api_key=self.polygon_api_key)
+            if self.polygon_api_key
+            else None
+        )
+        # Polygon news provider for the `news_sentiment` factor. Separate
+        # from `_load_news` (which is yfinance-only and feeds the LLM
+        # context) — this one is PIT-correct via `published_utc.lte`.
+        self.polygon_news_provider = (
+            PolygonNewsProvider(api_key=self.polygon_api_key)
             if self.polygon_api_key
             else None
         )
@@ -256,6 +278,32 @@ class AnalysisOnlyMVP:
             self._log("News fetch skipped (enable_news_fetching=False).")
             news_summary = {"count": 0, "items": [], "status": "disabled"}
             self._set_pit("news", "disabled")
+        # X1: Polygon news-sentiment factor. PIT-correct via
+        # `published_utc.lte=as_of_date`; works on historical regens even
+        # when `enable_news_fetching` is False.
+        if self.enable_news_factor:
+            self._log("Loading Polygon news sentiment...")
+            news_sentiment_block = self._load_news_sentiment(
+                symbol=symbol, as_of_date=as_of_date,
+            )
+        else:
+            self._log("News sentiment factor skipped (enable_news_factor=False).")
+            news_sentiment_block = {
+                "status": "disabled",
+                "pit_status": "disabled",
+                "net_sentiment": None,
+                "n_articles": 0,
+                "n_positive": 0,
+                "n_negative": 0,
+                "n_neutral": 0,
+                "n_with_insights": 0,
+                "n_keyword_fallback": 0,
+                "window_start": None,
+                "window_end": as_of_date,
+                "lookback_days": 14,
+                "source": "polygon_news",
+            }
+            self._set_pit("news_sentiment", "disabled")
         if self.enable_intraday_context:
             self._log("Loading intraday trigger context...")
             intraday_context = self._load_intraday_context(
@@ -370,6 +418,7 @@ class AnalysisOnlyMVP:
             options_flow=options_flow,
             option_chain_context=option_chain_context,
             news_summary=news_summary,
+            news_sentiment_block=news_sentiment_block,
             intraday_context=intraday_context,
             market_context=market_context,
             filings_context=filings_context,
@@ -412,6 +461,7 @@ class AnalysisOnlyMVP:
             "enable_narrative": self.enable_narrative,
             "enable_tradingagents_review": self.enable_tradingagents_review,
             "enable_news_fetching": self.enable_news_fetching,
+            "enable_news_factor": self.enable_news_factor,
             "enable_filings_fetching": self.enable_filings_fetching,
             "enable_intraday_context": self.enable_intraday_context,
             "enable_peer_competitor_analysis": (
@@ -1417,6 +1467,102 @@ class AnalysisOnlyMVP:
             "symbol_news_summary",
             cache_payload,
             out,
+        )
+        return out
+
+    def _load_news_sentiment(
+        self,
+        symbol: str,
+        as_of_date: str,
+        *,
+        lookback_days: int = 14,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Pull PIT-correct Polygon news + aggregate sentiment for the factor.
+
+        Returns a dict shaped for `key_features.news_sentiment` with
+        `status`, `pit_status`, `net_sentiment`, `n_articles`,
+        `n_positive`/`n_negative`/`n_neutral`, `n_with_insights`,
+        `n_keyword_fallback`, `window_start`, `window_end`,
+        `lookback_days`, `source`.
+        """
+        empty = {
+            "status": "unavailable",
+            "pit_status": "unavailable",
+            "net_sentiment": None,
+            "n_articles": 0,
+            "n_positive": 0,
+            "n_negative": 0,
+            "n_neutral": 0,
+            "n_with_insights": 0,
+            "n_keyword_fallback": 0,
+            "window_start": None,
+            "window_end": as_of_date,
+            "lookback_days": int(lookback_days),
+            "source": "polygon_news",
+        }
+        if not self.enable_news_factor:
+            self._set_pit("news_sentiment", "disabled")
+            return {**empty, "status": "disabled", "pit_status": "disabled"}
+        if self.polygon_news_provider is None:
+            self._set_pit("news_sentiment", "unavailable")
+            return {**empty, "reason": "no_polygon_api_key"}
+
+        cache_payload = {
+            "symbol": symbol.upper(),
+            "as_of_date": as_of_date,
+            "lookback_days": int(lookback_days),
+            "limit": int(limit),
+            "provider": "polygon_news",
+        }
+        cached = self._get_cached_json(
+            "news_sentiment",
+            "sentiment_summary",
+            cache_payload,
+            ttl_seconds=self._cache_ttl(as_of_date, live_seconds=900),
+        )
+        if isinstance(cached, dict):
+            self._set_pit(
+                "news_sentiment",
+                str(cached.get("pit_status", "unknown")),
+            )
+            return cached
+
+        # `published_utc.lte` accepts ISO dates; pass end-of-day to keep
+        # any article published on `as_of_date` itself.
+        published_before = f"{as_of_date}T23:59:59Z"
+        try:
+            raw_items = self.polygon_news_provider.get_news(
+                symbol=symbol,
+                limit=int(limit),
+                published_before=published_before,
+            )
+        except Exception:
+            raw_items = []
+
+        agg = compute_news_sentiment(
+            raw_items, as_of_date=as_of_date, lookback_days=int(lookback_days),
+        )
+        is_historical = self._resolve_pit_mode(as_of_date) == "historical"
+        pit_status = "pit" if is_historical else "live"
+        out = {
+            "status": "ok" if agg["n_articles"] > 0 else "no_articles",
+            "pit_status": pit_status,
+            "net_sentiment": agg["net_sentiment"],
+            "n_articles": agg["n_articles"],
+            "n_positive": agg["n_positive"],
+            "n_negative": agg["n_negative"],
+            "n_neutral": agg["n_neutral"],
+            "n_with_insights": agg["n_with_insights"],
+            "n_keyword_fallback": agg["n_keyword_fallback"],
+            "window_start": agg["window_start"],
+            "window_end": agg["window_end"],
+            "lookback_days": int(lookback_days),
+            "source": "polygon_news",
+        }
+        self._set_pit("news_sentiment", pit_status)
+        self._set_cached_json(
+            "news_sentiment", "sentiment_summary", cache_payload, out,
         )
         return out
 
@@ -2802,6 +2948,20 @@ class AnalysisOnlyMVP:
             else 0.0
         )
 
+        # Trailing 252d (1y) high and signed drawdown from it. Used by the
+        # per-ticker fear/greed composite. Falls back to the available
+        # window when we have fewer than 252 rows.
+        lookback_high = close.tail(252).max()
+        if (
+            lookback_high
+            and pd.notna(lookback_high)
+            and lookback_high > 0
+            and pd.notna(last_close)
+        ):
+            drawdown_from_52w_high = float(last_close / lookback_high - 1.0)
+        else:
+            drawdown_from_52w_high = float("nan")
+
         vol_avg_20 = volume.rolling(20).mean().iloc[-1]
         vol_std_20 = volume.rolling(20).std().iloc[-1]
         vol_z = (
@@ -2826,6 +2986,7 @@ class AnalysisOnlyMVP:
             "return_60d": self._safe_float(ret_60d),
             "volume_zscore_20d": self._safe_float(vol_z),
             "breakout_60d": self._safe_float(breakout_60d),
+            "drawdown_from_52w_high": self._safe_float(drawdown_from_52w_high),
         }
 
     def _scan_unusual_options(
@@ -3742,6 +3903,7 @@ class AnalysisOnlyMVP:
         options_flow: dict[str, Any],
         option_chain_context: dict[str, Any],
         news_summary: dict[str, Any],
+        news_sentiment_block: dict[str, Any] | None,
         intraday_context: dict[str, Any],
         market_context: dict[str, Any],
         filings_context: dict[str, Any],
@@ -4632,6 +4794,86 @@ class AnalysisOnlyMVP:
             iv_rank_reason,
         )
 
+        # X1 (2026-06-04): news_sentiment factor at weight=0 — composite
+        # delta from baseline must remain exactly 0.000 until IC validates
+        # the sign on a regenerated corpus.
+        ns_block = news_sentiment_block or {}
+        ns_net = ns_block.get("net_sentiment")
+        ns_n = int(ns_block.get("n_articles") or 0)
+        ns_score, ns_reason, ns_avail = score_news_sentiment(ns_net, ns_n)
+        add_factor(
+            "news_sentiment",
+            "sentiment",
+            ns_net,
+            ns_score,
+            ns_avail,
+            ns_reason,
+        )
+
+        # v1.7: per-ticker fear/greed composite. Aggregates IV rank,
+        # 25Δ IV skew, drawdown from 52w high, RSI(14), and net unusual
+        # options flow into one 0-100 score + rating. Only fires
+        # net_flow_notional when there is unusual options activity to
+        # avoid feeding `None`-via-default into the composite.
+        net_flow_for_fg = (
+            net_option_notional
+            if (
+                options_unusual > 0
+                and self._is_valid(net_option_notional)
+            )
+            else None
+        )
+        ticker_fg = compute_ticker_fear_greed(
+            iv_rank=iv_rank_value if iv_rank_avail else None,
+            iv_skew=iv_skew_value if iv_skew_avail else None,
+            drawdown_from_52w_high=technicals.get("drawdown_from_52w_high"),
+            rsi_14=rsi_14 if self._is_valid(rsi_14) else None,
+            net_flow_notional=net_flow_for_fg,
+        )
+        if ticker_fg.get("status") == "ok":
+            tfg_score_raw = ticker_fg.get("score")
+            tfg_factor_score, tfg_reason, tfg_avail = (
+                score_ticker_fear_greed_regime(tfg_score_raw)
+            )
+            tfg_rationale = (
+                f"{tfg_reason} "
+                f"(score={tfg_score_raw:.1f}, rating={ticker_fg.get('rating')}, "
+                f"components={ticker_fg.get('available_components')})"
+            )
+        else:
+            tfg_score_raw = None
+            tfg_factor_score, tfg_reason, tfg_avail = (
+                score_ticker_fear_greed_regime(None)
+            )
+            tfg_rationale = (
+                f"{tfg_reason} "
+                f"(available_components={ticker_fg.get('available_components', 0)})"
+            )
+        add_factor(
+            "ticker_fear_greed_regime",
+            "context",
+            tfg_score_raw,
+            tfg_factor_score,
+            tfg_avail,
+            tfg_rationale,
+        )
+
+        # v1.7 (Section 29 wip): regime-conditional sign flips for a small
+        # set of factors whose IC sign disagrees between trend_on and chop.
+        # Sharper retry of Priority #1 — wholesale weight replacement
+        # failed the gate (chop magnitudes noisy), but the SIGN
+        # disagreement on `market_fear_greed_regime`, `fund_profit_margins`,
+        # `options_iv_rank` is robust on the v1.7 corpus IC table.
+        # See `apply_regime_to_factor_scores` for the selection criteria.
+        regime = regime_for_market_context(market_context)
+        market_context["regime"] = regime  # persist for backtest / debugging
+        factor_scores_regime_adj = apply_regime_to_factor_scores(
+            factor_scores, weights, regime,
+        )
+        # Replace in-place so downstream consumers (pos/neg sorting,
+        # markdown rendering, etc.) see the regime-adjusted weighted_scores.
+        factor_scores[:] = factor_scores_regime_adj
+
         composite_out = compute_composite(factor_scores, weights=weights)
         composite_score = composite_out["composite_score"]
         pillar_scores = composite_out["pillar_scores"]
@@ -4673,12 +4915,27 @@ class AnalysisOnlyMVP:
         if options_unusual > 0:
             risk_flags.append("Abnormal options activity detected.")
 
-        direction = direction_for_composite(composite_score)
+        # v1.7: bear-side regime gate — bearish calls in trend_on regime are
+        # anti-predictive (Section 15: ~33% hit vs 50% base rate). Only
+        # allow bearish when regime is chop AND market F&G is at fear or
+        # worse. `regime` was computed above for the sign-flip step.
+        # Pipeline F&G score is a 0-100 CNN-style number; convert to the
+        # ±0.4 factor-score scale via score_fear_greed_regime so the gate
+        # threshold (≤-0.2) matches the factor-emission semantics.
+        fg_raw = market_context.get("fear_greed_score")
+        fg_rating = market_context.get("fear_greed_rating")
+        fg_factor_score, _, _ = score_fear_greed_regime(fg_raw, fg_rating)
+        direction = direction_for_composite_regime_gated(
+            composite_score,
+            regime=regime,
+            fear_greed_score=fg_factor_score,
+        )
         coverage = composite_out["coverage"]
         confidence = confidence_for(
             composite_score,
             coverage,
             calibration=self._load_confidence_calibration(),
+            direction=direction,
         )
         price_range_forecast = self._estimate_price_ranges(
             spot=close,
@@ -4915,6 +5172,8 @@ class AnalysisOnlyMVP:
                 "fundamental": fundamentals,
                 "options_flow": options_flow,
                 "options_iv": options_iv,
+                "ticker_fear_greed": ticker_fg,
+                "news_sentiment": news_sentiment_block or {},
                 "option_strategies": option_strategies,
                 "model_scoring": {
                     "weights": weights,

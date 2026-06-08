@@ -652,6 +652,90 @@ def reset_polygon_daily_aggs_cache() -> None:
         _POLYGON_DAILY_AGGS_CACHE.clear()
 
 
+# --- Polygon grouped-aggs (Future-work #6) ---
+# Different access pattern from `fetch_polygon_daily_aggs_cached`: that one
+# fetches a date RANGE for ONE symbol; this one fetches ONE date for ALL
+# symbols on the US stocks market via `/v2/aggs/grouped/locale/us/market/
+# stocks/{date}`. Right tool when the workload iterates many symbols at the
+# same date — e.g. `scripts/build_screener_universe.py` filtering ~3000
+# Nasdaq tickers by trailing-20d ADV. Replaces ~3000 per-symbol HTTP calls
+# with ~20 per-date calls returning ALL symbols (5-10x speedup on that
+# workload; modest impact on the regen which is already symbol-major).
+_POLYGON_GROUPED_AGGS_CACHE: dict[str, dict[str, dict]] = {}
+_POLYGON_GROUPED_AGGS_LOCK = threading.RLock()
+
+
+def _load_polygon_grouped_aggs(
+    date_iso: str,
+    api_key: str,
+    logger: logging.Logger,
+) -> dict[str, dict]:
+    """Fetch one day's daily aggs for ALL US stocks/ETFs from Polygon.
+
+    Returns a dict keyed by ticker (uppercase) mapping to the raw Polygon
+    row `{o, h, l, c, v, vw, n, t}` — caller normalizes as needed. Empty
+    dict on failure or no results (e.g. weekend/holiday).
+    """
+    if not api_key:
+        return {}
+    url = (
+        "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/"
+        f"{date_iso}"
+    )
+    params = {"adjusted": "true", "apiKey": api_key}
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        logger.warning(
+            "Polygon grouped aggs fetch failed for %s: %s", date_iso, exc
+        )
+        return {}
+    rows = payload.get("results") or []
+    out: dict[str, dict] = {}
+    for row in rows:
+        ticker = (row.get("T") or "").upper()
+        if ticker:
+            out[ticker] = row
+    return out
+
+
+def fetch_polygon_grouped_aggs_cached(
+    date_iso: str,
+    api_key: str,
+    logger: logging.Logger | None = None,
+) -> dict[str, dict]:
+    """Process-shared cached wrapper around `_load_polygon_grouped_aggs`.
+
+    Threads spawned from the same process share a single fetch per date.
+    Returns an empty dict on failure (callers should treat as data
+    unavailable for that date — weekend/holiday/network blip).
+    """
+    log = logger or logging.getLogger(__name__)
+    with _POLYGON_GROUPED_AGGS_LOCK:
+        cached = _POLYGON_GROUPED_AGGS_CACHE.get(date_iso)
+        if cached is not None:
+            return cached
+    # Fetch outside the lock so concurrent fetches for different dates
+    # don't serialize. We accept the rare double-fetch on the same date.
+    rows = _load_polygon_grouped_aggs(date_iso, api_key, log)
+    with _POLYGON_GROUPED_AGGS_LOCK:
+        # Cache even empty results when the lookup completed cleanly —
+        # weekends/holidays legitimately return zero rows, no point in
+        # retrying. Only skip cache when the fetch itself errored (caller
+        # can't tell the difference today; future work could promote this
+        # to an explicit fetch-status field).
+        _POLYGON_GROUPED_AGGS_CACHE[date_iso] = rows
+    return rows
+
+
+def reset_polygon_grouped_aggs_cache() -> None:
+    """Clear the module-level Polygon grouped-aggs cache. For tests."""
+    with _POLYGON_GROUPED_AGGS_LOCK:
+        _POLYGON_GROUPED_AGGS_CACHE.clear()
+
+
 class YFinancePriceProvider:
     def get_daily_bars(
         self,
@@ -700,22 +784,68 @@ class YFinancePriceProvider:
         return data.reset_index()
 
 
+# --- Polygon news cache ---
+#
+# Process-shared cache keyed by (symbol, published_before, limit). Mirrors
+# the `_VIX_SERIES_CACHE` pattern: load once, share across threads. Each
+# call to `PolygonNewsProvider.get_news` with the same (symbol, as_of)
+# tuple is a stable PIT-correct query, so caching is safe.
+_POLYGON_NEWS_CACHE: dict[tuple[str, str | None, int], list[dict[str, Any]]] = {}
+_POLYGON_NEWS_LOCK = threading.Lock()
+
+
+def reset_polygon_news_cache() -> None:
+    """Clear the module-level Polygon news cache. For tests."""
+    with _POLYGON_NEWS_LOCK:
+        _POLYGON_NEWS_CACHE.clear()
+
+
 class PolygonNewsProvider:
-    def __init__(self, api_key: str | None = None):
+    """Per-ticker historical news via Polygon /v2/reference/news.
+
+    PIT-correct: callers pass `published_before` (an ISO date or RFC3339
+    timestamp) and the server filters articles to those published on or
+    before that instant. Returns the raw Polygon `results` list — each
+    item is a dict with `title`, `description`, `published_utc`,
+    `tickers`, and (when available) `insights` whose entries carry a
+    `sentiment` classification in {"positive", "neutral", "negative"}.
+
+    Module-level cache (`_POLYGON_NEWS_CACHE`) dedups repeated calls with
+    the same (symbol, published_before, limit) tuple within a process —
+    mirrors the `_VIX_SERIES_CACHE` pattern. Returns `[]` when the API key
+    is missing or the HTTP call fails (no exception leaks).
+    """
+
+    BASE_URL = "https://api.polygon.io/v2/reference/news"
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        session: requests.Session | None = None,
+        timeout: int = 20,
+    ):
         self.api_key = api_key or os.getenv("POLYGON_API_KEY", "")
+        self.session = session or requests.Session()
+        self.timeout = timeout
 
     def get_news(
         self,
         symbol: str,
-        limit: int = 20,
+        limit: int = 50,
         published_before: str | None = None,
     ) -> list[dict[str, Any]]:
         if not self.api_key:
             return []
-        url = "https://api.polygon.io/v2/reference/news"
+        key = (symbol.upper(), published_before, int(limit))
+        with _POLYGON_NEWS_LOCK:
+            cached = _POLYGON_NEWS_CACHE.get(key)
+            if cached is not None:
+                # Return a shallow copy so callers can mutate the list
+                # without poisoning the cache for the next request.
+                return list(cached)
         params: dict[str, Any] = {
             "ticker": symbol.upper(),
-            "limit": limit,
+            "limit": int(limit),
             "sort": "published_utc",
             "order": "desc",
             "apiKey": self.api_key,
@@ -723,12 +853,18 @@ class PolygonNewsProvider:
         if published_before:
             params["published_utc.lte"] = published_before
         try:
-            response = requests.get(url, params=params, timeout=20)
+            response = self.session.get(
+                self.BASE_URL, params=params, timeout=self.timeout
+            )
             response.raise_for_status()
             payload = response.json()
         except Exception:
-            return []
-        return payload.get("results") or []
+            results: list[dict[str, Any]] = []
+        else:
+            results = payload.get("results") or []
+        with _POLYGON_NEWS_LOCK:
+            _POLYGON_NEWS_CACHE[key] = list(results)
+        return list(results)
 
 
 class YFinanceNewsProvider:

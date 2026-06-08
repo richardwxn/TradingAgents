@@ -49,6 +49,7 @@ from portfolio.options import (
     load_option_positions,
 )
 from portfolio.sizing import SizingConfig, sizing_config_from_dict
+from portfolio.risk import SectorShock
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,6 +66,43 @@ def _parse_args() -> argparse.Namespace:
                    help="Override the run date (YYYY-MM-DD); defaults to today.")
     p.add_argument("--no-prices", action="store_true",
                    help="Skip yfinance price fetching (offline / smoke-test mode).")
+    p.add_argument(
+        "--confidence-calibration-path",
+        default="configs/confidence_calibration.json",
+        help=(
+            "Path to the Phase-5 isotonic calibration JSON. When the file "
+            "exists, heuristic confidence values baked into older reports "
+            "are REPLACED with calibrated values at read time. Pass an "
+            "empty string to disable (use heuristic as-emitted)."
+        ),
+    )
+    p.add_argument(
+        "--no-shock-refresh", action="store_true",
+        help=(
+            "Disable the mid-week shock-triggered composite refresh. When "
+            "enabled (default), a VIX spike or sector ETF crash on the "
+            "current trading session triggers a fresh `analysis_mvp.py` "
+            "run for every held position before signals are loaded — so the "
+            "daily layer sees post-shock composites instead of last Friday's "
+            "stale ones. Back-dated --as-of runs always skip the refresh."
+        ),
+    )
+    p.add_argument(
+        "--shock-vix-pct-threshold", type=float, default=0.15,
+        help=(
+            "VIX percent rise vs prior close that triggers a mid-week "
+            "refresh. Default 0.15 (15%%). Combined OR with the absolute "
+            "threshold."
+        ),
+    )
+    p.add_argument(
+        "--shock-vix-absolute-threshold", type=float, default=25.0,
+        help=(
+            "Absolute VIX level that triggers a mid-week refresh. Default "
+            "25 — the upper edge of the calm-trend regime classifier in "
+            "scoring.py. Combined OR with the pct threshold."
+        ),
+    )
     return p.parse_args()
 
 
@@ -197,9 +235,9 @@ def fetch_price_context(symbol: str) -> PriceContext:
             threads=False,
         )
     except Exception:
-        return PriceContext(None, None, None)
+        return PriceContext(None, None, None, source="unavailable")
     if raw is None or getattr(raw, "empty", True):
-        return PriceContext(None, None, None)
+        return PriceContext(None, None, None, source="unavailable")
     df = raw.copy()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -207,12 +245,12 @@ def fetch_price_context(symbol: str) -> PriceContext:
         close = df["Close"].dropna()
         last_close = float(close.iloc[-1])
     except Exception:
-        return PriceContext(None, None, None)
+        return PriceContext(None, None, None, source="unavailable")
     sma20 = float(close.rolling(20).mean().iloc[-1]) if len(close) >= 20 else None
     if sma20 is not None and (pd.isna(sma20) or sma20 <= 0):
         sma20 = None
     atr14 = _atr14(df)
-    return PriceContext(last_close=last_close, sma20=sma20, atr14=atr14)
+    return PriceContext(last_close=last_close, sma20=sma20, atr14=atr14, source="yfinance")
 
 
 def fetch_prices_for_universe(symbols: list[str]) -> dict[str, PriceContext]:
@@ -220,6 +258,224 @@ def fetch_prices_for_universe(symbols: list[str]) -> dict[str, PriceContext]:
     for sym in symbols:
         out[sym.upper()] = fetch_price_context(sym)
     return out
+
+
+def _fetch_day_pct_change(symbol: str) -> float | None:
+    """Return latest daily percent change from yfinance, or None.
+
+    During the live session Yahoo's latest daily bar may be an in-progress
+    bar. That is exactly what the same-day circuit breaker wants. Historical
+    backtests avoid this helper entirely unless `as_of == today`.
+    """
+    try:
+        raw = yf.download(
+            symbol,
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return None
+    if raw is None or getattr(raw, "empty", True):
+        return None
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    try:
+        closes = df["Close"].dropna()
+        if len(closes) < 2:
+            return None
+        prev = float(closes.iloc[-2])
+        latest = float(closes.iloc[-1])
+    except Exception:
+        return None
+    if prev <= 0:
+        return None
+    return (latest / prev) - 1.0
+
+
+def detect_vix_spike(
+    *,
+    pct_change_threshold: float = 0.15,
+    absolute_threshold: float = 25.0,
+) -> tuple[bool, float | None, float | None, float | None]:
+    """Detect a VIX spike vs prior close.
+
+    Returns ``(spiked, current_vix, prior_close, pct_change)``. ``spiked``
+    is True when EITHER:
+      - VIX rose by `pct_change_threshold` (default 15%) vs prior close,
+      - OR absolute VIX > `absolute_threshold` (default 25 — the upper
+        edge of the calm-trend regime classifier in `scoring.py`).
+    Returns ``(False, None, None, None)`` on yfinance failure.
+    """
+    try:
+        raw = yf.download(
+            "^VIX",
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return (False, None, None, None)
+    if raw is None or getattr(raw, "empty", True):
+        return (False, None, None, None)
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    try:
+        closes = df["Close"].dropna()
+        if len(closes) < 2:
+            return (False, None, None, None)
+        prior = float(closes.iloc[-2])
+        current = float(closes.iloc[-1])
+    except Exception:
+        return (False, None, None, None)
+    if prior <= 0:
+        return (False, current, prior, None)
+    pct = (current / prior) - 1.0
+    spiked = (pct >= pct_change_threshold) or (current >= absolute_threshold)
+    return (bool(spiked), current, prior, pct)
+
+
+def maybe_refresh_held_composites(
+    *,
+    positions: dict[str, Position],
+    as_of: date,
+    reports_dir: Path = Path("reports/analysis_mvp"),
+    config: SizingConfig | None = None,
+    vix_pct_threshold: float = 0.15,
+    vix_absolute_threshold: float = 25.0,
+    disable: bool = False,
+) -> dict[str, str]:
+    """If a market shock condition is met, refresh weekly composites for
+    held positions via `analysis_mvp.py` BEFORE today's daily signals fire.
+
+    The default daily-signals flow reads composites that were generated last
+    Friday. On a sudden shock (VIX spike, sector ETF crash) those composites
+    are stale and won't reflect the new vol regime. This helper detects the
+    shock conditions and runs `analysis_mvp.py` for each held ticker so the
+    daily layer sees fresh composites.
+
+    Skip conditions (no refresh):
+    - `disable=True`
+    - `as_of != today` (back-dated replay — no shock possible)
+    - No positions (nothing to refresh)
+    - No VIX spike AND no sector ETF shock above threshold
+
+    Returns a dict mapping symbol → result string ("refreshed" | "failed:
+    <reason>"). Empty dict means no refresh was triggered.
+    """
+    if disable or as_of != date.today() or not positions:
+        return {}
+    spiked, vix_now, vix_prior, vix_pct = detect_vix_spike(
+        pct_change_threshold=vix_pct_threshold,
+        absolute_threshold=vix_absolute_threshold,
+    )
+    sector_threshold = (
+        float(getattr(config, "sector_shock_drop_pct", 0.03))
+        if config is not None else 0.03
+    )
+    sector_etfs = (
+        dict(getattr(config, "sector_shock_etfs", {}) or {})
+        if config is not None else {}
+    )
+    sector_shocked_etfs: list[tuple[str, float]] = []
+    for sector, etf in sector_etfs.items():
+        etf_u = str(etf).upper()
+        if not etf_u:
+            continue
+        pct = _fetch_day_pct_change(etf_u)
+        if pct is not None and pct <= -sector_threshold:
+            sector_shocked_etfs.append((etf_u, pct))
+    if not spiked and not sector_shocked_etfs:
+        return {}
+
+    # Shock detected. Surface the trigger inline so operators see WHY a
+    # mid-week regen kicked off (rather than wondering at a slow daily run).
+    trigger_parts: list[str] = []
+    if spiked:
+        trigger_parts.append(
+            f"VIX={vix_now:.1f} (prior {vix_prior:.1f}, "
+            f"Δ {vix_pct*100:+.1f}%)"
+        )
+    if sector_shocked_etfs:
+        s = ", ".join(f"{etf} {pct*100:+.1f}%" for etf, pct in sector_shocked_etfs[:3])
+        trigger_parts.append(f"sector ETFs: {s}")
+    print(f"  ⚠ Shock detected ({'; '.join(trigger_parts)}) — refreshing held composites")
+
+    # Refresh composites for HELD positions only (typically <20 tickers, fast).
+    # Calls analysis_mvp.py via subprocess so this script doesn't import the
+    # heavy pipeline. Uses the same defaults (data-provider polygon,
+    # calibration + regime weights paths auto-loaded).
+    import subprocess
+    import sys
+    today_iso = as_of.isoformat()
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[str, str] = {}
+    for sym in sorted(positions.keys()):
+        try:
+            r = subprocess.run(
+                [
+                    sys.executable, "analysis_mvp.py",
+                    "--ticker", sym,
+                    "--date", today_iso,
+                    "--no-markdown",
+                    "--no-json-stdout",
+                    "--output-dir", str(reports_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            results[sym] = "refreshed" if r.returncode == 0 else f"failed: rc={r.returncode}"
+        except subprocess.TimeoutExpired:
+            results[sym] = "failed: timeout"
+        except Exception as exc:
+            results[sym] = f"failed: {type(exc).__name__}"
+        print(f"    {sym}: {results[sym]}")
+    return results
+
+
+def fetch_sector_shocks(
+    signals: dict[str, object],
+    *,
+    config: SizingConfig,
+    as_of: date,
+) -> dict[str, SectorShock]:
+    """Detect configured same-day sector ETF shocks for active sectors."""
+    if not getattr(config, "sector_shock_guard_enabled", True):
+        return {}
+    if as_of != date.today():
+        return {}
+    sector_etfs = getattr(config, "sector_shock_etfs", {}) or {}
+    threshold = float(getattr(config, "sector_shock_drop_pct", 0.03))
+    sectors = sorted({
+        getattr(sig, "sector", None)
+        for sig in signals.values()
+        if sig is not None and getattr(sig, "sector", None)
+    })
+    shocks: dict[str, SectorShock] = {}
+    pct_by_etf: dict[str, float | None] = {}
+    for sector in sectors:
+        etf = str(sector_etfs.get(str(sector), "") or "").upper()
+        if not etf:
+            continue
+        if etf not in pct_by_etf:
+            pct_by_etf[etf] = _fetch_day_pct_change(etf)
+        pct_change = pct_by_etf.get(etf)
+        if pct_change is None or pct_change > -threshold:
+            continue
+        shocks[str(sector)] = SectorShock(
+            sector=str(sector),
+            trigger_symbol=etf,
+            pct_change=float(pct_change),
+            threshold=threshold,
+        )
+    return shocks
 
 
 def main() -> None:
@@ -239,9 +495,33 @@ def main() -> None:
     if not universe:
         raise SystemExit("No universe configured and no positions held; nothing to do.")
 
+    # Mid-week shock refresh: if VIX spikes or a sector ETF crashes today,
+    # refresh held-position composites BEFORE loading signals so the daily
+    # layer sees the post-shock fear_greed_regime / IV factors instead of
+    # last Friday's stale composites. Skipped on back-dated runs.
+    maybe_refresh_held_composites(
+        positions=positions,
+        as_of=as_of,
+        reports_dir=Path("reports/analysis_mvp"),
+        config=sizing_config,
+        vix_pct_threshold=float(args.shock_vix_pct_threshold),
+        vix_absolute_threshold=float(args.shock_vix_absolute_threshold),
+        disable=bool(args.no_shock_refresh),
+    )
+
     print(f"Loading reports from {args.reports_glob}...")
     report_paths = [Path(p) for p in glob.glob(args.reports_glob)]
-    signals = load_latest_signals(report_paths, universe=universe, as_of=as_of)
+    cal_path = args.confidence_calibration_path or None
+    if cal_path and not Path(cal_path).exists():
+        cal_path = None
+    signals = load_latest_signals(
+        report_paths,
+        universe=universe,
+        as_of=as_of,
+        calibration_path=cal_path,
+    )
+    if cal_path:
+        print(f"Calibrated confidence at read time via {cal_path}")
     found = sum(1 for s in signals.values() if s is not None)
     print(f"Resolved {found}/{len(universe)} latest signals (as of {as_of.isoformat()}).")
 
@@ -283,6 +563,21 @@ def main() -> None:
         n_betas = sum(1 for b in beta_map.values() if b is not None)
         print(f"Computed {n_betas}/{len(universe)} betas + correlation matrix.")
 
+    sector_shocks: dict[str, SectorShock] = {}
+    if not args.no_prices and sizing_config.sector_shock_guard_enabled:
+        print("Checking same-day sector shock guards...")
+        sector_shocks = fetch_sector_shocks(
+            signals,
+            config=sizing_config,
+            as_of=as_of,
+        )
+        if sector_shocks:
+            triggered = ", ".join(
+                f"{s} ({sh.trigger_symbol} {sh.pct_change*100:.1f}%)"
+                for s, sh in sorted(sector_shocks.items())
+            )
+            print(f"Sector shock guard triggered: {triggered}")
+
     actions, summary = compute_actions(
         signals=signals,
         positions=positions,
@@ -293,6 +588,7 @@ def main() -> None:
         risk_limits=risk_limits,
         beta_map=beta_map,
         correlation_matrix=corr_matrix,
+        sector_shocks=sector_shocks,
     )
 
     # Load option positions from the same positions ledger (Section 27).

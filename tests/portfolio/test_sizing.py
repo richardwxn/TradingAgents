@@ -57,6 +57,23 @@ def test_sizing_config_from_dict_ignores_unknown_keys():
     assert cfg.tradingagents_review_top_screener_n == 3
 
 
+def test_sizing_config_from_dict_parses_sector_shock_guard_block():
+    cfg = sizing_config_from_dict({
+        "sector_shock_guard": {
+            "enabled": False,
+            "drop_pct": 0.05,
+            "new_buy_size_factor": 0.25,
+            "existing_position_size_factor": 0.75,
+            "etfs": {"Semiconductors": "SMH"},
+        }
+    })
+    assert cfg.sector_shock_guard_enabled is False
+    assert cfg.sector_shock_drop_pct == pytest.approx(0.05)
+    assert cfg.sector_shock_new_buy_size_factor == pytest.approx(0.25)
+    assert cfg.sector_shock_existing_position_size_factor == pytest.approx(0.75)
+    assert cfg.sector_shock_etfs["Semiconductors"] == "SMH"
+
+
 # ---------- equal_weight_bullish ----------
 
 

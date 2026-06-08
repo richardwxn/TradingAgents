@@ -167,6 +167,53 @@ def test_build_review_prompt_contains_required_payload():
     assert payload["tuner_candidates"][0]["candidate"]["candidate_id"] == "c1"
 
 
+def test_report_context_from_payload_matches_saved_report_shape():
+    payload = {
+        "symbol": "NVDA",
+        "as_of_date": "2026-05-22",
+        "direction": "bullish",
+        "confidence": 0.72,
+        "risk_flags": ["High forecast range."],
+        "data_quality": {"scoring_coverage": 0.8},
+        "key_features": {
+            "technical": {"close": 100.0},
+            "fundamental": {"forward_pe": 30.0},
+            "options_flow": {"unusual_count": 2},
+            "market_context": {"spy_return_20d": 0.03},
+            "industry_context": {"sector": "Technology"},
+            "competitor_analysis": {"summary": {"return_20d_vs_peers": 0.02}},
+            "earnings_calendar": {"next_earnings_date": "2026-05-28"},
+            "model_scoring": {
+                "composite_score": 0.4,
+                "pillar_scores": {"technical": 0.2},
+                "factor_scores": [
+                    {
+                        "factor": "weak",
+                        "weighted_score": 0.01,
+                        "data_available": True,
+                    },
+                    {
+                        "factor": "strong",
+                        "weighted_score": 0.2,
+                        "data_available": True,
+                    },
+                    {
+                        "factor": "missing",
+                        "weighted_score": 1.0,
+                        "data_available": False,
+                    },
+                ],
+            },
+        },
+    }
+    context = agent_review.report_context_from_payload(payload)
+    assert context["symbol"] == "NVDA"
+    assert context["composite_score"] == 0.4
+    assert context["coverage"] == 0.8
+    assert context["competitor_summary"]["return_20d_vs_peers"] == 0.02
+    assert [f["factor"] for f in context["top_factors"]] == ["strong", "weak"]
+
+
 def test_select_representative_contexts_is_deterministic_and_deduped():
     originals = [
         _record("AAA", "2026-01-01", direction="neutral", composite=0.01, ret_20d=0.01),

@@ -3,8 +3,162 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
+import trade_tickets
+from portfolio.execution import ExecutionConfig
+from portfolio.signals import Action, Signal
+
+
+def _action(symbol: str = "NVDA", **overrides) -> Action:
+    base = {
+        "symbol": symbol,
+        "action": "BUY",
+        "direction": "bullish",
+        "composite": 0.4,
+        "confidence": 0.7,
+        "target_weight": 0.10,
+        "current_weight": 0.0,
+        "delta_pp": 0.10,
+        "target_shares": 5,
+        "current_shares": 0,
+        "delta_shares": 5,
+        "limit_price": 100.0,
+        "stop_loss": 95.0,
+        "last_close": 101.0,
+        "sma20": 100.0,
+        "atr14": 4.0,
+        "signal_age_days": 1,
+    }
+    base.update(overrides)
+    return Action(**base)
+
+
+def _signal(path: Path, **gate) -> Signal:
+    return Signal(
+        symbol="NVDA",
+        as_of_date="2026-05-31",
+        direction="bullish",
+        composite=0.4,
+        confidence=0.7,
+        source_path=str(path),
+        tradingagents_review_gate=gate,
+    )
+
+
+def test_select_review_candidates_only_buy_add_missing_valid_gate(tmp_path):
+    report = tmp_path / "NVDA.json"
+    report.write_text("{}")
+    candidates = trade_tickets._select_review_candidates(
+        [
+            _action("NVDA", action="BUY", delta_pp=0.10),
+            _action("AMD", action="TRIM", delta_pp=-0.20),
+            _action("AVGO", action="ADD", delta_pp=0.05),
+        ],
+        {
+            "NVDA": _signal(report),
+            "AMD": _signal(report),
+            "AVGO": _signal(report, status="ok", ticket_gate="allow"),
+        },
+        top_n=5,
+    )
+    assert [a.symbol for a in candidates] == ["NVDA"]
+
+
+def test_ensure_reviews_injects_shadow_gate_without_enforcing(tmp_path, monkeypatch):
+    report = tmp_path / "NVDA.json"
+    report.write_text(json.dumps({
+        "symbol": "NVDA",
+        "as_of_date": "2026-05-31",
+        "direction": "bullish",
+        "confidence": 0.7,
+        "key_features": {"model_scoring": {"composite_score": 0.4}},
+    }))
+    sizing = tmp_path / "sizing.yaml"
+    sizing.write_text("tradingagents_review_top_screener_n: 3\n")
+
+    def _fake_review(**_kwargs):
+        return {
+            "status": "ok",
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "review_type": "report",
+            "gate": {
+                "status": "ok",
+                "ticket_gate": "manual_review",
+                "reason": "Needs human confirmation.",
+                "execution_caveats": ["Risk critique."],
+            },
+        }
+
+    monkeypatch.setattr(
+        "tradingagents.analysis_only.agent_review.run_report_agent_review",
+        _fake_review,
+    )
+    args = Namespace(
+        ensure_tradingagents_review=True,
+        review_mode="shadow",
+        sizing_config=str(sizing),
+        tradingagents_review_top_n=None,
+        tradingagents_review_provider="openai",
+        tradingagents_review_model="gpt-5.4-mini",
+        tradingagents_review_base_url=None,
+    )
+    actions, summary = trade_tickets._ensure_tradingagents_reviews(
+        [_action()],
+        {"NVDA": _signal(report)},
+        args=args,
+        execution_config=ExecutionConfig(),
+    )
+    assert summary["mode"] == "shadow"
+    assert summary["manual_review_symbols"] == ["NVDA"]
+    assert summary["enforced"] is False
+    assert actions[0].review_gate_status == "manual_review"
+    assert actions[0].tradingagents_review["mode"] == "shadow"
+
+
+def test_ensure_reviews_marks_enforced_when_config_allows(tmp_path, monkeypatch):
+    report = tmp_path / "NVDA.json"
+    report.write_text(json.dumps({
+        "symbol": "NVDA",
+        "as_of_date": "2026-05-31",
+        "direction": "bullish",
+        "key_features": {"model_scoring": {"composite_score": 0.4}},
+    }))
+    sizing = tmp_path / "sizing.yaml"
+    sizing.write_text("tradingagents_review_top_screener_n: 1\n")
+
+    monkeypatch.setattr(
+        "tradingagents.analysis_only.agent_review.run_report_agent_review",
+        lambda **_kwargs: {
+            "status": "ok",
+            "gate": {
+                "status": "ok",
+                "ticket_gate": "block_buy_add",
+                "reason": "Risk review vetoes new long exposure.",
+                "execution_caveats": [],
+            },
+        },
+    )
+    args = Namespace(
+        ensure_tradingagents_review=True,
+        review_mode="enforce",
+        sizing_config=str(sizing),
+        tradingagents_review_top_n=None,
+        tradingagents_review_provider="openai",
+        tradingagents_review_model="gpt-5.4-mini",
+        tradingagents_review_base_url=None,
+    )
+    actions, summary = trade_tickets._ensure_tradingagents_reviews(
+        [_action()],
+        {"NVDA": _signal(report)},
+        args=args,
+        execution_config=ExecutionConfig(tradingagents_review_apply_to_tickets=True),
+    )
+    assert summary["enforced"] is True
+    assert summary["blocked_symbols"] == ["NVDA"]
+    assert actions[0].tradingagents_review["enforced"] is True
 
 def test_trade_tickets_no_prices_writes_blocked_artifacts(tmp_path):
     report_dir = tmp_path / "reports"
@@ -19,12 +173,14 @@ def test_trade_tickets_no_prices_writes_blocked_artifacts(tmp_path):
             "option_strategies": {
                 "strategies": [
                     {
-                        "type": "sell_put",
+                        "type": "buy_call_spread",
                         "verdict": "consider",
-                        "reason": "Pays premium to enter lower.",
+                        "reason": "Defines bullish upside risk.",
                         "expiry": "2026-06-19",
-                        "strike": 120.0,
-                        "premium": 2.5,
+                        "dte": 19,
+                        "long_strike": 120.0,
+                        "short_strike": 130.0,
+                        "debit": 2.5,
                     }
                 ]
             },
@@ -105,3 +261,6 @@ def test_trade_tickets_no_prices_writes_blocked_artifacts(tmp_path):
     assert "Codex Robinhood MCP Steps" not in md
     assert "Blocked Or Intent Only" in md
     assert "Option Score" in md
+    assert "Contract" in md
+    assert "$120.00-$130.00 call spread" in md
+    assert "- Option contract: 2026-06-19 / 19 DTE / $120.00-$130.00 call spread" in md
