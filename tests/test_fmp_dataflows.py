@@ -55,43 +55,38 @@ def _fmp_key(monkeypatch):
 # fmp_request / error handling
 # --------------------------------------------------------------------------
 
-def test_fmp_request_injects_api_key_and_builds_url():
+def test_fmp_request_injects_api_key_and_builds_stable_url():
     session = _StubSession([{"ok": True}])
-    out = fmp_request("profile/AAPL", session=session)
+    out = fmp_request("profile", {"symbol": "AAPL"}, session=session)
     assert out == {"ok": True}
     call = session.calls[0]
-    assert call["url"] == "https://financialmodelingprep.com/api/v3/profile/AAPL"
+    assert call["url"] == "https://financialmodelingprep.com/stable/profile"
+    assert call["params"]["symbol"] == "AAPL"
     assert call["params"]["apikey"] == "test-key"
-
-
-def test_fmp_request_version_segment():
-    session = _StubSession([{"ok": True}])
-    fmp_request("some/endpoint", version="v4", session=session)
-    assert "/api/v4/some/endpoint" in session.calls[0]["url"]
 
 
 def test_fmp_request_http_429_is_rate_limit():
     session = _StubSession([_StubResponse({}, status_code=429)])
     with pytest.raises(FMPRateLimitError):
-        fmp_request("profile/AAPL", session=session)
+        fmp_request("profile", {"symbol": "AAPL"}, session=session)
 
 
 def test_fmp_request_limit_message_is_rate_limit():
     session = _StubSession([{"Error Message": "Limit Reach. Please upgrade your plan."}])
     with pytest.raises(FMPRateLimitError):
-        fmp_request("profile/AAPL", session=session)
+        fmp_request("profile", {"symbol": "AAPL"}, session=session)
 
 
 def test_fmp_request_other_error_message_raises_fmp_error():
     session = _StubSession([{"Error Message": "Invalid symbol ZZZZ"}])
     with pytest.raises(FMPError):
-        fmp_request("profile/ZZZZ", session=session)
+        fmp_request("profile", {"symbol": "ZZZZ"}, session=session)
 
 
 def test_fmp_request_missing_key_raises(monkeypatch):
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     with pytest.raises(ValueError):
-        fmp_request("profile/AAPL", session=_StubSession([{}]))
+        fmp_request("profile", {"symbol": "AAPL"}, session=_StubSession([{}]))
 
 
 # --------------------------------------------------------------------------
@@ -137,13 +132,13 @@ def test_filter_noop_without_curr_date():
 
 def test_get_fundamentals_combines_profile_metrics_ratios(monkeypatch):
     payloads = {
-        "profile/AAPL": [{"companyName": "Apple Inc.", "sector": "Technology"}],
-        "key-metrics-ttm/AAPL": [{"peRatioTTM": 30.0}],
-        "ratios-ttm/AAPL": [{"currentRatioTTM": 1.1}],
+        "profile": [{"companyName": "Apple Inc.", "sector": "Technology"}],
+        "key-metrics-ttm": [{"peRatioTTM": 30.0}],
+        "ratios-ttm": [{"currentRatioTTM": 1.1}],
     }
 
-    def fake_request(path, params=None, **kwargs):
-        return payloads[path]
+    def fake_request(endpoint, params=None, **kwargs):
+        return payloads[endpoint]
 
     monkeypatch.setattr(fmp_fundamentals, "fmp_request", fake_request)
     out = json.loads(fmp_fundamentals.get_fundamentals("AAPL", curr_date="2026-06-01"))
@@ -183,15 +178,15 @@ def test_freq_maps_to_period(monkeypatch):
 def test_get_news_passes_date_range(monkeypatch):
     captured = {}
 
-    def fake_request(path, params=None, **kwargs):
-        captured["path"] = path
+    def fake_request(endpoint, params=None, **kwargs):
+        captured["endpoint"] = endpoint
         captured["params"] = params
         return [{"title": "headline", "publishedDate": "2026-05-15"}]
 
     monkeypatch.setattr(fmp_news, "fmp_request", fake_request)
     out = json.loads(fmp_news.get_news("AAPL", "2026-05-01", "2026-05-31"))
-    assert captured["path"] == "stock_news"
-    assert captured["params"]["tickers"] == "AAPL"
+    assert captured["endpoint"] == "news/stock"
+    assert captured["params"]["symbols"] == "AAPL"
     assert captured["params"]["from"] == "2026-05-01"
     assert captured["params"]["to"] == "2026-05-31"
     assert out[0]["title"] == "headline"

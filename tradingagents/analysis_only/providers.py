@@ -1072,7 +1072,7 @@ _FMP_BALANCE_MAP = {
 }
 _FMP_CASHFLOW_MAP = {
     "net_cash_flow_from_operating_activities": "netCashProvidedByOperatingActivities",
-    "net_cash_flow_from_investing_activities": "netCashUsedForInvestingActivites",
+    "net_cash_flow_from_investing_activities": "netCashProvidedByInvestingActivities",
 }
 
 
@@ -1088,8 +1088,11 @@ class FMPFinancialsProvider:
     ``fillingDate`` (when the filing became public) is on/before ``as_of_date``.
     """
 
-    BASE_URL = "https://financialmodelingprep.com/api/v3"
-    _ALL_FETCH_LIMIT = 100
+    # FMP's current "stable" API — symbol is a query param, not a path segment.
+    BASE_URL = "https://financialmodelingprep.com/stable"
+    # Free plan caps statement endpoints at 5 periods (HTTP 402 above that).
+    # 5 quarters is enough for TTM synthesis; raise via FMP_STATEMENT_LIMIT.
+    _DEFAULT_FETCH_LIMIT = 5
 
     def __init__(
         self,
@@ -1100,6 +1103,12 @@ class FMPFinancialsProvider:
         self.api_key = api_key or os.getenv("FMP_API_KEY", "")
         self.session = session or requests.Session()
         self.timeout = timeout
+        try:
+            self._fetch_limit = max(
+                1, int(os.getenv("FMP_STATEMENT_LIMIT", self._DEFAULT_FETCH_LIMIT))
+            )
+        except (TypeError, ValueError):
+            self._fetch_limit = self._DEFAULT_FETCH_LIMIT
 
     def fetch_quarterly(
         self, symbol: str, as_of_date: str, limit: int = 8
@@ -1119,20 +1128,17 @@ class FMPFinancialsProvider:
         # interface parity with PolygonFinancialsProvider.
         return []
 
-    def _statement_url(self, statement: str, symbol: str) -> str:
-        return f"{self.BASE_URL}/{statement}/{symbol.upper()}"
-
     def _fetch_statement(
         self, symbol: str, statement: str, period: str
     ) -> list[dict[str, Any]]:
         params = {
+            "symbol": symbol.upper(),
             "period": period,
-            "limit": self._ALL_FETCH_LIMIT,
+            "limit": self._fetch_limit,
             "apikey": self.api_key,
         }
         response = self.session.get(
-            self._statement_url(statement, symbol), params=params,
-            timeout=self.timeout,
+            f"{self.BASE_URL}/{statement}", params=params, timeout=self.timeout,
         )
         response.raise_for_status()
         data = response.json()
@@ -1202,7 +1208,9 @@ class FMPFinancialsProvider:
             bs = balance_by_date.get(date, {})
             cf = cashflow_by_date.get(date, {})
             records.append({
-                "filing_date": inc.get("fillingDate")
+                # Stable API uses ``filingDate``; legacy v3 used ``fillingDate``.
+                "filing_date": inc.get("filingDate")
+                or inc.get("fillingDate")
                 or inc.get("acceptedDate"),
                 "end_date": date,
                 "start_date": None,
@@ -1221,7 +1229,7 @@ class FMPFinancialsProvider:
         """Up to ``limit`` records filed on/before ``as_of_date``, PIT-correct."""
         if not self.api_key:
             return []
-        cap = max(1, min(int(limit), self._ALL_FETCH_LIMIT))
+        cap = max(1, min(int(limit), self._fetch_limit))
         filtered: list[dict[str, Any]] = []
         for record in self._fetch_all(symbol, period):
             filing_date = record.get("filing_date")

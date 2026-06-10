@@ -46,31 +46,31 @@ class _StatementSession:
 
 def _income():
     return [
-        {"date": "2026-03-31", "fillingDate": "2026-04-20", "revenue": 400,
+        {"date": "2026-03-31", "filingDate": "2026-04-20", "revenue": 400,
          "netIncome": 80, "operatingIncome": 100, "grossProfit": 200},
-        {"date": "2025-12-31", "fillingDate": "2026-01-25", "revenue": 380,
+        {"date": "2025-12-31", "filingDate": "2026-01-25", "revenue": 380,
          "netIncome": 70, "operatingIncome": 95, "grossProfit": 190},
-        {"date": "2025-09-30", "fillingDate": "2025-10-22", "revenue": 360,
+        {"date": "2025-09-30", "filingDate": "2025-10-22", "revenue": 360,
          "netIncome": 60, "operatingIncome": 90, "grossProfit": 180},
     ]
 
 
 def _balance():
     return [
-        {"date": "2026-03-31", "fillingDate": "2026-04-20", "totalAssets": 1000,
+        {"date": "2026-03-31", "filingDate": "2026-04-20", "totalAssets": 1000,
          "totalLiabilities": 600, "totalStockholdersEquity": 400,
          "totalCurrentAssets": 300, "totalCurrentLiabilities": 150,
          "inventory": 50},
-        {"date": "2025-12-31", "fillingDate": "2026-01-25", "totalAssets": 950,
+        {"date": "2025-12-31", "filingDate": "2026-01-25", "totalAssets": 950,
          "totalStockholdersEquity": 380},
     ]
 
 
 def _cashflow():
     return [
-        {"date": "2026-03-31", "fillingDate": "2026-04-20",
+        {"date": "2026-03-31", "filingDate": "2026-04-20",
          "netCashProvidedByOperatingActivities": 120,
-         "netCashUsedForInvestingActivites": -40},
+         "netCashProvidedByInvestingActivities": -40},
     ]
 
 
