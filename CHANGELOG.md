@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [Unreleased]
+
+### Added
+
+- **Financial Modeling Prep (FMP) data vendor.** A third `data_vendors` /
+  `tool_vendors` option for `fundamental_data` and `news_data` alongside
+  `yfinance` and `alpha_vantage`, supplying cleaner company profiles, TTM
+  metrics/ratios, and as-reported statements. Plugs into the existing
+  `route_to_vendor` registry with rate-limit fallback; statements are
+  point-in-time filtered on filing date. Set `FMP_API_KEY`.
+- **SEC filing document analysis.** `SECFilingsProvider` now downloads the
+  primary 10-K / 10-Q / 8-K document and extracts the Risk Factors and MD&A
+  sections (TOC-aware, gated by the section's Item-N marker). The new
+  `sec_analysis` module sends them to an LLM for a structured digest
+  (summary, key risks, MD&A highlights, tone, notable changes). Exposed as
+  the `get_sec_filing_analysis` tool on the fundamentals analyst and via the
+  opt-in `enable_filing_analysis` pipeline flag. Set `SEC_USER_AGENT`.
+- **Equity-research HTML reports.** `render_html` / `render_html_file` and
+  `render_report.py --html` produce a self-contained HTML report with inline
+  CSS and embedded matplotlib charts (factor scorecard, pillar scores,
+  price-target scenarios, price-range forecast fan), reusing the existing
+  equity-research Markdown for prose. Adds `matplotlib` + `markdown` deps.
+
 ## [0.2.5] — 2026-05-11
 
 ### Added

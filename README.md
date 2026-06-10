@@ -151,7 +151,15 @@ export MINIMAX_API_KEY=...         # MiniMax — Global (api.minimax.io, M2.x, 2
 export MINIMAX_CN_API_KEY=...      # MiniMax — China (api.minimaxi.com, M2.x, 204K ctx)
 export OPENROUTER_API_KEY=...      # OpenRouter
 export ALPHA_VANTAGE_API_KEY=...   # Alpha Vantage
+export FMP_API_KEY=...             # Financial Modeling Prep (richer fundamentals)
+export SEC_USER_AGENT="Name email@example.com"  # SEC EDGAR contact (filing analysis)
 ```
+
+`fundamental_data` and `news_data` can be pointed at `fmp` (Financial Modeling
+Prep) in addition to `yfinance` and `alpha_vantage` via the `data_vendors` /
+`tool_vendors` config — FMP supplies cleaner company profiles, TTM metrics, and
+as-reported statements (point-in-time filtered on filing date). SEC EDGAR needs
+no API key, only a contact identifier in `SEC_USER_AGENT` (or `SEC_CONTACT_EMAIL`).
 
 For enterprise providers (e.g. Azure OpenAI, AWS Bedrock), copy `.env.enterprise.example` to `.env.enterprise` and fill in your credentials.
 
@@ -367,6 +375,33 @@ python analysis_ui.py --host 127.0.0.1 --port 8765
 ```
 
 Open `http://127.0.0.1:8765` to choose ticker/date/provider, adjust unusual-options thresholds, tune factor weights, and generate JSON + Markdown reports.
+
+### SEC Filing Analysis
+
+The fundamentals analyst can read a company's most recent 10-K / 10-Q / 8-K
+directly from SEC EDGAR. It downloads the primary document, extracts the Risk
+Factors and Management's Discussion & Analysis sections (point-in-time: only
+filings public on/before the analysis date), and asks the LLM for a structured
+digest — summary, key risks, MD&A highlights, management tone, and notable
+changes. It is exposed to the LangGraph fundamentals analyst as the
+`get_sec_filing_analysis` tool, and to the analysis-only pipeline via the
+`enable_filing_analysis=True` flag (off by default). Set `SEC_USER_AGENT` to a
+contact string so EDGAR does not rate-limit you.
+
+### Equity-Research HTML Reports
+
+Render any analysis-only JSON report as a self-contained HTML equity-research
+document — inline CSS, embedded charts (factor scorecard, pillar scores,
+price-target scenarios, price-range forecast fan), and the equity-research
+narrative. No external assets, so it opens offline and prints cleanly to PDF.
+
+```bash
+python render_report.py --html reports/analysis_ui/NVDA_2026-02-10.json
+python render_report.py --html --full report.json     # full technical layout
+python render_report.py --html --no-charts report.json # text only
+```
+
+Programmatically: `from tradingagents.analysis_only import render_html, render_html_file`.
 
 ### Testing and Model Robustness
 
