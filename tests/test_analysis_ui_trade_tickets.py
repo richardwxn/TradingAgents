@@ -23,6 +23,7 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
         'data-tab="summary"',
         'data-tab="best-buy"',
         'data-tab="trade-tickets"',
+        'data-tab="ml-gate"',
         'data-tab="markdown"',
         'data-tab="json"',
         'id="ticker"',
@@ -44,7 +45,7 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
         assert marker in html
 
     assert html.count('<button class="side-tab') == 3
-    assert html.count('<button class="tab') == 5
+    assert html.count('<button class="tab') == 6
 
 
 def test_analysis_ui_annotates_option_strategy_scores():

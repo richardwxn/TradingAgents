@@ -133,6 +133,24 @@ def make_handler(output_dir: str):
                 job_id = (query.get("job_id") or [""])[0]
                 self._send_json(_best_buy_result(job_id))
                 return
+            if parsed.path == "/api/ml-gate":
+                query = parse_qs(parsed.query)
+                try:
+                    self._send_json(
+                        _ml_gate_snapshot(
+                            as_of=(query.get("date") or [""])[0],
+                            model=(query.get("model") or ["ridge_return"])[0],
+                            horizon=(query.get("horizon") or ["ret_60d"])[0],
+                            threshold=float((query.get("threshold") or ["0.55"])[0]),
+                            base_dir=(query.get("base_dir") or ["reports/paper_trading"])[0],
+                        )
+                    )
+                except Exception as exc:
+                    self._send_json(
+                        {"ok": False, "error": str(exc)},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                return
             if parsed.path == "/report":
                 query = parse_qs(parsed.query)
                 path = (query.get("path") or [""])[0]
@@ -1803,6 +1821,140 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _latest_recommendation_path(base_dir: Path, as_of: str | None = None) -> Path | None:
+    rec_dir = base_dir / "recommendations"
+    if as_of:
+        path = rec_dir / f"{as_of}.jsonl"
+        return path if path.exists() else None
+    files = sorted(rec_dir.glob("*.jsonl"))
+    return files[-1] if files else None
+
+
+def _ml_gate_score(row: dict[str, Any], *, model: str, horizon: str) -> tuple[float | None, dict[str, Any]]:
+    shadow = row.get("ml_shadow") or {}
+    models = shadow.get("models") or {}
+    block = ((models.get(model) or {}).get(horizon) or {})
+    score = _safe_float(block.get("score"))
+    return score, block if isinstance(block, dict) else {}
+
+
+def _ml_gate_snapshot(
+    *,
+    as_of: str,
+    model: str,
+    horizon: str,
+    threshold: float,
+    base_dir: str,
+) -> dict[str, Any]:
+    """Read paper-trading recommendations and compare factor vs ML gate.
+
+    This is display-only. It does not recompute actions, write files, or place
+    orders. The non-ML result is the production action stored in the JSONL;
+    the ML-gated result is a hypothetical allow/block overlay on BUY/ADD rows
+    plus a "would trigger" marker for non-production BUY candidates.
+    """
+
+    base = Path(base_dir).expanduser()
+    if not base.is_absolute():
+        base = (Path.cwd() / base).resolve()
+    else:
+        base = base.resolve()
+    root = Path.cwd().resolve()
+    try:
+        base.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Paper-trading base_dir must be inside the workspace.") from exc
+    path = _latest_recommendation_path(base, as_of.strip() or None)
+    if path is None:
+        return {
+            "ok": True,
+            "path": None,
+            "as_of": as_of or None,
+            "model": model,
+            "horizon": horizon,
+            "threshold": threshold,
+            "rows": [],
+            "summary": {
+                "total": 0,
+                "actionable": 0,
+                "production_buy_triggers": 0,
+                "ml_buy_triggers": 0,
+                "ml_allowed": 0,
+                "ml_blocked": 0,
+                "ml_new_triggers": 0,
+                "disagreements": 0,
+                "missing_ml": 0,
+            },
+            "message": "No paper-trading recommendation log found.",
+        }
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        action = str(payload.get("action") or "").upper()
+        actionable = action in {"BUY", "ADD", "TRIM", "EXIT"}
+        buy_like = action in {"BUY", "ADD"}
+        sell_like = action in {"TRIM", "EXIT"}
+        score, score_block = _ml_gate_score(payload, model=model, horizon=horizon)
+        if score is None:
+            ml_gate = "missing"
+        elif buy_like:
+            ml_gate = "allow" if score >= threshold else "block"
+        elif sell_like:
+            ml_gate = "not_applicable"
+        else:
+            ml_gate = "would_trigger" if score >= threshold else "not_triggered"
+        production_triggered = bool(buy_like)
+        ml_triggered = bool(score is not None and score >= threshold and not sell_like)
+        comparable = bool(score is not None and not sell_like)
+        rows.append(
+            {
+                "symbol": payload.get("symbol"),
+                "action": action,
+                "production_triggered": production_triggered,
+                "direction": payload.get("direction"),
+                "composite": payload.get("composite"),
+                "confidence": payload.get("confidence"),
+                "target_weight": payload.get("target_weight"),
+                "delta_pp": payload.get("delta_pp"),
+                "ml_model": model,
+                "ml_horizon": horizon,
+                "ml_score": score,
+                "ml_raw_score": score_block.get("raw_score"),
+                "ml_calibrated": score_block.get("calibrated"),
+                "ml_gate": ml_gate,
+                "ml_triggered": ml_triggered,
+                "disagreement": bool(production_triggered != ml_triggered) if comparable else False,
+                "notes": payload.get("notes") or [],
+            }
+        )
+    summary = {
+        "total": len(rows),
+        "actionable": sum(1 for r in rows if str(r["action"]).upper() in {"BUY", "ADD", "TRIM", "EXIT"}),
+        "production_buy_triggers": sum(1 for r in rows if r["production_triggered"]),
+        "ml_buy_triggers": sum(1 for r in rows if r["ml_triggered"]),
+        "ml_allowed": sum(1 for r in rows if r["ml_gate"] == "allow"),
+        "ml_blocked": sum(1 for r in rows if r["ml_gate"] == "block"),
+        "ml_new_triggers": sum(1 for r in rows if r["ml_gate"] == "would_trigger"),
+        "disagreements": sum(1 for r in rows if r["disagreement"]),
+        "missing_ml": sum(1 for r in rows if r["ml_gate"] == "missing"),
+    }
+    return {
+        "ok": True,
+        "path": str(path.resolve()),
+        "as_of": path.stem,
+        "model": model,
+        "horizon": horizon,
+        "threshold": threshold,
+        "rows": rows,
+        "summary": summary,
+    }
+
+
 def _clean_factor_weights(raw: dict[str, Any]) -> dict[str, float]:
     cleaned: dict[str, float] = {}
     for key, value in raw.items():
@@ -2131,6 +2283,24 @@ def _html_page() -> str:
     .artifact-row a {{ white-space: nowrap; }}
     .handoff-box {{ background: var(--panel-soft); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
     .handoff-box p {{ margin: 0 0 10px; color: var(--muted); line-height: 1.45; }}
+    .control-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 12px; }}
+    .control-grid button {{ min-height: 42px; }}
+    .gate-badge {{
+      display: inline-flex;
+      align-items: center;
+      border-radius: 6px;
+      padding: 4px 7px;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: #fff;
+      background: var(--muted);
+      white-space: nowrap;
+    }}
+    .gate-badge.allow, .gate-badge.would_trigger {{ background: var(--good); }}
+    .gate-badge.block, .gate-badge.missing {{ background: var(--bad); }}
+    .gate-badge.not_triggered, .gate-badge.not_applicable {{ background: var(--warn); }}
+    tr.disagreement td {{ background: rgba(176, 84, 54, .08); }}
     .agent-room {{ display: grid; gap: 12px; }}
     .agent-room details {{ border-top: 1px solid var(--line); padding-top: 10px; }}
     .agent-room summary {{ cursor: pointer; font-weight: 750; margin-bottom: 8px; }}
@@ -2409,12 +2579,14 @@ def _html_page() -> str:
         <button class="tab active" data-tab="summary" type="button">Summary</button>
         <button class="tab" data-tab="best-buy" type="button">Best Buy</button>
         <button class="tab" data-tab="trade-tickets" type="button">Trade Tickets</button>
+        <button class="tab" data-tab="ml-gate" type="button">ML Gate</button>
         <button class="tab" data-tab="markdown" type="button">Markdown</button>
         <button class="tab" data-tab="json" type="button">JSON</button>
       </div>
       <div id="summary"></div>
       <div id="best-buy" class="hidden"></div>
       <div id="trade-tickets" class="hidden"></div>
+      <div id="ml-gate" class="hidden"></div>
       <pre id="markdown" class="hidden"></pre>
       <pre id="json" class="hidden"></pre>
     </section>
@@ -2424,6 +2596,7 @@ def _html_page() -> str:
     const DATA_PROVIDER_ENV = {data_provider_env_json};
     const LLM_MODELS = {llm_models_json};
     const LLM_ENV = {llm_env_json};
+    const TAB_IDS = ['summary', 'best-buy', 'trade-tickets', 'ml-gate', 'markdown', 'json'];
     let bestBuyPoll = null;
     const factors = document.getElementById('factors');
     for (const [name, value] of Object.entries(DEFAULT_WEIGHTS)) {{
@@ -2457,11 +2630,13 @@ def _html_page() -> str:
       btn.addEventListener('click', () => {{
         document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
+        for (const id of TAB_IDS) {{
           document.getElementById(id).classList.toggle('hidden', id !== btn.dataset.tab);
         }}
+        if (btn.dataset.tab === 'ml-gate') loadMlGate();
       }});
     }});
+    renderMlGateShell();
 
     document.querySelectorAll('.side-tab').forEach(btn => {{
       btn.addEventListener('click', () => {{
@@ -2546,7 +2721,7 @@ def _html_page() -> str:
       llmRun.disabled = true;
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
       document.querySelector('[data-tab="best-buy"]').classList.add('active');
-      for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
+      for (const id of TAB_IDS) {{
         document.getElementById(id).classList.toggle('hidden', id !== 'best-buy');
       }}
       document.getElementById('best-buy').innerHTML = `
@@ -2640,7 +2815,7 @@ def _html_page() -> str:
       run.disabled = true;
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
       document.querySelector('[data-tab="trade-tickets"]').classList.add('active');
-      for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
+      for (const id of TAB_IDS) {{
         document.getElementById(id).classList.toggle('hidden', id !== 'trade-tickets');
       }}
       document.getElementById('trade-tickets').innerHTML = `
@@ -2703,7 +2878,7 @@ def _html_page() -> str:
       run.disabled = true;
       document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
       document.querySelector('[data-tab="trade-tickets"]').classList.add('active');
-      for (const id of ['summary', 'best-buy', 'trade-tickets', 'markdown', 'json']) {{
+      for (const id of TAB_IDS) {{
         document.getElementById(id).classList.toggle('hidden', id !== 'trade-tickets');
       }}
       const payload = {{
@@ -3098,6 +3273,156 @@ def _html_page() -> str:
           <pre>${{escapeHtml(data.codex_prompt || '')}}</pre>
         </div>
       `;
+    }}
+    function renderMlGateShell() {{
+      const el = document.getElementById('ml-gate');
+      if (!el || el.dataset.ready === '1') return;
+      el.dataset.ready = '1';
+      el.innerHTML = `
+        <div class="dashboard-panel">
+          <h2>ML gate comparison</h2>
+          <div class="control-grid">
+            <div>
+              <label for="ml_gate_date">Recommendation Date</label>
+              <input id="ml_gate_date" placeholder="latest">
+            </div>
+            <div>
+              <label for="ml_gate_model">Shadow Model</label>
+              <select id="ml_gate_model">
+                <option value="ridge_return">ridge_return</option>
+                <option value="elastic_logit">elastic_logit</option>
+                <option value="hist_gbdt">hist_gbdt</option>
+              </select>
+            </div>
+            <div>
+              <label for="ml_gate_horizon">Horizon</label>
+              <select id="ml_gate_horizon">
+                <option value="ret_60d">ret_60d</option>
+                <option value="ret_20d">ret_20d</option>
+                <option value="ret_5d">ret_5d</option>
+              </select>
+            </div>
+            <div>
+              <label for="ml_gate_threshold">Gate Threshold</label>
+              <input id="ml_gate_threshold" type="number" min="0" max="1" step="0.01" value="0.55">
+            </div>
+            <div>
+              <button id="ml_gate_refresh" class="secondary" type="button">Refresh</button>
+            </div>
+          </div>
+          <p class="hint">Production action is the non-ML factor result from the paper-trading recommendation log. ML gate is a display-only shadow overlay; it does not change tickets or recommendations.</p>
+        </div>
+        <div id="ml-gate-result"></div>
+      `;
+      document.getElementById('ml_gate_refresh').addEventListener('click', loadMlGate);
+    }}
+    async function loadMlGate() {{
+      renderMlGateShell();
+      const result = document.getElementById('ml-gate-result');
+      result.innerHTML = '<div class="dashboard-panel"><p class="hint">Loading ML gate snapshot...</p></div>';
+      const params = new URLSearchParams();
+      const date = document.getElementById('ml_gate_date').value.trim();
+      if (date) params.set('date', date);
+      params.set('model', document.getElementById('ml_gate_model').value);
+      params.set('horizon', document.getElementById('ml_gate_horizon').value);
+      params.set('threshold', document.getElementById('ml_gate_threshold').value || '0.55');
+      try {{
+        const res = await fetch(`/api/ml-gate?${{params.toString()}}`);
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'ML gate snapshot failed');
+        renderMlGate(data);
+      }} catch (err) {{
+        result.innerHTML = `<div class="error">${{escapeHtml(err.message)}}</div>`;
+      }}
+    }}
+    function renderMlGate(data) {{
+      const rows = data.rows || [];
+      const summary = data.summary || {{}};
+      const sortedRows = rows.slice().sort((a, b) => Number(b.disagreement) - Number(a.disagreement) || String(a.symbol || '').localeCompare(String(b.symbol || '')));
+      const result = document.getElementById('ml-gate-result');
+      if (!rows.length) {{
+        result.innerHTML = `
+          <div class="dashboard-panel">
+            <h2>No ML gate rows</h2>
+            <div class="empty-state">${{escapeHtml(data.message || 'No paper-trading recommendation rows found.')}}</div>
+          </div>
+        `;
+        return;
+      }}
+      result.innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>${{fmtNum(summary.disagreements || 0)}} ML disagreement${{summary.disagreements === 1 ? '' : 's'}}</h2>
+              <p>${{escapeHtml(data.model)}} / ${{escapeHtml(data.horizon)}} at threshold ${{fmtPct(data.threshold)}} on ${{escapeHtml(data.as_of || 'latest')}}.</p>
+            </div>
+            <span class="action-badge ${{summary.disagreements ? 'watch' : 'buy'}}">${{summary.disagreements ? 'review' : 'aligned'}}</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Production BUY/ADD', fmtNum(summary.production_buy_triggers || 0))}}
+            ${{statItem('ML buy triggers', fmtNum(summary.ml_buy_triggers || 0))}}
+            ${{statItem('ML allows production', fmtNum(summary.ml_allowed || 0))}}
+            ${{statItem('ML blocks production', fmtNum(summary.ml_blocked || 0))}}
+            ${{statItem('ML-only triggers', fmtNum(summary.ml_new_triggers || 0))}}
+            ${{statItem('Missing ML', fmtNum(summary.missing_ml || 0))}}
+          </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Factor production vs ML shadow gate</h2>
+          <p class="hint">${{escapeHtml(data.path || '')}}</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Production action</th>
+                  <th>Factor score</th>
+                  <th>ML score</th>
+                  <th>ML gate</th>
+                  <th>Comparison</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${{sortedRows.map(mlGateRow).join('')}}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }}
+    function mlGateRow(row) {{
+      return `
+        <tr class="${{row.disagreement ? 'disagreement' : ''}}">
+          <td><strong>${{escapeHtml(row.symbol || '')}}</strong></td>
+          <td>
+            <span class="verdict">${{escapeHtml(row.action || '')}}</span>
+            <div class="hint">${{row.production_triggered ? 'production BUY/ADD' : 'no production BUY/ADD'}}</div>
+          </td>
+          <td>
+            <div>C ${{fmtSigned(row.composite)}}</div>
+            <div class="hint">conf ${{fmtNum(row.confidence)}} · target ${{fmtPct(row.target_weight)}} · delta ${{fmtPct(row.delta_pp)}}</div>
+          </td>
+          <td>
+            <div>${{fmtPct(row.ml_score)}}</div>
+            <div class="hint">raw ${{fmtNum(row.ml_raw_score)}}${{row.ml_calibrated ? ' · calibrated' : ''}}</div>
+          </td>
+          <td>${{mlGateBadge(row.ml_gate)}}</td>
+          <td>${{escapeHtml(mlGateComparison(row))}}</td>
+        </tr>
+      `;
+    }}
+    function mlGateBadge(gate) {{
+      const label = String(gate || 'unknown').replaceAll('_', ' ');
+      return `<span class="gate-badge ${{escapeHtml(gate || '')}}">${{escapeHtml(label)}}</span>`;
+    }}
+    function mlGateComparison(row) {{
+      if (row.ml_gate === 'allow') return 'same: factor BUY/ADD passes ML gate';
+      if (row.ml_gate === 'block') return 'ML blocks production BUY/ADD';
+      if (row.ml_gate === 'would_trigger') return 'ML would trigger where factor did not';
+      if (row.ml_gate === 'not_triggered') return 'same: no BUY/ADD trigger';
+      if (row.ml_gate === 'not_applicable') return 'sell-side action is not ML-gated';
+      if (row.ml_gate === 'missing') return 'missing ML shadow score';
+      return 'unknown';
     }}
     function renderPositionsSource(source) {{
       if (!source || source.source_type === 'unavailable') {{

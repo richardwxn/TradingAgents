@@ -1,0 +1,73 @@
+# Shadow ML benchmark configuration.
+#
+# Production scoring remains the factor model. These settings are used by
+# scripts/eval_ml_models.py to train/evaluate ML models in walk-forward only.
+
+reports_glob: reports/analysis_mvp/*.json
+benchmark: SPY
+horizons: [5, 20, 60]
+primary_horizon: ret_60d
+
+walk_forward:
+  train_months: 18
+  test_months: 3
+  step_months: 1
+  embargo_days_by_horizon:
+    ret_5d: 5
+    ret_20d: 20
+    ret_60d: 60
+
+features:
+  allowlist:
+    - factor_composite
+    - factor_confidence
+    - trend_price_vs_sma20
+    - trend_sma20_vs_sma50
+    - trend_sma50_vs_sma200
+    - momentum_rsi
+    - momentum_macd_hist
+    - momentum_return_20d
+    - breakout_60d
+    - fund_revenue_growth
+    - fund_earnings_growth
+    - fund_profit_margins
+    - fund_fcf_growth
+    - valuation_forward_vs_trailing_pe
+    - valuation_sales_multiple_vs_growth
+    - industry_relative_strength
+    - peer_relative_momentum
+    - peer_relative_valuation
+    - market_spy_trend
+    - market_vix_regime
+    - market_fear_greed_regime
+    - intraday_momentum_rsi
+    - intraday_breakout_signal
+    - filings_recency_signal
+    - options_net_flow
+    - options_iv_term_structure
+    - options_iv_skew
+    - options_iv_rank
+    - news_sentiment
+    - ticker_fear_greed_regime
+
+models:
+  elastic_logit:
+    C: 0.5
+    l1_ratio: 0.25
+    max_iter: 2000
+  ridge_return:
+    alpha: 1.0
+  hist_gbdt:
+    max_depth: 4
+    min_samples_leaf: 50
+    learning_rate: 0.05
+    l2_regularization: 1.0
+    early_stopping_rounds: 50
+    validation_fraction: 0.15
+
+gates:
+  min_alpha_hit_lift: 0.01
+  min_top_k_precision_lift: 0.01
+  max_horizon_regression: 0.01
+  top_k_per_week: 10
+  leak_sanity_ic_ceiling: 0.95
