@@ -27,6 +27,7 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
         'data-tab="markdown"',
         'data-tab="json"',
         'id="ticker"',
+        'id="report_style"',
         'id="watchlist"',
         'id="best_buy_max_report_age_days"',
         'id="trade_ticket_max_report_age_days"',
@@ -46,6 +47,119 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
 
     assert html.count('<button class="side-tab') == 3
     assert html.count('<button class="tab') == 6
+
+
+def test_run_analysis_uses_selected_report_style(tmp_path, monkeypatch):
+    class FakeReport:
+        def to_json_dict(self):
+            return {
+                "symbol": "NVDA",
+                "as_of_date": "2026-06-01",
+                "horizon": "swing_1_4_weeks",
+                "generated_at_utc": "2026-06-01T20:00:00Z",
+                "direction": "bullish",
+                "confidence": 0.8,
+                "thesis": "Test thesis.",
+                "key_features": {
+                    "technical": {"close": 100.0},
+                    "model_scoring": {"composite_score": 0.4},
+                    "decision_summary": {
+                        "status": "ok",
+                        "action": "buy",
+                        "current_price": 100.0,
+                    },
+                },
+                "data_quality": {},
+            }
+
+    class FakeMVP:
+        def __init__(self, **_kwargs):
+            pass
+
+        def report_cache_key(self, symbol, as_of_date):
+            return f"{symbol}-{as_of_date}"
+
+        def run(self, symbol, as_of_date):
+            assert symbol == "NVDA"
+            assert as_of_date == "2026-06-01"
+            return FakeReport()
+
+        def save_report(self, report, output_dir):
+            path = Path(output_dir) / "NVDA_2026-06-01.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report.to_json_dict()))
+            return path
+
+    monkeypatch.setattr(analysis_ui, "AnalysisOnlyMVP", FakeMVP)
+
+    standard = analysis_ui._run_analysis(
+        {
+            "ticker": "NVDA",
+            "date": "2026-06-01",
+            "force_refresh": True,
+        },
+        output_dir=str(tmp_path / "standard"),
+    )
+    equity = analysis_ui._run_analysis(
+        {
+            "ticker": "NVDA",
+            "date": "2026-06-01",
+            "force_refresh": True,
+            "report_style": "equity_research",
+        },
+        output_dir=str(tmp_path / "equity"),
+    )
+
+    assert standard["report_style"] == "standard"
+    assert "# NVDA — Analysis Report" in standard["markdown"]
+    assert "Equity Research Report" not in standard["markdown"]
+    assert equity["report_style"] == "equity_research"
+    assert "# NVDA Equity Research Report" in equity["markdown"]
+    assert "## Executive summary" in Path(equity["markdown_path"]).read_text()
+
+
+def test_run_analysis_rejects_unknown_report_style(tmp_path, monkeypatch):
+    class FakeMVP:
+        def __init__(self, **_kwargs):
+            pass
+
+        def report_cache_key(self, symbol, as_of_date):
+            return f"{symbol}-{as_of_date}"
+
+        def run(self, *_args, **_kwargs):
+            class Report:
+                def to_json_dict(self):
+                    return {
+                        "symbol": "NVDA",
+                        "as_of_date": "2026-06-01",
+                        "key_features": {},
+                        "data_quality": {},
+                    }
+
+            return Report()
+
+        def save_report(self, report, output_dir):
+            path = Path(output_dir) / "NVDA_2026-06-01.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report.to_json_dict()))
+            return path
+
+    monkeypatch.setattr(analysis_ui, "AnalysisOnlyMVP", FakeMVP)
+
+    try:
+        analysis_ui._run_analysis(
+            {
+                "ticker": "NVDA",
+                "date": "2026-06-01",
+                "force_refresh": True,
+                "report_style": "pdf",
+            },
+            output_dir=str(tmp_path),
+        )
+    except ValueError as exc:
+        assert "report_style must be one of" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for unknown report_style.")
 
 
 def test_analysis_ui_annotates_option_strategy_scores():

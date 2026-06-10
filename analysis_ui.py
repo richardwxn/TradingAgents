@@ -33,7 +33,11 @@ from portfolio.execution import (
     ticket_from_action,
 )
 from portfolio.snapshot import load_positions_payload
-from tradingagents.analysis_only import AnalysisOnlyMVP, render_markdown
+from tradingagents.analysis_only import (
+    AnalysisOnlyMVP,
+    render_equity_research_markdown,
+    render_markdown,
+)
 from tradingagents.analysis_only.cache import load_report_if_cache_hit, report_file
 from tradingagents.analysis_only.pipeline import AnalysisReport
 from tradingagents.analysis_only.scoring import DEFAULT_FACTOR_WEIGHTS
@@ -43,6 +47,7 @@ from tradingagents.llm_clients.validators import VALID_MODELS
 DEFAULT_OUTPUT_DIR = "reports/analysis_ui"
 DEFAULT_LLM_MODEL = "gpt-5.4-mini"
 DEFAULT_DATA_PROVIDER = "polygon"
+REPORT_STYLES = {"standard", "equity_research"}
 DEFAULT_PORTFOLIO_PATH = "configs/portfolio_snapshot.json"
 DEFAULT_REPORTS_GLOB = "reports/analysis_mvp/*.json"
 DEFAULT_POSITIONS_PATH = "portfolio/positions.json"
@@ -298,6 +303,9 @@ def _run_analysis(payload: dict[str, Any], output_dir: str) -> dict[str, Any]:
         raise ValueError("Ticker is required.")
     as_of_date = str(payload.get("date") or datetime.now().strftime("%Y-%m-%d"))
     datetime.strptime(as_of_date, "%Y-%m-%d")
+    report_style = _validate_report_style(
+        str(payload.get("report_style") or "standard")
+    )
 
     factor_weights = _clean_factor_weights(payload.get("factor_weights") or {})
     horizon = str(payload.get("horizon") or "swing_1_4_weeks")
@@ -354,7 +362,7 @@ def _run_analysis(payload: dict[str, Any], output_dir: str) -> dict[str, Any]:
         json_path = report_file(out_dir, ticker, as_of_date)
     data = report.to_json_dict()
     _annotate_option_strategy_scores(data)
-    markdown = render_markdown(data)
+    markdown = _render_analysis_markdown(data, report_style)
     md_path = json_path.with_suffix(".md")
     md_path.write_text(markdown)
     return {
@@ -362,9 +370,26 @@ def _run_analysis(payload: dict[str, Any], output_dir: str) -> dict[str, Any]:
         "json_path": str(json_path.resolve()),
         "markdown_path": str(md_path.resolve()),
         "cache_hit": cache_hit,
+        "report_style": report_style,
         "report": data,
         "markdown": markdown,
     }
+
+
+def _render_analysis_markdown(data: dict[str, Any], report_style: str) -> str:
+    report_style = _validate_report_style(report_style)
+    if report_style == "equity_research":
+        return render_equity_research_markdown(data)
+    return render_markdown(data)
+
+
+def _validate_report_style(report_style: str) -> str:
+    if report_style not in REPORT_STYLES:
+        raise ValueError(
+            "report_style must be one of: "
+            + ", ".join(sorted(REPORT_STYLES))
+        )
+    return report_style
 
 
 def _annotate_option_strategy_scores(report: dict[str, Any]) -> dict[str, Any]:
@@ -1494,6 +1519,7 @@ def _best_buy_analysis_payload(
 ) -> dict[str, Any]:
     passthrough_keys = {
         "horizon",
+        "report_style",
         "data_provider",
         "disable_options_scan",
         "min_unusual_option_notional",
@@ -1821,6 +1847,10 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+_ML_GATE_VALID_MODELS: tuple[str, ...] = ("ridge_return", "elastic_logit", "hist_gbdt")
+_ML_GATE_VALID_HORIZONS: tuple[str, ...] = ("ret_5d", "ret_20d", "ret_60d")
+
+
 def _latest_recommendation_path(base_dir: Path, as_of: str | None = None) -> Path | None:
     rec_dir = base_dir / "recommendations"
     if as_of:
@@ -1854,6 +1884,16 @@ def _ml_gate_snapshot(
     plus a "would trigger" marker for non-production BUY candidates.
     """
 
+    if model not in _ML_GATE_VALID_MODELS:
+        raise ValueError(
+            f"Unknown ML model {model!r}. Must be one of: "
+            f"{', '.join(_ML_GATE_VALID_MODELS)}"
+        )
+    if horizon not in _ML_GATE_VALID_HORIZONS:
+        raise ValueError(
+            f"Unknown ML horizon {horizon!r}. Must be one of: "
+            f"{', '.join(_ML_GATE_VALID_HORIZONS)}"
+        )
     base = Path(base_dir).expanduser()
     if not base.is_absolute():
         base = (Path.cwd() / base).resolve()
@@ -2396,6 +2436,11 @@ def _html_page() -> str:
             <option value="position_1_3_months">position 1-3 months</option>
             <option value="long_3_6_months">long 3-6 months</option>
           </select>
+          <label for="report_style">Report Style</label>
+          <select id="report_style" name="report_style">
+            <option value="standard" selected>Standard</option>
+            <option value="equity_research">Equity Research</option>
+          </select>
           <label for="data_provider">Data Provider</label>
           <select id="data_provider" name="data_provider">
             <option value="auto">auto</option>
@@ -2663,6 +2708,7 @@ def _html_page() -> str:
         ticker: document.getElementById('ticker').value,
         date: document.getElementById('date').value,
         horizon: document.getElementById('horizon').value,
+        report_style: document.getElementById('report_style').value,
         data_provider: dataProvider.value,
         competitors: document.getElementById('competitors').value,
         disable_options_scan: document.getElementById('disable_options_scan').checked,
@@ -2766,6 +2812,7 @@ def _html_page() -> str:
         generate_all_reports: forceAllLlm,
         force_refresh_reports: forceAllLlm,
         horizon: document.getElementById('horizon').value,
+        report_style: document.getElementById('report_style').value,
         data_provider: dataProvider.value,
         disable_options_scan: document.getElementById('disable_options_scan').checked,
         min_unusual_option_notional: Number(document.getElementById('min_unusual_option_notional').value),
@@ -2838,6 +2885,7 @@ def _html_page() -> str:
         run_missing_reports: document.getElementById('trade_ticket_run_missing').checked,
         refresh_stale_reports: document.getElementById('trade_ticket_refresh_stale').checked,
         horizon: document.getElementById('horizon').value,
+        report_style: document.getElementById('report_style').value,
         data_provider: dataProvider.value,
         disable_options_scan: document.getElementById('disable_options_scan').checked,
         min_unusual_option_notional: Number(document.getElementById('min_unusual_option_notional').value),
@@ -3310,6 +3358,7 @@ def _html_page() -> str:
               <button id="ml_gate_refresh" class="secondary" type="button">Refresh</button>
             </div>
           </div>
+          <p class="hint warn">Shadow models (<code>ridge_return</code>, <code>elastic_logit</code>, <code>hist_gbdt</code>) <strong>failed multi-regime walk-forward gates</strong>. On bull-tape v1.8-only they showed +12&ndash;13pp 60d alpha lift on tech core; on the combined COVID + 2022 bear + tech rally corpus that collapsed to &plusmn;1pp with worse Brier and worse top-k precision. See <code>backtest/results/ml_shadow_multi_regime_findings.md</code>. ML disagreement does <em>not</em> mean ML is right &mdash; treat this view as inspection, not a signal.</p>
           <p class="hint">Production action is the non-ML factor result from the paper-trading recommendation log. ML gate is a display-only shadow overlay; it does not change tickets or recommendations.</p>
         </div>
         <div id="ml-gate-result"></div>

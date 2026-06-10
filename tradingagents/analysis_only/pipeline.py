@@ -100,6 +100,7 @@ class AnalysisOnlyMVP:
         regime_weights_path: str | None = None,
         confidence_calibration_path: str | None = None,
         enable_llm_critic: bool = False,
+        enable_filing_analysis: bool = False,
         forecast_horizons: dict[str, int] | None = None,
         competitors: list[str] | None = None,
         enable_llm_insights: bool = False,
@@ -149,6 +150,11 @@ class AnalysisOnlyMVP:
         self._confidence_calibration_cache: dict[str, Any] | None = None
         self._confidence_calibration_loaded = False
         self.enable_llm_critic = enable_llm_critic
+        # When on (and filings fetching is enabled), the latest PIT filing is
+        # downloaded, section-split, and sent to the LLM for a structured
+        # digest attached under filings_context["filing_analysis"]. Default
+        # off so standard/backfill runs incur no extra network/LLM cost.
+        self.enable_filing_analysis = enable_filing_analysis
         self.forecast_horizons = forecast_horizons
         self.competitors = [c.upper() for c in (competitors or [])]
         self.enable_llm_insights = enable_llm_insights
@@ -458,6 +464,7 @@ class AnalysisOnlyMVP:
             "forecast_horizons": self.forecast_horizons,
             "competitors": self.competitors,
             "enable_llm_critic": self.enable_llm_critic,
+            "enable_filing_analysis": self.enable_filing_analysis,
             "enable_llm_insights": self.enable_llm_insights,
             "enable_narrative": self.enable_narrative,
             "enable_tradingagents_review": self.enable_tradingagents_review,
@@ -1720,6 +1727,9 @@ class AnalysisOnlyMVP:
             "symbol": symbol.upper(),
             "as_of_date": as_of_date,
             "provider": "sec_submissions",
+            # Segregate analysis-enriched entries from metadata-only ones so a
+            # metadata-only cache hit is not reused when analysis is requested.
+            "with_analysis": self.enable_filing_analysis,
         }
         cached = self._get_cached_json(
             "filings",
@@ -1757,8 +1767,39 @@ class AnalysisOnlyMVP:
             "latest_filing_date": latest.get("filing_date"),
             "cik": latest.get("cik"),
         }
+        if self.enable_filing_analysis:
+            out["filing_analysis"] = self._run_filing_analysis(symbol, as_of_date)
         self._set_cached_json("filings", "latest_filing", cache_payload, out)
         return out
+
+    def _run_filing_analysis(
+        self, symbol: str, as_of_date: str | None
+    ) -> dict[str, Any]:
+        """Download + section-split + LLM-analyze the latest filing.
+
+        Returns the ``analyze_filing`` block. Reuses the pipeline's SEC
+        provider so document fetches share the EDGAR throttle/backoff. Any
+        failure is captured as a status block rather than raised, so a bad
+        filing fetch never aborts report generation.
+        """
+        try:
+            from tradingagents.analysis_only.sec_analysis import analyze_filing
+
+            return analyze_filing(
+                symbol,
+                as_of_date,
+                provider=self.llm_provider,
+                model=self.llm_model,
+                base_url=self.llm_base_url,
+                sec_provider=self.sec_filings_provider,
+            )
+        except Exception as exc:
+            return {
+                "status": "filing_analysis_runtime_error",
+                "error": str(exc),
+                "provider": self.llm_provider,
+                "model": self.llm_model,
+            }
 
     def _load_market_context(self, as_of_date: str) -> dict[str, Any]:
         spy_ret_20d = self._get_return_days("SPY", as_of_date, 20)

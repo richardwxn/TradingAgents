@@ -5,6 +5,7 @@ from typing import Any, Protocol
 import logging
 import math
 import os
+import re
 import threading
 import time
 
@@ -1062,6 +1063,215 @@ class PolygonMarketStatusProvider:
         return status == "open"
 
 
+def strip_html_to_text(document: str) -> str:
+    """Reduce a filing's HTML to readable plain text.
+
+    Uses ``parsel`` (already a project dependency) to drop script/style nodes
+    and collect text. Whitespace is collapsed and non-breaking spaces are
+    normalised so downstream section regexes see clean ``Item N`` headers.
+    Plain-text filings (no tags) pass through largely unchanged.
+    """
+    if not document:
+        return ""
+    from parsel import Selector
+
+    try:
+        selector = Selector(text=document)
+        # Remove non-content nodes before extracting text.
+        for bad in selector.xpath("//script | //style"):
+            bad.root.getparent().remove(bad.root)
+        parts = selector.xpath("//body//text()").getall()
+        if not parts:
+            parts = selector.xpath("//text()").getall()
+        text = " ".join(parts)
+    except Exception:
+        # Fall back to a naive tag strip if parsing fails on malformed HTML.
+        text = re.sub(r"<[^>]+>", " ", document)
+
+    text = text.replace("\xa0", " ").replace("​", "")
+    # Normalise curly quotes so title anchors like "management's discussion"
+    # match regardless of the apostrophe glyph used in the filing.
+    text = text.replace("’", "'").replace("‘", "'")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    return text.strip()
+
+
+# Per-form section maps. Sections are anchored on their TITLE text (more
+# reliable than bare "Item N" numbers, which repeat across Part I/Part II of a
+# 10-Q) and bounded by the next section's title or item marker. Matching is
+# case-insensitive on a whitespace-normalised copy of the text.
+_FILING_SECTION_MAP: dict[str, dict[str, dict[str, list[str]]]] = {
+    "10-K": {
+        "risk_factors": {
+            "starts": ["risk factors"],
+            "prefixes": ["item 1a"],
+            "ends": [
+                "item 1b", "unresolved staff comments", "item 2.",
+                "management's discussion", "properties",
+            ],
+        },
+        "mdna": {
+            "starts": [
+                "management's discussion and analysis", "management's discussion",
+            ],
+            "prefixes": ["item 7"],
+            "ends": [
+                "item 7a", "item 8", "quantitative and qualitative",
+                "financial statements and supplementary",
+            ],
+        },
+    },
+    "10-Q": {
+        "mdna": {
+            "starts": [
+                "management's discussion and analysis", "management's discussion",
+            ],
+            "prefixes": ["item 2"],
+            "ends": [
+                "item 3.", "item 4.", "quantitative and qualitative",
+                "controls and procedures",
+            ],
+        },
+        "risk_factors": {
+            "starts": ["risk factors"],
+            "prefixes": ["item 1a"],
+            "ends": [
+                "item 2.", "unregistered sales", "item 6", "exhibits",
+                "defaults upon senior", "legal proceedings",
+            ],
+        },
+    },
+}
+
+# Window (chars) after a title anchor inspected to decide whether the match is
+# a table-of-contents entry rather than the real section heading.
+_TOC_WINDOW = 60
+_TOC_PAGE_NUM_RE = re.compile(r"^[\s.…]*\d{1,4}\b")
+# Window (chars) before a title anchor searched for its "Item N" marker. The
+# real section heading reads "Item 1A. Risk Factors"; an in-prose mention
+# (e.g. a forward-looking-statements disclaimer) has no item marker just
+# before it, so requiring one filters those out.
+_PREFIX_WINDOW = 40
+
+
+def _looks_like_toc(text_after_anchor: str) -> bool:
+    """Heuristic: does the text right after a title anchor read like a TOC row?
+
+    Table-of-contents rows are followed by dot leaders, a page number, and/or
+    the next item heading; real sections are followed by prose.
+    """
+    head = text_after_anchor[:_TOC_WINDOW]
+    lowered = head.lower()
+    if "item " in lowered:  # another item heading immediately follows
+        return True
+    if "...." in head or "…" in head:  # dot leaders
+        return True
+    if _TOC_PAGE_NUM_RE.match(head):  # leading page number
+        return True
+    return False
+
+
+def _has_item_prefix(lowered: str, anchor_start: int, prefixes: list[str]) -> bool:
+    """True if an ``Item N`` marker sits just before the title anchor."""
+    if not prefixes:
+        return True  # no prefix requirement
+    window = lowered[max(0, anchor_start - _PREFIX_WINDOW):anchor_start]
+    return any(p in window for p in prefixes)
+
+
+def _extract_section(
+    text: str,
+    lowered: str,
+    starts: list[str],
+    ends: list[str],
+    *,
+    prefixes: list[str] | None = None,
+    min_len: int = 40,
+) -> str | None:
+    """Slice ``text`` for a section, skipping table-of-contents matches.
+
+    Collects every start-anchor occurrence and drops the ones that look like
+    TOC rows. Candidates whose title is preceded by the section's ``Item N``
+    marker are preferred (the real heading); only if none qualify do we fall
+    back to unprefixed candidates (some filings omit the marker). Among the
+    chosen set, the longest slice to the nearest end anchor wins.
+    """
+    prefixes = prefixes or []
+    prefixed: list[int] = []
+    other: list[int] = []
+    for anchor in starts:
+        pos = 0
+        while True:
+            idx = lowered.find(anchor, pos)
+            if idx == -1:
+                break
+            pos = idx + len(anchor)
+            if _looks_like_toc(text[idx + len(anchor):]):
+                continue
+            if _has_item_prefix(lowered, idx, prefixes):
+                prefixed.append(idx)
+            else:
+                other.append(idx)
+
+    candidates = prefixed or other
+    best: str | None = None
+    for start in candidates:
+        end_idx = len(text)
+        for phrase in ends:
+            phrase_idx = lowered.find(phrase, start + 1)
+            if phrase_idx != -1:
+                end_idx = min(end_idx, phrase_idx)
+        section = text[start:end_idx].strip()
+        if len(section) >= min_len and (best is None or len(section) > len(best)):
+            best = section
+    return best
+
+
+def extract_filing_sections(
+    document_text: str,
+    form: str,
+    *,
+    max_section_chars: int = 20_000,
+) -> dict[str, str]:
+    """Extract the analytically-useful sections from a filing.
+
+    * 10-K: Risk Factors (Item 1A) and MD&A (Item 7).
+    * 10-Q: MD&A (Item 2) and Risk Factors (Part II, Item 1A).
+    * 8-K (and anything unmapped): the full body, since 8-Ks are short and
+      have no stable item structure worth slicing.
+
+    Each section is truncated to ``max_section_chars``. Sections that cannot
+    be located are simply omitted; an empty dict means nothing usable was
+    found (the caller can fall back to the raw text).
+    """
+    text = strip_html_to_text(document_text)
+    if not text:
+        return {}
+    form = str(form or "").upper()
+    spec = _FILING_SECTION_MAP.get(form)
+    if not spec:
+        return {"body": text[:max_section_chars]}
+
+    lowered = text.lower()
+    out: dict[str, str] = {}
+    for name, bounds in spec.items():
+        section = _extract_section(
+            text,
+            lowered,
+            bounds["starts"],
+            bounds["ends"],
+            prefixes=bounds.get("prefixes"),
+        )
+        if section:
+            out[name] = section[:max_section_chars]
+    if not out:
+        # Item headers not found (unusual formatting) — give the caller the
+        # head of the document rather than nothing.
+        out["body"] = text[:max_section_chars]
+    return out
+
+
 class SECFilingsProvider:
     """Fetch SEC EDGAR submissions and pick the latest 10-Q/10-K/8-K
     filing on/before ``as_of_date``.
@@ -1082,6 +1292,11 @@ class SECFilingsProvider:
 
     SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
     TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+    # Primary filing documents live under the EDGAR Archives tree. The CIK is
+    # un-padded here and the accession number has its dashes stripped.
+    ARCHIVES_URL = (
+        "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
+    )
     RELEVANT_FORMS = {"10-Q", "10-K", "8-K"}
     MIN_REQUEST_INTERVAL = 0.11  # ~9 req/s, under EDGAR's 10/s ceiling.
     MAX_RETRIES = 3
@@ -1162,6 +1377,82 @@ class SECFilingsProvider:
                 "primary_document": doc,
             }
         return None
+
+    def filing_document_url(self, filing: dict[str, Any]) -> str | None:
+        """Build the EDGAR Archives URL for a filing's primary document.
+
+        Returns ``None`` if the filing dict is missing the cik, accession,
+        or primary_document fields needed to locate the file.
+        """
+        cik = filing.get("cik")
+        accession = filing.get("accession")
+        document = filing.get("primary_document")
+        if not (cik and accession and document):
+            return None
+        return self.ARCHIVES_URL.format(
+            cik=int(cik),
+            accession=str(accession).replace("-", ""),
+            document=document,
+        )
+
+    def fetch_filing_document(
+        self,
+        filing: dict[str, Any],
+        *,
+        max_chars: int = 8_000_000,
+    ) -> str | None:
+        """Fetch the raw primary document (HTML/text) for a filing.
+
+        Returns the document body (truncated to ``max_chars`` to bound memory
+        for pathologically large filings) or ``None`` when the URL cannot be
+        built. The cap is generous because a filing's HTML is ~10x its text,
+        and in a 10-Q the MD&A sits *after* the bulky financial statements —
+        too small a cap would silently drop the section we most want.
+
+        Raises ``SECFetchError`` on transient HTTP/network failures so callers
+        can avoid caching an error.
+        """
+        url = self.filing_document_url(filing)
+        if not url:
+            return None
+        text = self._fetch_text(url, host="www.sec.gov")
+        if max_chars and len(text) > max_chars:
+            return text[:max_chars]
+        return text
+
+    def _fetch_text(self, url: str, *, host: str) -> str:
+        """Fetch a URL returning its raw text body (mirrors ``_fetch_json``).
+
+        Uses the same throttle/backoff/retry policy as the JSON fetcher so a
+        document download stays within EDGAR's rate ceiling.
+        """
+        headers = dict(self.headers)
+        headers["Host"] = host
+        last_exc: Exception | None = None
+        for attempt in range(self.MAX_RETRIES):
+            self._throttle()
+            try:
+                response = requests.get(url, headers=headers, timeout=30)
+            except requests.RequestException as exc:
+                last_exc = exc
+                self._sleep_backoff(attempt)
+                continue
+            status = response.status_code
+            if status == 200:
+                return response.text
+            if status == 429 or 500 <= status < 600:
+                last_exc = SECFetchError(
+                    f"SEC {url} returned HTTP {status} (attempt "
+                    f"{attempt + 1}/{self.MAX_RETRIES})"
+                )
+                self._sleep_backoff(attempt)
+                continue
+            raise SECFetchError(
+                f"SEC {url} returned HTTP {status} (non-retryable)"
+            )
+        raise SECFetchError(
+            f"SEC fetch exhausted retries for {url}: {last_exc}"
+        ) from last_exc
 
     def _get_cik(self, symbol: str) -> str | None:
         mapping = self._load_ticker_mapping()

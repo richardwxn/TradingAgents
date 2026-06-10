@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import analysis_ui
 
 
@@ -80,3 +82,39 @@ def test_analysis_ui_html_exposes_ml_gate_tab():
     assert 'data-tab="ml-gate"' in html
     assert 'id="ml-gate"' in html
     assert "/api/ml-gate" in html
+
+
+def test_analysis_ui_html_includes_multi_regime_warning_banner():
+    """The ML Gate panel must surface the multi-regime findings prominently
+    so users do not mistake ML disagreement for ML being right."""
+    html = analysis_ui._html_page()
+
+    assert "multi-regime walk-forward gates" in html
+    assert "ml_shadow_multi_regime_findings.md" in html
+    assert "hint warn" in html
+
+
+def test_ml_gate_snapshot_rejects_unknown_model(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "paper" / "recommendations").mkdir(parents=True)
+    with pytest.raises(ValueError, match="Unknown ML model"):
+        analysis_ui._ml_gate_snapshot(
+            as_of="2026-06-09",
+            model="totally_made_up",
+            horizon="ret_60d",
+            threshold=0.55,
+            base_dir="paper",
+        )
+
+
+def test_ml_gate_snapshot_rejects_unknown_horizon(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "paper" / "recommendations").mkdir(parents=True)
+    with pytest.raises(ValueError, match="Unknown ML horizon"):
+        analysis_ui._ml_gate_snapshot(
+            as_of="2026-06-09",
+            model="ridge_return",
+            horizon="ret_1y",
+            threshold=0.55,
+            base_dir="paper",
+        )
