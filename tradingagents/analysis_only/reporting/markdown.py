@@ -39,6 +39,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         _render_scorecard(payload),
         _render_pillars(payload),
         _render_fundamentals(payload),
+        _render_sec_filing(payload),
         _render_options(payload),
         _render_options_iv(payload),
         _render_option_strategies(payload),
@@ -52,6 +53,24 @@ def render_markdown(payload: dict[str, Any]) -> str:
         _render_llm_insights(payload),
         _render_tradingagents_review(payload),
         _render_data_quality(payload),
+    ]
+    return "\n\n".join(s for s in sections if s).rstrip() + "\n"
+
+
+def render_equity_research_markdown(payload: dict[str, Any]) -> str:
+    """Render a FinRobot-inspired equity research report from an analysis payload.
+
+    This is intentionally presentation-only: it reorganizes the existing report
+    JSON without changing cache keys, invoking LLMs, or requiring new data.
+    """
+    sections = [
+        _render_er_header(payload),
+        _render_er_executive_summary(payload),
+        _render_er_investment_thesis(payload),
+        _render_er_valuation_and_peers(payload),
+        _render_er_catalysts_and_sentiment(payload),
+        _render_er_risk_assessment(payload),
+        _render_er_trading_plan_appendix(payload),
     ]
     return "\n\n".join(s for s in sections if s).rstrip() + "\n"
 
@@ -903,6 +922,55 @@ def _render_industry_news(p: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_sec_filing(p: dict[str, Any]) -> str:
+    fc = (p.get("key_features") or {}).get("filings_context") or {}
+    block = fc.get("filing_analysis") or {}
+    if not block:
+        return ""
+    filing = block.get("filing") or {}
+    analysis = block.get("analysis") or {}
+    output = analysis.get("output") or {}
+    status = block.get("status")
+
+    if status != "ok" or not output:
+        # Surface the filing pointer + status even when the digest is missing.
+        if not filing:
+            return ""
+        lines = ["## SEC filing analysis", ""]
+        lines.append(
+            f"- **Latest filing:** {filing.get('form') or '?'} "
+            f"filed {filing.get('filing_date') or '?'}"
+        )
+        if filing.get("url"):
+            lines.append(f"- **Source:** {filing['url']}")
+        lines.append(f"- _Analysis unavailable (status: {status})._")
+        return "\n".join(lines)
+
+    header = f"**{filing.get('form') or 'Filing'}**"
+    if filing.get("filing_date"):
+        header += f" filed {filing['filing_date']}"
+    if filing.get("url"):
+        header += f" — [source]({filing['url']})"
+    lines = ["## SEC filing analysis", "", header, ""]
+    if output.get("tone"):
+        lines.append(f"- **Management tone:** {output['tone']}")
+    if output.get("summary"):
+        lines += ["", str(output["summary"])]
+
+    def _bullets(title: str, items: Any) -> list[str]:
+        items = [i for i in (items or []) if str(i).strip()]
+        if not items:
+            return []
+        out = ["", f"**{title}**", ""]
+        out += [f"- {_escape_pipes(str(i))}" for i in items]
+        return out
+
+    lines += _bullets("Key risks", output.get("key_risks"))
+    lines += _bullets("MD&A highlights", output.get("mdna_highlights"))
+    lines += _bullets("Notable changes", output.get("notable_changes"))
+    return "\n".join(lines)
+
+
 def _render_events(p: dict[str, Any]) -> str:
     kf = p.get("key_features") or {}
     events = kf.get("event_timeline") or []
@@ -1042,6 +1110,364 @@ def _render_tradingagents_review(p: dict[str, Any]) -> str:
     if room:
         lines += ["", room]
     return "\n".join(lines)
+
+
+# ---------- equity research report renderers ----------
+
+
+def _render_er_header(p: dict[str, Any]) -> str:
+    symbol = p.get("symbol", "?")
+    as_of = p.get("as_of_date", "?")
+    horizon = (p.get("horizon") or "").replace("_", " ")
+    generated = p.get("generated_at_utc", "?")
+    return "\n".join(
+        [
+            f"# {symbol} Equity Research Report",
+            "",
+            f"- **As of:** {as_of}",
+            f"- **Horizon:** {horizon or '—'}",
+            f"- **Generated (UTC):** {generated}",
+            "- **Report style:** FinRobot-inspired equity research summary",
+        ]
+    )
+
+
+def _render_er_executive_summary(p: dict[str, Any]) -> str:
+    kf = p.get("key_features") or {}
+    decision = kf.get("decision_summary") or {}
+    tech = kf.get("technical") or {}
+    scoring = kf.get("model_scoring") or {}
+    target = kf.get("price_target") or {}
+    action = decision.get("label") or decision.get("action") or p.get("direction")
+    current_price = decision.get("current_price", tech.get("close"))
+    base_target = target.get("base", decision.get("base_target"))
+    base_upside = target.get("base_upside_pct", decision.get("base_upside_pct"))
+    summary = decision.get("summary") or p.get("thesis")
+
+    lines = [
+        "## Executive summary",
+        "",
+        "| Item | Read |",
+        "|---|---|",
+        f"| Direction | {_escape_pipes(str(p.get('direction') or '—'))} |",
+        f"| Action | {_escape_pipes(str(action or '—'))} |",
+        f"| Confidence | {_fmt_num(p.get('confidence'))} |",
+        f"| Composite score | {_fmt_signed(scoring.get('composite_score'))} |",
+        f"| Current price | {_fmt_price(current_price)} |",
+        f"| Base target / upside | {_fmt_price(base_target)} / {_fmt_pct(base_upside)} |",
+        f"| Win probability | {_fmt_pct(decision.get('estimated_win_probability'))} |",
+    ]
+    if summary:
+        lines += ["", f"**Top-line read:** {str(summary).strip()}"]
+    top_positive, top_negative = _er_top_factor_lists(scoring)
+    if top_positive or top_negative:
+        lines += ["", "**Primary evidence**", ""]
+        for label, factors in (("Support", top_positive), ("Pressure", top_negative)):
+            if factors:
+                joined = "; ".join(_er_factor_label(f) for f in factors[:3])
+                lines.append(f"- **{label}:** {joined}")
+    return "\n".join(lines)
+
+
+def _render_er_investment_thesis(p: dict[str, Any]) -> str:
+    thesis = p.get("thesis")
+    bull = p.get("bull_case") or []
+    bear = p.get("bear_case") or []
+    kf = p.get("key_features") or {}
+    narrative = kf.get("llm_narrative") or {}
+    insights = kf.get("llm_insights") or {}
+    if not thesis and not bull and not bear and not insights:
+        return ""
+
+    source = kf.get("narrative_source") or "templated"
+    lines = ["## Investment thesis"]
+    if thesis:
+        lines += ["", f"**Thesis.** {str(thesis).strip()}"]
+        if narrative.get("enabled"):
+            lines.append(f"_Narrative source: {source}; status: {narrative.get('status', 'unknown')}._")
+    if bull:
+        lines += ["", "**Bull case**", ""]
+        lines.extend(f"- {_clean_case_string(str(item))}" for item in bull[:6])
+    if bear:
+        lines += ["", "**Bear case**", ""]
+        lines.extend(f"- {_clean_case_string(str(item))}" for item in bear[:6])
+
+    analysis = insights.get("analysis") or {}
+    if insights.get("enabled") and insights.get("status") == "ok":
+        lines += ["", "**Optional LLM synthesis**", ""]
+        if analysis.get("summary"):
+            lines.append(f"- {analysis.get('summary')}")
+        for key, label in (
+            ("industry_angle", "Industry angle"),
+            ("competitor_angle", "Competitor angle"),
+            ("company_event_angle", "Company event angle"),
+        ):
+            if analysis.get(key):
+                lines.append(f"- **{label}:** {analysis.get(key)}")
+    elif insights.get("enabled"):
+        lines += ["", f"_LLM insights status: {insights.get('status', 'unknown')}._"]
+    return "\n".join(lines)
+
+
+def _render_er_valuation_and_peers(p: dict[str, Any]) -> str:
+    kf = p.get("key_features") or {}
+    fund = kf.get("fundamental") or {}
+    target = kf.get("price_target") or {}
+    comp = kf.get("competitor_analysis") or {}
+    scoring = kf.get("model_scoring") or {}
+    valuation_factors = _er_named_factors(scoring, ("valuation", "peer_relative"))
+    if not fund and not target and not comp and not valuation_factors:
+        return ""
+
+    lines = ["## Valuation and peer read"]
+    rows = [
+        ("Market cap", fund.get("market_cap"), "money"),
+        ("Enterprise value", fund.get("enterprise_value"), "money"),
+        ("Trailing P/E", fund.get("trailing_pe"), "num"),
+        ("Forward P/E", fund.get("forward_pe"), "num"),
+        ("Price / sales", fund.get("price_to_sales"), "num"),
+        ("Revenue growth", fund.get("revenue_growth"), "pct"),
+        ("Profit margin", fund.get("profit_margins"), "pct"),
+        ("ROE", fund.get("return_on_equity"), "pct"),
+    ]
+    present_rows = list(_iter_present(rows))
+    if present_rows:
+        lines += ["", "**Company valuation snapshot**", "", "| Metric | Value |", "|---|---|"]
+        for label, value, kind in present_rows:
+            lines.append(f"| {label} | {_fmt_by_kind(value, kind)} |")
+
+    if target and target.get("status") == "ok":
+        lines += [
+            "",
+            "**Price target scenarios**",
+            "",
+            "| Bear | Base | Bull | Base upside | Confidence | Coverage |",
+            "|---|---|---|---|---|---|",
+            "| {bear} | {base} | {bull} | {up} | {conf} | {cov} |".format(
+                bear=_fmt_price(target.get("bear")),
+                base=_fmt_price(target.get("base")),
+                bull=_fmt_price(target.get("bull")),
+                up=_fmt_pct(target.get("base_upside_pct")),
+                conf=_fmt_num(target.get("confidence")),
+                cov=_fmt_num(target.get("coverage")),
+            ),
+        ]
+        drivers = target.get("drivers") or []
+        if drivers:
+            lines += ["", "**Target drivers**", ""]
+            lines.extend(f"- {_escape_pipes(str(item))}" for item in drivers[:5])
+
+    summary = comp.get("summary") or {}
+    rows = comp.get("peer_metrics") or []
+    if summary or rows:
+        lines += ["", "**Peer-relative read**", ""]
+        if summary:
+            lines.extend(
+                [
+                    f"- Peer count: {_fmt_int(summary.get('peer_count'))}",
+                    f"- 20d return vs peer median: {_fmt_pct(summary.get('return_20d_vs_peers'))}",
+                    f"- Trailing P/E vs peer median: {_fmt_num(summary.get('trailing_pe_vs_peers'))}",
+                    f"- Peer EV/revenue median: {_fmt_num(summary.get('peer_ev_to_revenue_median'))}",
+                ]
+            )
+        if rows:
+            lines += [
+                "",
+                "| Ticker | 20d return | 60d return | Trailing P/E | Rev growth | Market cap |",
+                "|---|---|---|---|---|---|",
+            ]
+            for r in rows[:8]:
+                lines.append(
+                    "| {t} | {r20} | {r60} | {pe} | {rg} | {mc} |".format(
+                        t=r.get("ticker", "?"),
+                        r20=_fmt_pct(r.get("return_20d")),
+                        r60=_fmt_pct(r.get("return_60d")),
+                        pe=_fmt_num(r.get("trailing_pe")),
+                        rg=_fmt_pct(r.get("revenue_growth")),
+                        mc=_fmt_money(r.get("market_cap")),
+                    )
+                )
+
+    if valuation_factors:
+        lines += ["", "**Valuation factors in model**", ""]
+        lines.extend(_er_factor_bullets(valuation_factors[:6]))
+    return "\n".join(lines)
+
+
+def _render_er_catalysts_and_sentiment(p: dict[str, Any]) -> str:
+    kf = p.get("key_features") or {}
+    events = kf.get("event_timeline") or []
+    company_events = kf.get("company_events") or {}
+    industry_news = kf.get("industry_news_context") or {}
+    news_sentiment = kf.get("news_sentiment") or {}
+    filings = kf.get("filings_context") or {}
+    earnings = kf.get("earnings_calendar") or {}
+    if not (events or company_events or industry_news or news_sentiment or filings or earnings):
+        return ""
+
+    lines = ["## Catalysts and sentiment"]
+    next_earnings = (
+        earnings.get("next_earnings_date")
+        or company_events.get("next_earnings_date")
+    )
+    if next_earnings:
+        days = earnings.get("next_earnings_in_calendar_days")
+        suffix = f" (in {_fmt_int(days)} days)" if days is not None else ""
+        lines += ["", f"- **Next earnings:** {next_earnings}{suffix}"]
+    if news_sentiment:
+        lines.append(
+            "- **News sentiment:** "
+            f"{_fmt_num(news_sentiment.get('net_sentiment'))} "
+            f"from {_fmt_int(news_sentiment.get('n_articles'))} articles "
+            f"({news_sentiment.get('status', 'unknown')})"
+        )
+    if filings:
+        latest = filings.get("latest_form") or filings.get("latest_accession")
+        lines.append(
+            "- **Filings context:** "
+            f"{filings.get('status', 'unknown')}"
+            + (f"; latest {latest}" if latest else "")
+        )
+    if industry_news.get("status") == "ok":
+        summary = industry_news.get("semantic_summary")
+        if summary:
+            lines += ["", f"**Industry news read:** {summary}"]
+        themes = industry_news.get("ranked_themes") or []
+        if themes:
+            lines += ["", "| Theme | Count | Examples |", "|---|---:|---|"]
+            for item in themes[:6]:
+                examples = "; ".join(item.get("examples") or [])
+                lines.append(
+                    "| {theme} | {count} | {examples} |".format(
+                        theme=_escape_pipes(str(item.get("theme", "?"))),
+                        count=item.get("count", 0),
+                        examples=_escape_pipes(examples),
+                    )
+                )
+    if events:
+        lines += [
+            "",
+            "**Upcoming or detected catalysts**",
+            "",
+            "| Source | Type | Direction | Relevance | Horizon | Title |",
+            "|---|---|---|---|---|---|",
+        ]
+        for e in events[:10]:
+            lines.append(
+                "| {s} | {t} | {d} | {r} | {h} | {ti} |".format(
+                    s=e.get("source", "?"),
+                    t=e.get("event_type", "?"),
+                    d=e.get("likely_direction", "?"),
+                    r=_fmt_num(e.get("relevance")),
+                    h=e.get("time_horizon", "?"),
+                    ti=_escape_pipes(str(e.get("title", ""))),
+                )
+            )
+    return "\n".join(lines)
+
+
+def _render_er_risk_assessment(p: dict[str, Any]) -> str:
+    kf = p.get("key_features") or {}
+    risks = p.get("risk_flags") or []
+    invalidations = p.get("invalidation_conditions") or []
+    opts = kf.get("options_flow") or {}
+    iv = kf.get("options_iv") or {}
+    dq = p.get("data_quality") or {}
+    pit_warnings = dq.get("pit_warnings") or []
+    if not (risks or invalidations or opts or iv or dq):
+        return ""
+
+    lines = ["## Risk assessment"]
+    if risks:
+        lines += ["", "**Primary risks**", ""]
+        lines.extend(f"- {item}" for item in risks[:8])
+    if invalidations:
+        lines += ["", "**Invalidation conditions**", ""]
+        lines.extend(f"- {item}" for item in invalidations[:8])
+    if opts or iv:
+        lines += [
+            "",
+            "**Options and volatility context**",
+            "",
+            f"- Options scan: {opts.get('scan_status', 'unknown')}; unusual count {_fmt_int(opts.get('unusual_count'))}",
+            f"- Net call-put notional: {_fmt_money(opts.get('net_call_put_notional'))}",
+            f"- ATM IV 30d: {_fmt_pct(iv.get('atm_iv_30d', opts.get('atm_iv_30d')))}",
+            f"- IV rank 252d: {_fmt_pct(iv.get('iv_rank_252d'))}",
+        ]
+    if dq:
+        lines += [
+            "",
+            "**Data quality flags**",
+            "",
+            f"- Provider: requested={dq.get('data_provider_requested')}, resolved={dq.get('data_provider_resolved')}",
+            f"- Scoring coverage: {_fmt_num(dq.get('scoring_coverage'))}",
+            f"- Price rows: {_fmt_int(dq.get('price_rows'))}",
+            f"- Fundamentals present: {dq.get('has_fundamentals')}",
+        ]
+        if pit_warnings:
+            lines += ["", "**PIT warnings**", ""]
+            lines.extend(f"- {item}" for item in pit_warnings[:8])
+    return "\n".join(lines)
+
+
+def _render_er_trading_plan_appendix(p: dict[str, Any]) -> str:
+    sections = [
+        _render_decision_summary(p),
+        _render_price_levels(p),
+        _render_forecasts(p),
+        _render_scorecard(p),
+        _render_pillars(p),
+        _render_option_strategies(p),
+        _render_tradingagents_review(p),
+        _render_data_quality(p),
+    ]
+    body = "\n\n".join(s for s in sections if s)
+    if not body:
+        return ""
+    return "## Trading plan appendix\n\n" + body
+
+
+def _er_top_factor_lists(
+    scoring: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    factors = sorted(
+        scoring.get("factor_scores") or [],
+        key=lambda f: abs(f.get("weighted_score") or 0.0),
+        reverse=True,
+    )
+    positive = [f for f in factors if (f.get("weighted_score") or 0.0) > 0]
+    negative = [f for f in factors if (f.get("weighted_score") or 0.0) < 0]
+    return positive, negative
+
+
+def _er_named_factors(
+    scoring: dict[str, Any],
+    needles: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    factors = scoring.get("factor_scores") or []
+    out = []
+    for factor in factors:
+        name = str(factor.get("factor") or "").lower()
+        pillar = str(factor.get("pillar") or "").lower()
+        if any(needle in name or needle in pillar for needle in needles):
+            out.append(factor)
+    return sorted(out, key=lambda f: abs(f.get("weighted_score") or 0.0), reverse=True)
+
+
+def _er_factor_label(factor: dict[str, Any]) -> str:
+    name = factor.get("factor") or "factor"
+    weighted = _fmt_signed(factor.get("weighted_score"))
+    bucket = factor.get("bucket") or "n/a"
+    return f"{name} {weighted} ({bucket})"
+
+
+def _er_factor_bullets(factors: list[dict[str, Any]]) -> list[str]:
+    lines = []
+    for factor in factors:
+        rationale = str(factor.get("rationale") or "").strip()
+        suffix = f": {rationale}" if rationale else ""
+        lines.append(f"- **{_er_factor_label(factor)}**{suffix}")
+    return lines
 
 
 def _render_tradingagents_gate(gate: dict[str, Any]) -> list[str]:
