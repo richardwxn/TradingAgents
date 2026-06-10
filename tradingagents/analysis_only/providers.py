@@ -892,11 +892,20 @@ class YFinanceNewsProvider:
 _FINANCIALS_ALL_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
 _FINANCIALS_ALL_LOCK = threading.RLock()
 
+_FMP_FINANCIALS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
+_FMP_FINANCIALS_LOCK = threading.RLock()
+
 
 def reset_financials_cache() -> None:
     """Clear the module-level financials cache. Test-only helper."""
     with _FINANCIALS_ALL_LOCK:
         _FINANCIALS_ALL_CACHE.clear()
+
+
+def reset_fmp_financials_cache() -> None:
+    """Clear the module-level FMP financials cache. Test-only helper."""
+    with _FMP_FINANCIALS_LOCK:
+        _FMP_FINANCIALS_CACHE.clear()
 
 
 class PolygonFinancialsProvider:
@@ -1042,6 +1051,189 @@ class PolygonFinancialsProvider:
             return float(v) if v is not None else None
         except (TypeError, ValueError):
             return None
+
+
+# FMP statement field -> Polygon-style GAAP line key. Adapting FMP records
+# into Polygon's nested shape lets the pipeline's `_pf_pick` / TTM-synth logic
+# consume either provider unchanged.
+_FMP_INCOME_MAP = {
+    "revenues": "revenue",
+    "net_income_loss": "netIncome",
+    "operating_income_loss": "operatingIncome",
+    "gross_profit": "grossProfit",
+}
+_FMP_BALANCE_MAP = {
+    "equity": "totalStockholdersEquity",
+    "assets": "totalAssets",
+    "liabilities": "totalLiabilities",
+    "current_assets": "totalCurrentAssets",
+    "current_liabilities": "totalCurrentLiabilities",
+    "inventory": "inventory",
+}
+_FMP_CASHFLOW_MAP = {
+    "net_cash_flow_from_operating_activities": "netCashProvidedByOperatingActivities",
+    "net_cash_flow_from_investing_activities": "netCashUsedForInvestingActivites",
+}
+
+
+class FMPFinancialsProvider:
+    """Point-in-time fundamentals via Financial Modeling Prep.
+
+    A PIT-correct alternative to ``PolygonFinancialsProvider`` for the analysis
+    pipeline. Fetches FMP income / balance-sheet / cash-flow statements, merges
+    them by fiscal period, and adapts each period into Polygon's nested record
+    shape (``record.financials.<statement>.<gaap_key> = {"value", "unit"}`` plus
+    ``filing_date`` / ``end_date`` / ``period_of_report_date``) so the rest of
+    the pipeline consumes it identically. Returns only statements whose
+    ``fillingDate`` (when the filing became public) is on/before ``as_of_date``.
+    """
+
+    BASE_URL = "https://financialmodelingprep.com/api/v3"
+    _ALL_FETCH_LIMIT = 100
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        session: requests.Session | None = None,
+        timeout: int = 20,
+    ):
+        self.api_key = api_key or os.getenv("FMP_API_KEY", "")
+        self.session = session or requests.Session()
+        self.timeout = timeout
+
+    def fetch_quarterly(
+        self, symbol: str, as_of_date: str, limit: int = 8
+    ) -> list[dict[str, Any]]:
+        return self._fetch(symbol, as_of_date, period="quarter", limit=limit)
+
+    def fetch_annual(
+        self, symbol: str, as_of_date: str, limit: int = 3
+    ) -> list[dict[str, Any]]:
+        return self._fetch(symbol, as_of_date, period="annual", limit=limit)
+
+    def fetch_ttm(
+        self, symbol: str, as_of_date: str, limit: int = 4
+    ) -> list[dict[str, Any]]:
+        # FMP exposes no native trailing-twelve-month statement endpoint; the
+        # pipeline synthesizes TTM from four quarters itself. Kept for
+        # interface parity with PolygonFinancialsProvider.
+        return []
+
+    def _statement_url(self, statement: str, symbol: str) -> str:
+        return f"{self.BASE_URL}/{statement}/{symbol.upper()}"
+
+    def _fetch_statement(
+        self, symbol: str, statement: str, period: str
+    ) -> list[dict[str, Any]]:
+        params = {
+            "period": period,
+            "limit": self._ALL_FETCH_LIMIT,
+            "apikey": self.api_key,
+        }
+        response = self.session.get(
+            self._statement_url(statement, symbol), params=params,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    def _fetch_all(self, symbol: str, period: str) -> list[dict[str, Any]]:
+        """Fetch + merge the three statements into Polygon-shaped records.
+
+        Cached per (symbol, period) at module level so threads share results.
+        On any error the empty list is negative-cached for the process.
+        """
+        cache_key = (symbol.upper(), period)
+        with _FMP_FINANCIALS_LOCK:
+            cached = _FMP_FINANCIALS_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            if not self.api_key:
+                _FMP_FINANCIALS_CACHE[cache_key] = []
+                return []
+            try:
+                income = self._fetch_statement(symbol, "income-statement", period)
+                balance = self._fetch_statement(
+                    symbol, "balance-sheet-statement", period
+                )
+                cashflow = self._fetch_statement(
+                    symbol, "cash-flow-statement", period
+                )
+            except Exception:
+                _FMP_FINANCIALS_CACHE[cache_key] = []
+                return []
+            records = self._merge_statements(income, balance, cashflow)
+            _FMP_FINANCIALS_CACHE[cache_key] = records
+            return records
+
+    @staticmethod
+    def _section(row: dict[str, Any], field_map: dict[str, str]) -> dict[str, Any]:
+        section: dict[str, Any] = {}
+        for gaap_key, fmp_key in field_map.items():
+            value = row.get(fmp_key)
+            try:
+                value = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                value = None
+            if value is not None:
+                section[gaap_key] = {"value": value, "unit": "USD"}
+        return section
+
+    def _merge_statements(
+        self,
+        income: list[dict[str, Any]],
+        balance: list[dict[str, Any]],
+        cashflow: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Merge per-statement rows keyed by fiscal period-end date.
+
+        Income statements drive the record set (period date, filing date);
+        balance-sheet and cash-flow lines are joined on the matching date.
+        Records are returned newest-first (FMP's native order).
+        """
+        balance_by_date = {str(r.get("date")): r for r in balance if r.get("date")}
+        cashflow_by_date = {str(r.get("date")): r for r in cashflow if r.get("date")}
+        records: list[dict[str, Any]] = []
+        for inc in income:
+            date = str(inc.get("date") or "")
+            if not date:
+                continue
+            bs = balance_by_date.get(date, {})
+            cf = cashflow_by_date.get(date, {})
+            records.append({
+                "filing_date": inc.get("fillingDate")
+                or inc.get("acceptedDate"),
+                "end_date": date,
+                "start_date": None,
+                "period_of_report_date": date,
+                "financials": {
+                    "income_statement": self._section(inc, _FMP_INCOME_MAP),
+                    "balance_sheet": self._section(bs, _FMP_BALANCE_MAP),
+                    "cash_flow_statement": self._section(cf, _FMP_CASHFLOW_MAP),
+                },
+            })
+        return records
+
+    def _fetch(
+        self, symbol: str, as_of_date: str, period: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Up to ``limit`` records filed on/before ``as_of_date``, PIT-correct."""
+        if not self.api_key:
+            return []
+        cap = max(1, min(int(limit), self._ALL_FETCH_LIMIT))
+        filtered: list[dict[str, Any]] = []
+        for record in self._fetch_all(symbol, period):
+            filing_date = record.get("filing_date")
+            if not filing_date or str(filing_date) > as_of_date:
+                continue
+            end_date = record.get("end_date")
+            if end_date and str(end_date) > as_of_date:
+                continue
+            filtered.append(record)
+            if len(filtered) >= cap:
+                break
+        return filtered
 
 
 class PolygonMarketStatusProvider:
