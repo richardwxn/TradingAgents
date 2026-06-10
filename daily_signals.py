@@ -103,6 +103,34 @@ def _parse_args() -> argparse.Namespace:
             "scoring.py. Combined OR with the pct threshold."
         ),
     )
+    p.add_argument(
+        "--paper-log-dir", default="reports/paper_trading",
+        help=(
+            "Where to append per-day recommendation JSONL files. Used by "
+            "scripts/paper_trading_report.py to compute follow-rate + "
+            "attribution. Default reports/paper_trading."
+        ),
+    )
+    p.add_argument(
+        "--no-paper-log", action="store_true",
+        help=(
+            "Disable the paper-trading recommendation logger. Mostly for "
+            "smoke tests; for production use keep the log on."
+        ),
+    )
+    p.add_argument(
+        "--ml-shadow-config",
+        default="configs/ml_models.yaml",
+        help=(
+            "Optional shadow-ML config. When present, daily paper-trading "
+            "recommendations include non-actionable ML scores under "
+            "`ml_shadow`; production actions are unchanged."
+        ),
+    )
+    p.add_argument(
+        "--no-ml-shadow", action="store_true",
+        help="Disable shadow-ML scoring in the paper-trading log.",
+    )
     return p.parse_args()
 
 
@@ -591,6 +619,33 @@ def main() -> None:
         sector_shocks=sector_shocks,
     )
 
+    ml_shadow_by_symbol: dict[str, dict[str, object]] = {}
+    ml_shadow_config = getattr(args, "ml_shadow_config", None)
+    if (
+        not getattr(args, "no_ml_shadow", False)
+        and ml_shadow_config
+        and Path(ml_shadow_config).exists()
+        and not args.no_prices
+    ):
+        try:
+            from tradingagents.analysis_only.ml_shadow import compute_shadow_predictions
+
+            print("Computing non-actionable ML shadow predictions for paper log...")
+            ml_shadow_by_symbol = compute_shadow_predictions(
+                report_paths=report_paths,
+                signals=signals,
+                as_of_date=as_of.isoformat(),
+                config_path=ml_shadow_config,
+            )
+            print(f"ML shadow predictions attached for {len(ml_shadow_by_symbol)} symbol(s).")
+        except Exception as exc:
+            print(f"  ⚠ ML shadow scoring failed: {type(exc).__name__}: {exc}")
+            ml_shadow_by_symbol = {}
+    elif getattr(args, "no_ml_shadow", False):
+        print("Skipping ML shadow scoring (--no-ml-shadow).")
+    elif args.no_prices:
+        print("Skipping ML shadow scoring (--no-prices).")
+
     # Load option positions from the same positions ledger (Section 27).
     # Backward-compatible: positions without an `options` field yield an
     # empty dict and the section renders to "" (no-op).
@@ -655,6 +710,57 @@ def main() -> None:
     )
     print(f"Wrote: {md_path}")
     print(f"Wrote: {json_path}")
+
+    # Paper-trading dry-run log: persist recommendations to JSONL so the
+    # weekly reporter (scripts/paper_trading_report.py) can join them to
+    # executions (logged via scripts/log_execution.py) and produce a
+    # follow-rate + attribution report. Skipped on --no-paper-log.
+    if not getattr(args, "no_paper_log", False):
+        try:
+            from portfolio.paper_trading import (
+                RecommendationRecord,
+                now_utc_iso,
+                write_recommendations_for_day,
+            )
+            paper_log_dir = Path(getattr(args, "paper_log_dir", "reports/paper_trading"))
+            now_iso = now_utc_iso()
+            recs = [
+                RecommendationRecord(
+                    as_of_date=as_of.isoformat(),
+                    symbol=a.symbol,
+                    action=a.action,
+                    direction=a.direction,
+                    composite=a.composite,
+                    confidence=a.confidence,
+                    target_weight=float(a.target_weight),
+                    current_weight=float(a.current_weight),
+                    delta_pp=float(a.delta_pp),
+                    target_shares=int(a.target_shares),
+                    current_shares=int(a.current_shares),
+                    delta_shares=int(a.delta_shares),
+                    limit_price=a.limit_price,
+                    stop_loss=a.stop_loss,
+                    last_close=a.last_close,
+                    sma20=a.sma20,
+                    atr14=a.atr14,
+                    signal_age_days=a.signal_age_days,
+                    price_source=a.price_source,
+                    notes=list(a.notes or []),
+                    review_gate_status=getattr(a, "review_gate_status", None),
+                    review_gate_reason=getattr(a, "review_gate_reason", None),
+                    ml_shadow=dict(ml_shadow_by_symbol.get(a.symbol.upper(), {})),
+                    generated_at_utc=now_iso,
+                )
+                for a in actions
+            ]
+            pt_path = write_recommendations_for_day(
+                recs, base_dir=paper_log_dir, as_of_date=as_of.isoformat(),
+            )
+            print(f"Paper-trading log: wrote {len(recs)} recommendations → {pt_path}")
+        except Exception as exc:
+            # Logging must NEVER break the daily-signals run. Surface the
+            # error and continue — the user still gets their report.
+            print(f"  ⚠ paper-trading log failed: {type(exc).__name__}: {exc}")
 
     # Brief one-line console summary for the impatient.
     counts: dict[str, int] = {}

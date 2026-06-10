@@ -97,6 +97,11 @@ def _make_weight_fn(source: str, *, custom_weights: dict[str, float] | None,
             )
             return w or None
         return _fit
+    if source == "per_horizon_rolling":
+        # Sentinel: the per-horizon-rolling source is dispatched specially
+        # in main() because it returns DIFFERENT weights per horizon.
+        # Returning None here triggers the dispatch.
+        return None
     if source == "custom_json":
         if not custom_weights:
             raise SystemExit("--weight-source custom_json requires --weights-json")
@@ -104,14 +109,101 @@ def _make_weight_fn(source: str, *, custom_weights: dict[str, float] | None,
         return lambda _train: dict(weights)
     raise SystemExit(
         f"Unknown --weight-source: {source!r}. "
-        "Must be one of: v1.4, v1.5, ic_signed_rolling, custom_json."
+        "Must be one of: v1.4, v1.5, ic_signed_rolling, custom_json, "
+        "per_horizon_json."
     )
+
+
+def _load_per_horizon_weights(path: str) -> dict[str, dict[str, float]]:
+    """Load the JSON written by fit_per_horizon_weights.py."""
+    payload = json.loads(Path(path).read_text())
+    if "weights_by_horizon" not in payload:
+        raise SystemExit(
+            f"{path}: payload missing required key 'weights_by_horizon'"
+        )
+    weights_by_horizon = payload.get("weights_by_horizon")
+    if not isinstance(weights_by_horizon, dict):
+        raise SystemExit(
+            f"{path}: 'weights_by_horizon' must be a dict, got {type(weights_by_horizon).__name__}"
+        )
+    return {
+        h: {k: float(v) for k, v in (w or {}).items()}
+        for h, w in weights_by_horizon.items()
+    }
+
+
+def _fit_per_horizon_weights_for_window(
+    train: list[BacktestRecord], *, horizons: list[str],
+    min_abs_ic: float, min_n: int,
+) -> dict[str, dict[str, float]]:
+    """Per-horizon IC-signed weights computed from a single training window.
+
+    Returns `{horizon: {factor: ic_weight}}`. Used by per_horizon_rolling
+    to get strict OOS weights (no information from test or future windows).
+    """
+    by_factor = explode_records_to_factors(train)
+    if not by_factor:
+        return {h: {} for h in horizons}
+    summary = summarize_factors(by_factor, return_fields=list(horizons))
+    return {
+        h: ic_signed_weights(
+            summary, horizon=h, min_abs_ic=min_abs_ic, min_n=min_n,
+        )
+        for h in horizons
+    }
+
+
+def _evaluate_window_per_horizon(
+    records: list[BacktestRecord],
+    win,
+    *,
+    per_horizon_weights: dict[str, dict[str, float]],
+    horizons: list[str],
+) -> dict:
+    """Run evaluate_window once per horizon, each with its own weight vector.
+
+    Merges the per_horizon sub-dicts. `weights_used` becomes a dict of dicts
+    so downstream CSV / summary code can still render a "n_nonzero" count
+    (it picks the largest by total absolute weight as a proxy).
+    """
+    merged_per_horizon: dict[str, dict] = {}
+    weights_by_h: dict[str, dict[str, float]] = {}
+    train_n = test_n = 0
+    for horizon in horizons:
+        weights = per_horizon_weights.get(horizon) or {}
+        weights_by_h[horizon] = dict(weights)
+        weight_fn = (lambda w=weights: (lambda _train: dict(w) if w else None))()
+        result = evaluate_window(
+            records, win, weight_fn=weight_fn, horizons=[horizon],
+        )
+        merged_per_horizon[horizon] = result["per_horizon"][horizon]
+        train_n = result["train_n"]
+        test_n = result["test_n"]
+    # Pick the densest weight vector as the canonical `weights_used` so the
+    # downstream CSV/summary's n_nonzero column is informative; full per-h
+    # vectors are preserved under `weights_used_per_horizon`.
+    canonical = max(
+        weights_by_h.values(), key=lambda d: sum(1 for v in d.values() if v),
+        default={},
+    )
+    return {
+        "window": win.as_dict(),
+        "train_n": train_n,
+        "test_n": test_n,
+        "weights_used": dict(canonical),
+        "weights_used_per_horizon": weights_by_h,
+        "per_horizon": merged_per_horizon,
+    }
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--reports-glob", default="reports/analysis_mvp/*.json",
+        "--reports-glob", action="append",
+        help=(
+            "Glob for report JSONs. May be passed multiple times. "
+            "Defaults to reports/analysis_mvp/*.json when omitted."
+        ),
     )
     p.add_argument("--train-months", type=int, default=18)
     p.add_argument("--test-months", type=int, default=3)
@@ -133,12 +225,20 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--weight-source", nargs="+", required=True,
-        choices=["v1.4", "v1.5", "ic_signed_rolling", "custom_json"],
+        choices=["v1.4", "v1.5", "ic_signed_rolling", "custom_json",
+                 "per_horizon_json", "per_horizon_rolling"],
         help="One or more weight sources to evaluate against the same windows.",
     )
     p.add_argument(
         "--weights-json", default=None,
         help="Path to weight JSON for --weight-source custom_json.",
+    )
+    p.add_argument(
+        "--per-horizon-weights-json", default=None,
+        help=(
+            "Path to per-horizon weights JSON (output of "
+            "fit_per_horizon_weights.py) for --weight-source per_horizon_json."
+        ),
     )
     p.add_argument(
         "--output-dir", default="backtest/results/walk_forward",
@@ -228,9 +328,16 @@ def main() -> int:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    paths = sorted(glob.glob(args.reports_glob))
+    reports_globs = args.reports_glob or ["reports/analysis_mvp/*.json"]
+    seen: set[str] = set()
+    paths: list[str] = []
+    for pattern in reports_globs:
+        for p in sorted(glob.glob(pattern)):
+            if p not in seen:
+                paths.append(p)
+                seen.add(p)
     if not paths:
-        raise SystemExit(f"No reports matched: {args.reports_glob}")
+        raise SystemExit(f"No reports matched: {reports_globs}")
     print(f"Loading {len(paths)} reports...")
     t0 = time.time()
     records = load_records(
@@ -249,6 +356,14 @@ def main() -> int:
         # Ensure it's a flat dict[str, float].
         if not isinstance(custom_weights, dict):
             raise SystemExit("--weights-json must be a flat factor→weight dict")
+    per_horizon_weights = None
+    if "per_horizon_json" in args.weight_source:
+        if not args.per_horizon_weights_json:
+            raise SystemExit(
+                "--weight-source per_horizon_json requires "
+                "--per-horizon-weights-json <path>"
+            )
+        per_horizon_weights = _load_per_horizon_weights(args.per_horizon_weights_json)
 
     corpus_min, corpus_max = _records_date_span(records)
     windows = generate_windows(
@@ -273,21 +388,56 @@ def main() -> int:
     last_source_summary = None
 
     for source in args.weight_source:
-        weight_fn = _make_weight_fn(
-            source,
-            custom_weights=custom_weights,
-            horizon=args.fit_horizon,
-            min_abs_ic=args.min_abs_ic,
-            min_n=args.min_n,
-        )
-        print(f"[{source}] evaluating {len(windows)} windows...")
-        ts = time.time()
-        per_window: list[dict] = []
-        for win in windows:
-            ws = evaluate_window(
-                records, win, weight_fn=weight_fn, horizons=args.horizons,
+        if source == "per_horizon_json":
+            print(f"[{source}] evaluating {len(windows)} windows "
+                  f"(per-horizon static weights)...")
+            ts = time.time()
+            per_window: list[dict] = []
+            for win in windows:
+                ws = _evaluate_window_per_horizon(
+                    records, win,
+                    per_horizon_weights=per_horizon_weights,
+                    horizons=list(args.horizons),
+                )
+                per_window.append(ws)
+        elif source == "per_horizon_rolling":
+            print(f"[{source}] evaluating {len(windows)} windows "
+                  f"(per-horizon rolling fit, strict OOS)...")
+            ts = time.time()
+            per_window = []
+            for win in windows:
+                train_slice = [
+                    r for r in records
+                    if win.train_start <= r.as_of_date <= win.train_end
+                ]
+                window_weights = _fit_per_horizon_weights_for_window(
+                    train_slice,
+                    horizons=list(args.horizons),
+                    min_abs_ic=args.min_abs_ic,
+                    min_n=args.min_n,
+                )
+                ws = _evaluate_window_per_horizon(
+                    records, win,
+                    per_horizon_weights=window_weights,
+                    horizons=list(args.horizons),
+                )
+                per_window.append(ws)
+        else:
+            weight_fn = _make_weight_fn(
+                source,
+                custom_weights=custom_weights,
+                horizon=args.fit_horizon,
+                min_abs_ic=args.min_abs_ic,
+                min_n=args.min_n,
             )
-            per_window.append(ws)
+            print(f"[{source}] evaluating {len(windows)} windows...")
+            ts = time.time()
+            per_window = []
+            for win in windows:
+                ws = evaluate_window(
+                    records, win, weight_fn=weight_fn, horizons=args.horizons,
+                )
+                per_window.append(ws)
         summary = summarize_walk_forward(
             per_window, horizons=args.horizons,
             baseline_hit_rate=args.baseline_hit_rate,
@@ -340,7 +490,7 @@ def main() -> int:
     )
     md_header = (
         "# Walk-forward OOS evaluation\n\n"
-        f"- Corpus: `{args.reports_glob}` "
+        f"- Corpus: `{', '.join(reports_globs)}` "
         f"(span `{corpus_min}` → `{corpus_max}`, {len(records)} records)\n"
         f"- Windows: train={args.train_months}mo, "
         f"test={args.test_months}mo, step={args.step_months}mo → "

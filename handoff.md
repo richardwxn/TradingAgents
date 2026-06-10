@@ -38,6 +38,8 @@ Goal: report-style deliverable (no automated trading). Every report should be
 | 26 | Earnings-aware sizing + portfolio risk caps | ✅ done | See [Section 26](#26-earnings-aware-sizing--portfolio-level-risk-caps). Long-only-tuned: pre-earnings 50% trim, sector/β/correlation caps with cash-drag-correct beta budget math. |
 | 27 | Phase 2 v1.4 regen + Nasdaq Composite screener + financials cache | ✅ done | See [Section 27](#27-phase-2-v14-regen--nasdaq-composite-screener--financials-cache). v1.4 weights+VIX proxy regen confirms inversion; +0.72pp / +0.79pp at 60d. New screener surfaces high-composite Nasdaq names outside the curated core. Polygon Financials module-level cache shipped for next regen. |
 | 28 | Walk-forward OOS harness + calibration refresh + v1.5/v1.6 commits | ✅ done | See [Section 28](#28-walk-forward-oos-harness--calibration-refresh--v15v16-commits). Walk-forward shows v1.4 not overfit (median ≥ single-split). Calibrated confidence Brier −44%. v1.5 stays committed (walk-forward +0.66pp at 60d). **v1.6 inverts `market_spy_trend`** sign on +0.51pp walk-forward gate. |
+| 29 | v1.7 regime sign flips + bear gate + dir-conditional calibration + new factors + shock refresh + screener (b) | ✅ done | See [Section 29](#29-v17-regime-sign-flips--bear-gate--directional-calibration--shock-refresh). Regime-conditional sign flips on chop records (+1.10pp walk-forward at 60d). Bear-side regime gate gates anti-predictive bearish bucket. Direction-conditional isotonic calibration. New `ticker_fear_greed_regime`, `news_sentiment` factors at weight=0. Polygon news + grouped aggs. ProcessPoolExecutor in regen. Mid-week shock refresh on VIX/sector spike. |
+| 30 | v1.8 commits from multi-regime stress test + paper-trading scaffold | ✅ done | See [Section 30](#30-multi-regime-stress-test--v18-commits--paper-trading-scaffold). Multi-regime corpus (10,241 records, 2020 crash + 2022 bear + tech rally) surfaced that v1.4 fear_greed inversion is regime-rally artifact. v1.8: `ticker_fear_greed_regime` sign-inverted + weight 0→0.02; `options_iv_rank` weight 0.04→0.02. Paper-trading dry-run logger + execution CLI + weekly reporter shipped. |
 
 ## Target architecture (after #7)
 
@@ -3355,3 +3357,313 @@ before tech does. Weight unchanged at 0.04.
    current corpus uses. The right honesty check for any
    regime-sensitive factor (`market_spy_trend`, `market_fear_greed_regime`,
    etc.).
+
+## 29. v1.7 — regime sign flips + bear gate + directional calibration + shock refresh
+
+Big multi-workstream arc. v1.7 layers four orthogonal improvements
+plus a number of new factors / infrastructure pieces. Plan:
+[plans/accuracy_improvements.md](plans/accuracy_improvements.md) +
+ad-hoc.
+
+### A. Regime-conditional sign flips (v1.7 weight commit)
+
+The Priority #1 regime weights experiment ([Section 28's
+parking lot](backtest/results/v1_7_regime_decision.md)) showed that
+wholesale per-regime weight replacement failed the +0.5pp gate, but
+the SIGN disagreement on a handful of factors between trend_on and
+chop is robust:
+- `market_fear_greed_regime`: chop IC -0.17 vs trend_on +0.05.
+- `fund_profit_margins`: chop IC -0.17 vs trend_on +0.08.
+- `options_iv_rank`: chop IC -0.14 vs trend_on +0.04.
+
+New `apply_regime_to_factor_scores` in `scoring.py` negates the score
+on chop-regime records for those three factors. Walk-forward gate on
+the v1.7 corpus: **+1.10pp 60d bullish, +0.50pp 20d, +2.27pp 5d — all
+horizons improve, no regression.**
+
+Live smoke on a chop+extreme-fear date (TSLA 2025-04-11) confirms
+the rationale string annotation `[regime=chop: sign flipped per
+Phase-4 IC]` fires correctly.
+
+### B. Bear-side regime gate
+
+Section 14/15 found bearish hit-rate at ~33% in this corpus
+(anti-predictive vs 50% base rate). New
+`direction_for_composite_regime_gated` downgrades bearish candidates
+to neutral UNLESS regime is `chop` AND `fear_greed_score ≤ −0.2`.
+Falls back to standard direction on unknown regime / no input.
+
+In the walk-forward backtest on the v1.7 corpus, this manifests as
+the bearish bucket count dropping ~50% with bearish hit-rate barely
+moving (the model now refuses bearish calls when conditions don't
+warrant them). The point isn't to improve bearish hit-rate — it's to
+stop emitting low-quality bearish calls in trend_on regimes.
+
+### C. Direction-conditional confidence calibration
+
+`fit_isotonic_calibration_by_direction` fits separate isotonic curves
+per direction (bullish / bearish / neutral). Output preserves the
+all-directions curve as a fallback. `confidence_for(..., direction=...)`
+routes through `apply_isotonic_calibration_directional`.
+
+Live fit on v1.7 corpus:
+- Bullish curve: full 0-1.0 range, midpoint hit-rate 1.0 — strong
+  predictive curve.
+- **Bearish curve: range 0-1.0 BUT midpoint hit-rate 0.000** — PAV
+  plateaus collapsed (heavily anti-predictive).
+- Neutral curve: capped at 0.125.
+
+Daily-signals confidence now correctly down-weights bearish exposure
+without any other code changes — the bearish curve's near-zero values
+get floor-clamped to 0.5 when emitted.
+
+### D. New factors at weight=0 (X1, ticker_fear_greed_regime)
+
+**Polygon news sentiment** (`news_sentiment` factor) — new
+`PolygonNewsProvider` with module-level cache + new
+`compute_news_sentiment` (aggregates Polygon `insights[].sentiment`
+with keyword-fallback over a trailing 14d window). Emitted at
+weight=0 pending IC validation.
+
+**Per-ticker fear/greed** (`ticker_fear_greed_regime` factor) —
+aggregates 5 already-available per-ticker signals (IV rank, 25Δ IV
+skew, drawdown from 52w high, RSI(14), unusual options net flow)
+into a 0-100 score + rating analogous to CNN's market-wide F&G. Live
+smokes confirm sensible per-ticker outputs (TSLA 2025-04-11 = 16.67
+extreme_fear; AAPL 2024-07-19 = 60.00 greed). Emitted at weight=0
+with momentum-following placeholder sign pending IC validation
+(v1.8 inverts and promotes).
+
+### E. Infrastructure: Polygon grouped-aggs + ProcessPoolExecutor
+
+- **Polygon grouped-aggs endpoint** (`/v2/aggs/grouped/locale/us/market/
+  stocks/{date}`) — new `fetch_polygon_grouped_aggs_cached` returns
+  all symbols' daily aggs for one date in a single HTTP call. Wired
+  into `scripts/build_screener_universe.py` ADV pre-computation:
+  **~3000 per-ticker calls → ~30 per-date calls (~100x reduction).**
+- **ProcessPoolExecutor in regen** — `scripts/generate_corpus.py`
+  gains `--executor {process|thread}` flag (default `process`).
+  Module-level caches don't cross process boundaries but the CPU-
+  bound BSM IV / statement-parsing wins dominate on a full regen.
+
+### F. Mid-week shock-triggered refresh
+
+Section 28 honest caveat: "composite is stale within a week." Today's
+sudden semi sell-off scenario (mid-week shock) wouldn't update model
+output until Friday's regen. **Fixed in v1.7.**
+
+New `daily_signals.maybe_refresh_held_composites`:
+- Detects VIX spike (≥15% pct vs prior close OR absolute ≥25) and/or
+  sector ETF crash (existing `SectorShock` infrastructure).
+- If shock detected AND `as_of == today` AND positions exist: kicks off
+  `analysis_mvp.py` for each held ticker before signals are loaded.
+- Subprocess-based; subprocess failures fall through gracefully.
+- Skipped on `--no-shock-refresh` and on back-dated `--as-of` runs.
+
+**Live-verified on actual 2026-06-05 VIX spike** (21.51, +39.7% vs
+prior close). Three test positions (NVDA / AMD / AVGO) all refreshed
+in ~30s; fresh composites correctly emit `regime=chop` with `F&G=fear`
+and v1.7 chop sign flips active.
+
+### G. Screener approach (b) — two-composite emission
+
+Section 27 deferred. `rank_candidates_per_cohort` adds per-cohort
+tables (tech / non_tech) to the screener output so non-tech names
+aren't crushed by tech-weight composites in the global top-N. Live
+smoke shows 10 non-tech names ranked separately from 10 tech names.
+
+### Tests + status
+
+- 1004+ tests passing across the arc.
+- Sample composites verified across multiple smokes (NVDA, TSLA, AAPL,
+  AMD, AVGO).
+- Mid-week shock refresh tested end-to-end against today's live VIX.
+
+### Honest caveats
+
+- All v1.7 weight changes (regime sign flips) are GATED on bull-tape
+  walk-forward. Section 30 (next) reveals that some of v1.5/v1.6/v1.7
+  signal is regime-rally-specific.
+- The bear-side regime gate is correct behavior but means
+  walk-forward on combined multi-regime corpora shows 0% bearish
+  hit-rate — measure bearish accuracy on v1.7-only or pre-gate
+  backtest if needed.
+- `news_sentiment` and `ticker_fear_greed_regime` at weight=0 wait
+  for v1.8's IC measurement on the regenerated corpus.
+
+### Output artifacts
+
+- `tradingagents/analysis_only/scoring.py` — `apply_regime_to_factor_scores`,
+  `REGIME_SIGN_FLIPS`, `direction_for_composite_regime_gated`,
+  `fit_isotonic_calibration_by_direction`,
+  `apply_isotonic_calibration_directional`, `compute_ticker_fear_greed`,
+  `score_ticker_fear_greed_regime`, `compute_news_sentiment`,
+  `score_news_sentiment`.
+- `tradingagents/analysis_only/pipeline.py` — wires regime sign flips
+  + bear gate + dir-conditional calibration + new factor emissions
+  + news sentiment provider + `_load_news_sentiment` helper.
+- `tradingagents/analysis_only/providers.py` — `PolygonNewsProvider`
+  with cache, `fetch_polygon_grouped_aggs_cached`.
+- `scripts/generate_corpus.py` — `--executor` flag + ProcessPool branch
+  + plumbed `confidence_calibration_path` / `regime_weights_path`.
+- `scripts/build_screener_universe.py` — uses grouped-aggs for ADV.
+- `daily_signals.py` — `maybe_refresh_held_composites` + sector shock
+  guard wiring + read-time confidence calibration override.
+- `tradingagents/analysis_only/screener.py` — `rank_candidates_per_cohort`
+  + per-cohort markdown section.
+- `scripts/walk_forward_eval.py` — new walk-forward harness (Unit A).
+
+## 30. Multi-regime stress test + v1.8 commits + paper-trading scaffold
+
+### Multi-regime stress test (most important finding)
+
+Combined corpus: 4,931 v1.7 records (2023-07 → 2026-06) + 5,310
+extended records (2020-01 → 2023-07, regenerated overnight with the
+ProcessPool worker pool) = **10,241 records spanning COVID crash,
+recovery rally, 2022 rate-hike bear, and the 2023-2026 tech rally**.
+
+Walk-forward bullish 60d test_hit at 57 rolling windows:
+
+| Source | Combined | v1.7-only (14 windows) |
+|---|---:|---:|
+| v1.4 weights | 65.09% | 70.78% |
+| **v1.5/v1.6 (current)** | **64.24%** | 72.18% |
+| ic_signed_rolling | 63.91% | 79.58% |
+
+**v1.5/v1.6 weights LOSE 0.85pp on the combined corpus while winning
++1.40pp on v1.7-only.** The +1.40pp lift Section 28/29 measured was
+real for the bull tape; it's regime-specific.
+
+### Per-factor multi-regime cohort IC
+
+| Factor | v1.7-only core IC | Combined core IC | Verdict |
+|---|---:|---:|---|
+| `options_iv_term_structure` | +0.121 | **+0.125** | v1.5 inversion VALIDATED — most robust commit |
+| `market_vix_regime` | -0.115 | -0.093 (92% sign-cons) | Quiet workhorse — most reliable signal in the table |
+| `ticker_fear_greed_regime` | -0.102 | -0.095 (73% sign-cons) | Stable anti-predictive — placeholder sign wrong (v1.8 candidate) |
+| `market_spy_trend` | **+0.181** | +0.066 (58% sign-cons) | v1.6 inversion WEAKER than appeared, magnitude cut by 64% |
+| `market_fear_greed_regime` | +0.178 | **−0.019** | v1.4 inversion is REGIME-RALLY ARTIFACT — signal vanishes outside tech bull tape |
+| `news_sentiment` | -0.021 | -0.023 | Confirmed dead-weight, stays at 0 |
+| `options_iv_rank` | -0.017 | -0.017 | Degraded from Phase 1's +0.107 — weight cut warranted |
+
+Full document: `backtest/results/multi_regime_findings.md`.
+
+### v1.8 commits — two low-regret moves
+
+1. **`ticker_fear_greed_regime`** sign INVERTED + weight 0 → 0.02:
+   - Multi-regime IC -0.095 stable across corpora (v1.7-only -0.102,
+     combined -0.095).
+   - 73% sign-cons. Canary cohort agrees (-0.117).
+   - Current placeholder mimicked v1.4 momentum-following; classical
+     contrarian (fear → bullish, greed → bearish) is the right sign.
+   - Conservative 0.02 weight relative to |IC|=0.095.
+2. **`options_iv_rank`** weight 0.04 → 0.02:
+   - IC degraded from +0.107 (Phase 1) → -0.017 (both recent corpora).
+   - Sign-cons 54% (random). The Section 21 commit doesn't generalize
+     forward.
+   - Cut rather than zero — the factor's data path is healthy; the
+     signal may rotate back.
+
+Walk-forward gate on the combined corpus:
+
+| Horizon | v1.7 baseline | v1.8 candidate | Δ |
+|---|---:|---:|---:|
+| 5d | 55.12% | 54.97% | -0.15pp |
+| 20d | 55.56% | 55.56% | +0.00pp |
+| 60d | 64.24% | 64.20% | -0.04pp |
+
+No horizon regresses by >1pp. The commit story is cross-regime IC
+stability, not headline hit-rate movement.
+
+### Mid-week shock refresh — live-verified
+
+Tested against actual market data on 2026-06-05: VIX spike (15.4 →
+21.51, +39.7%) + SOXX -10.4% + XLK -6.7%. Test portfolio (NVDA / AMD
+/ AVGO) refreshed in 30s; post-refresh reports correctly show
+`regime=chop`, `F&G=fear`, v1.7 chop sign flips active. The biggest
+"system doesn't react to shocks" gap is closed.
+
+### Paper-trading dry-run scaffold
+
+New infrastructure to test the model in live conditions:
+- `portfolio/paper_trading.py` — pure module: `RecommendationRecord`,
+  `ExecutionRecord`, append/load helpers,
+  `join_recommendations_to_executions`, `unattributed_executions`.
+- `daily_signals.py` — writes per-day recommendations JSONL to
+  `reports/paper_trading/recommendations/YYYY-MM-DD.jsonl` after each
+  daily run.
+- `scripts/log_execution.py` — manual CLI for the user to record
+  actual trades. `--list-pending` shows today's actionable recs that
+  don't yet have a matching execution.
+- `scripts/paper_trading_report.py` — weekly diff: follow-rate, by-
+  action breakdown, per-symbol attribution (yfinance forward
+  returns), override reasons, unattributed (pure discretionary)
+  trades.
+
+End-to-end smoke verified: 2 recommendations logged → `--list-pending`
+shows the 1 actionable → execution logged with ref_recommendation_date
+→ report correctly classifies as `followed` with 100% follow-rate.
+
+The model has been tuned through 8 versions (v1.0 → v1.8) entirely
+on historical data. Paper-trading is the only honest test of "would
+the recommendations actually help in live conditions." Run it for
+2-4 weeks of actual trading days to get meaningful data.
+
+### Tests + status
+
+- **1030 tests passing + 1 skipped** (was 1004 pre-paper-trading +
+  pre-v1.8 → +26 net).
+- v1.8 sign-flip + weights verified via live smoke and combined-corpus
+  walk-forward.
+- Paper-trading scaffold round-trip verified end-to-end.
+
+### Honest caveats
+
+- v1.8's expected lift is small (small weights). The commit story is
+  cross-regime IC stability, not headline hit-rate movement.
+- The bullish 60d hit-rate on the combined corpus is 64% — significantly
+  lower than the v1.7-only 72%. This is regime composition (more chop
+  in combined), NOT model degradation.
+- v1.4 (`market_fear_greed_regime`) inversion is the most fragile
+  single commit per multi-regime evidence (combined IC ≈ 0). Kept
+  as-is because the trading universe IS tech; the bull-tape behavior
+  IS the user's operating environment. Worth revisiting if/when the
+  user diversifies away from tech.
+- `market_spy_trend` (v1.6) inversion sign-cons dropped from 88% →
+  58% in multi-regime. Marginal hold; not enough evidence to roll
+  back either.
+- Per-horizon weight vectors (different factors better at different
+  horizons) remains the largest unrealized accuracy lift. Deferred
+  pending paper-trading evidence.
+
+### Output artifacts
+
+- `tradingagents/analysis_only/scoring.py` — v1.8 weight changes +
+  inverted `score_ticker_fear_greed_regime` mapping.
+- `portfolio/paper_trading.py` (new, ~280 lines).
+- `scripts/log_execution.py` (new, ~140 lines).
+- `scripts/paper_trading_report.py` (new, ~270 lines).
+- `daily_signals.py` — paper-trading log integration.
+- `backtest/results/multi_regime_findings.md` — full multi-regime
+  analysis.
+- `/tmp/combined_corpus/` — 10,241-report symlink dir for repeat runs.
+
+### Deferred follow-ups
+
+1. **Paper-trading dry-run for 2-4 weeks** — the actual production
+   test. Wait-and-aggregate, no code changes needed.
+2. **Per-horizon weight vectors** — different weights for
+   `composite_5d` / `composite_20d` / `composite_60d`. ~1 day.
+   Should follow paper-trading evidence.
+3. **`market_fear_greed_regime` weight reduction** — if user
+   diversifies beyond tech, this commit becomes fragile per
+   multi-regime evidence. Watch.
+4. **`trend_sma50_vs_sma200` chop sign flip** — cohort IC -0.227 in
+   v1.7-only suggested a strong candidate, but combined IC is ~0.
+   Needs proper cross-corpus walk-forward before commit.
+5. **Local cache + incremental regen** — still the biggest
+   architectural unlock for iteration cadence. 1-2 weeks. Plan
+   needed.
+6. **Bigger universe** — current model is tech-tuned. Expanding to
+   S&P 500 broad coverage would require ~1 week of regen + re-tune.
+   Only relevant if user wants to trade beyond current 26 names.

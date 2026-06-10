@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 import json
 import logging
 import math
 import os
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -5927,14 +5928,34 @@ class AnalysisOnlyMVP:
             return None
         return (da - db).days
 
+    def _market_now(self) -> datetime:
+        """Current time in the primary US equity market timezone."""
+        return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+
+    def _current_market_reference_date(self) -> date:
+        """Most recent US equity session that should use live snapshots.
+
+        The pipeline previously compared `as_of_date` with the UTC calendar
+        day. That made Sunday-night Pacific runs look historical once UTC had
+        rolled to Monday, even though the latest completed market session was
+        still Friday. Use New York time and walk back before the market opens.
+        """
+        market_now = self._market_now()
+        ref = market_now.date()
+        if ref.weekday() >= 5 or market_now.time() < time(9, 30):
+            ref -= timedelta(days=1)
+        while ref.weekday() >= 5:
+            ref -= timedelta(days=1)
+        return ref
+
     def _resolve_pit_mode(self, as_of_date: str) -> str:
-        """Return 'live' if as_of_date is today/future, else 'historical'."""
-        today = datetime.now(timezone.utc).date()
+        """Return 'live' for the current market reference date or newer."""
+        reference_date = self._current_market_reference_date()
         try:
             target = datetime.strptime(as_of_date, "%Y-%m-%d").date()
         except ValueError:
             return "live"
-        return "live" if target >= today else "historical"
+        return "live" if target >= reference_date else "historical"
 
     def _live_or_leak(self, as_of_date: str) -> str:
         """Status to stamp on sections that always pull realtime data."""
