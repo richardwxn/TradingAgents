@@ -30,6 +30,7 @@ from tradingagents.analysis_only.state_store import StateStore, SymbolState
 from tradingagents.analysis_only.scoring import (
     apply_regime_to_factor_scores,
     compute_composite,
+    compute_per_horizon_composites,
     compute_news_sentiment,
     regime_for_market_context,
     compute_ticker_fear_greed,
@@ -5260,6 +5261,14 @@ class AnalysisOnlyMVP:
                     "factor_scores": factor_scores,
                     "pillar_scores": pillar_scores,
                     "composite_score": round(composite_score, 4),
+                    # Additive per-horizon composites. ret_5d/ret_60d use the
+                    # global vector (== composite_score); ret_20d uses the
+                    # validated IC-signed override. Consumers may read the 20d
+                    # composite for a 20d-horizon view; the primary is unchanged.
+                    "per_horizon_composites": compute_per_horizon_composites(
+                        factor_scores, weights,
+                        global_composite=round(composite_score, 4),
+                    ),
                 },
                 "decision_summary": decision_summary,
                 "portfolio_context": portfolio_context,

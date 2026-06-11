@@ -56,6 +56,10 @@ class Signal:
     sector: str | None = None
     industry: str | None = None
     tradingagents_review_gate: dict[str, Any] = field(default_factory=dict)
+    # Additive 20d-horizon composite (validated per-horizon override). The
+    # primary `composite` is unchanged; this exposes the 20d view for a
+    # future 20d-horizon action surface without altering current sizing.
+    composite_20d: float | None = None
 
     def to_sizing_input(self) -> dict[str, Any]:
         return {
@@ -148,6 +152,8 @@ def _load_signal_from_json(path: Path) -> Signal | None:
     kf = payload.get("key_features") or {}
     model_scoring = kf.get("model_scoring") or {}
     composite = model_scoring.get("composite_score")
+    ph = (model_scoring.get("per_horizon_composites") or {}).get("ret_20d") or {}
+    composite_20d = ph.get("composite_score")
     ec = kf.get("earnings_calendar") or {}
     ind = kf.get("industry_context") or {}
     review_gate = (kf.get("tradingagents_review") or {}).get("gate") or {}
@@ -170,6 +176,9 @@ def _load_signal_from_json(path: Path) -> Signal | None:
         industry=ind.get("industry"),
         tradingagents_review_gate=(
             dict(review_gate) if isinstance(review_gate, dict) else {}
+        ),
+        composite_20d=(
+            float(composite_20d) if composite_20d is not None else None
         ),
     )
 
