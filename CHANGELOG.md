@@ -15,7 +15,11 @@ Breaking changes within the 0.x line are called out explicitly.
   `yfinance` and `alpha_vantage`, supplying cleaner company profiles, TTM
   metrics/ratios, and as-reported statements. Plugs into the existing
   `route_to_vendor` registry with rate-limit fallback; statements are
-  point-in-time filtered on filing date. Set `FMP_API_KEY`.
+  point-in-time filtered on filing date. Set `FMP_API_KEY`. The analysis-only
+  pipeline can also use FMP as its PIT fundamentals source via
+  `fundamentals_provider="fmp"` (`FMPFinancialsProvider`), selected
+  independently of the price `data_provider`; "auto" keeps Polygon-first
+  behavior and falls back to FMP.
 - **SEC filing document analysis.** `SECFilingsProvider` now downloads the
   primary 10-K / 10-Q / 8-K document and extracts the Risk Factors and MD&A
   sections (TOC-aware, gated by the section's Item-N marker). The new

@@ -17,6 +17,7 @@ import yfinance as yf
 from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.analysis_only.providers import (
     FearGreedProvider,
+    FMPFinancialsProvider,
     PolygonFinancialsProvider,
     PolygonNewsProvider,
     SECFetchError,
@@ -29,6 +30,7 @@ from tradingagents.analysis_only.state_store import StateStore, SymbolState
 from tradingagents.analysis_only.scoring import (
     apply_regime_to_factor_scores,
     compute_composite,
+    compute_per_horizon_composites,
     compute_news_sentiment,
     regime_for_market_context,
     compute_ticker_fear_greed,
@@ -93,6 +95,7 @@ class AnalysisOnlyMVP:
         self,
         horizon: str = "swing_1_4_weeks",
         data_provider: str = "polygon",
+        fundamentals_provider: str = "auto",
         options_enabled: bool = True,
         min_unusual_option_notional: float = 500_000.0,
         min_option_volume_oi_ratio: float = 3.0,
@@ -178,6 +181,17 @@ class AnalysisOnlyMVP:
         self.polygon_financials_provider = (
             PolygonFinancialsProvider(api_key=self.polygon_api_key)
             if self.polygon_api_key
+            else None
+        )
+        # Optional FMP fundamentals source. `fundamentals_provider` selects it
+        # independently of `data_provider` (which governs price/news), so a
+        # Polygon price run can use FMP fundamentals. "auto" prefers Polygon
+        # for backward compatibility, falling back to FMP when only FMP is set.
+        self.fundamentals_provider = str(fundamentals_provider or "auto").lower()
+        self.fmp_api_key = os.getenv("FMP_API_KEY", "").strip()
+        self.fmp_financials_provider = (
+            FMPFinancialsProvider(api_key=self.fmp_api_key)
+            if self.fmp_api_key
             else None
         )
         # Polygon news provider for the `news_sentiment` factor. Separate
@@ -453,6 +467,7 @@ class AnalysisOnlyMVP:
             "as_of_date": as_of_date,
             "horizon": self.horizon,
             "data_provider": self.data_provider,
+            "fundamentals_provider": self.fundamentals_provider,
             "options_enabled": self.options_enabled,
             "min_unusual_option_notional": self.min_unusual_option_notional,
             "min_option_volume_oi_ratio": self.min_option_volume_oi_ratio,
@@ -818,20 +833,23 @@ class AnalysisOnlyMVP:
     ) -> dict[str, float | None]:
         is_historical = self._resolve_pit_mode(as_of_date) == "historical"
 
-        if is_historical and self.polygon_financials_provider:
-            pit_fields = self._load_fundamentals_polygon(
+        fin_provider, fin_name = self._active_financials_provider()
+        if is_historical and fin_provider is not None:
+            pit_fields = self._load_fundamentals_pit(
+                provider=fin_provider,
+                provider_name=fin_name,
                 ticker=ticker,
                 as_of_date=as_of_date,
                 spot_close=spot_close,
             )
             if pit_fields is not None:
                 self._set_pit("fundamentals", "pit")
-                self._set_pit("fundamentals.source", "polygon_financials_pit")
+                self._set_pit("fundamentals.source", f"{fin_name}_pit")
                 return {
                     k: self._safe_float(v) for k, v in pit_fields.items()
                 }
             self._log(
-                "Polygon financials returned no PIT data; "
+                f"{fin_name} financials returned no PIT data; "
                 "marking fundamentals unavailable (no PIT fallback for "
                 "historical dates)."
             )
@@ -912,19 +930,40 @@ class AnalysisOnlyMVP:
         )
         return out
 
-    def _load_fundamentals_polygon(
+    def _active_financials_provider(self) -> tuple[Any | None, str]:
+        """Resolve the (provider, name) used for PIT fundamentals.
+
+        ``fundamentals_provider`` selects the source independently of the price
+        ``data_provider``. "auto" preserves the prior behavior (Polygon when
+        available), falling back to FMP; "fmp"/"polygon" force a specific one.
+        The name is used in the PIT label and cache key so the two sources
+        never share cached entries.
+        """
+        pref = self.fundamentals_provider
+        if pref == "fmp" and self.fmp_financials_provider is not None:
+            return self.fmp_financials_provider, "fmp_financials"
+        if pref in ("auto", "polygon") and self.polygon_financials_provider is not None:
+            return self.polygon_financials_provider, "polygon_financials"
+        if pref == "auto" and self.fmp_financials_provider is not None:
+            return self.fmp_financials_provider, "fmp_financials"
+        return None, ""
+
+    def _load_fundamentals_pit(
         self,
+        provider: Any,
+        provider_name: str,
         ticker: Any,
         as_of_date: str,
         spot_close: float | None = None,
     ) -> dict[str, float | None] | None:
-        """PIT fundamentals via Polygon Financials API + price-derived ratios.
+        """PIT fundamentals via a financials provider + price-derived ratios.
 
-        Returns None if Polygon returned no usable data, so the caller can
-        fall back to the live yfinance path. Keys mirror the legacy
-        `_load_fundamentals` shape so downstream factor scoring is unchanged.
+        Works with any provider returning Polygon-shaped records
+        (PolygonFinancialsProvider / FMPFinancialsProvider). Returns None if
+        the provider returned no usable data, so the caller can fall back.
+        Keys mirror the legacy `_load_fundamentals` shape so downstream factor
+        scoring is unchanged.
         """
-        provider = self.polygon_financials_provider
         if provider is None:
             return None
 
@@ -935,7 +974,7 @@ class AnalysisOnlyMVP:
             "spot_close": round(float(spot_close), 6)
             if self._is_valid(spot_close)
             else None,
-            "provider": "polygon_financials_pit",
+            "provider": f"{provider_name}_pit",
         }
         cached = self._get_cached_json(
             "fundamentals",
@@ -957,7 +996,7 @@ class AnalysisOnlyMVP:
                 limit=3,
             )
         except Exception as exc:
-            self._log(f"Polygon financials fetch error: {exc}")
+            self._log(f"{provider_name} financials fetch error: {exc}")
             return None
 
         if not quarterly and not annuals:
@@ -5222,6 +5261,14 @@ class AnalysisOnlyMVP:
                     "factor_scores": factor_scores,
                     "pillar_scores": pillar_scores,
                     "composite_score": round(composite_score, 4),
+                    # Additive per-horizon composites. ret_5d/ret_60d use the
+                    # global vector (== composite_score); ret_20d uses the
+                    # validated IC-signed override. Consumers may read the 20d
+                    # composite for a 20d-horizon view; the primary is unchanged.
+                    "per_horizon_composites": compute_per_horizon_composites(
+                        factor_scores, weights,
+                        global_composite=round(composite_score, 4),
+                    ),
                 },
                 "decision_summary": decision_summary,
                 "portfolio_context": portfolio_context,

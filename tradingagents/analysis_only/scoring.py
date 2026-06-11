@@ -1527,6 +1527,111 @@ def _first_finite(*values: float | None) -> float | None:
     return None
 
 
+# Per-horizon composite weight overrides (per-horizon emission).
+#
+# Only ret_20d is overridden, with the IC-signed sparse vector fit at
+# min_abs_ic=0.04 and validated +9.9pp median bullish test-hit under strict
+# rolling-OOS walk-forward vs the v1.5 global vector (see
+# `backtest/results/per_horizon_ic_sweep_findings.md`). ret_5d / ret_60d are
+# intentionally ABSENT, so they fall back to the global DEFAULT_FACTOR_WEIGHTS
+# — the primary (60d-anchored) composite is therefore unchanged, and per-horizon
+# emission is purely additive.
+#
+# These are SIGNED weights (sign = IC sign), consumed by
+# `compute_composite_signed`'s abs-normalized form — the same math the
+# walk-forward gate (`backtest.rebuild_records_with_weights`) used, so an
+# emitted composite_20d matches the gated recipe.
+PER_HORIZON_WEIGHTS: dict[str, dict[str, float]] = {
+    "ret_20d": {
+        "market_vix_regime": -0.0794,
+        "options_iv_skew": -0.0639,
+        "market_fear_greed_regime": 0.0614,
+        "peer_relative_valuation": 0.0577,
+        "momentum_rsi": -0.0426,
+    },
+}
+
+# Horizons for which a composite is emitted alongside the primary.
+PER_HORIZON_KEYS: tuple[str, ...] = ("ret_5d", "ret_20d", "ret_60d")
+
+
+def compute_composite_signed(
+    factor_scores: list[dict[str, Any]],
+    weights: dict[str, float],
+) -> dict[str, Any]:
+    """Composite from SIGNED, abs-normalized weights.
+
+    Mirrors `backtest.rebuild_records_with_weights` exactly: each available
+    factor contributes ``score * (w / Σ|w|)``, divided by the active weight
+    fraction, clipped to [-1, 1]. With all-positive weights this is identical
+    to `compute_composite`; with signed weights it models IC-sign inversions
+    (a negative weight flips that factor's contribution).
+
+    Returns ``{composite_score, coverage, n_factors, weight_source?}``.
+    """
+    abs_total = sum(abs(v) for v in weights.values()) or 1.0
+    composite_raw = 0.0
+    active_weight = 0.0
+    n_factors = 0
+    for f in factor_scores:
+        if not f.get("data_available"):
+            continue
+        name = f.get("factor")
+        w_signed = float(weights.get(name, 0.0))
+        if w_signed == 0.0:
+            continue
+        score = f.get("score")
+        if score is None:
+            continue
+        composite_raw += float(score) * (w_signed / abs_total)
+        active_weight += abs(w_signed) / abs_total
+        n_factors += 1
+    if active_weight > 0:
+        composite_raw = composite_raw / active_weight
+    composite = max(-1.0, min(1.0, composite_raw))
+    return {
+        "composite_score": round(composite, 4),
+        "coverage": round(active_weight, 4),
+        "n_factors": n_factors,
+    }
+
+
+def compute_per_horizon_composites(
+    factor_scores: list[dict[str, Any]],
+    global_weights: dict[str, float],
+    *,
+    per_horizon_weights: dict[str, dict[str, float]] | None = None,
+    horizons: tuple[str, ...] = PER_HORIZON_KEYS,
+    global_composite: float | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Emit one composite per horizon.
+
+    A horizon present in ``per_horizon_weights`` uses its override vector and is
+    computed via `compute_composite_signed` (matching the walk-forward gate).
+    A horizon NOT overridden falls back to the global vector — and when
+    ``global_composite`` is supplied it reuses that value verbatim, so the
+    fallback horizons stay byte-identical to the primary composite_score
+    (avoiding a sub-rounding drift between `compute_composite`, which reads each
+    row's stored ``weighted_score``, and the recompute-from-``score`` path).
+
+    Result: ``{horizon: {composite_score, coverage?, n_factors?, weight_source}}``.
+    """
+    phw = per_horizon_weights if per_horizon_weights is not None else PER_HORIZON_WEIGHTS
+    out: dict[str, dict[str, Any]] = {}
+    for h in horizons:
+        override = phw.get(h)
+        if override:
+            result = compute_composite_signed(factor_scores, override)
+            result["weight_source"] = "per_horizon"
+        elif global_composite is not None:
+            result = {"composite_score": round(global_composite, 4), "weight_source": "global"}
+        else:
+            result = compute_composite_signed(factor_scores, global_weights)
+            result["weight_source"] = "global"
+        out[h] = result
+    return out
+
+
 def compute_composite(
     factor_scores: list[dict[str, Any]],
     weights: dict[str, float] | None = None,

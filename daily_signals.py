@@ -37,7 +37,9 @@ from portfolio.signals import (
     PriceContext,
     Position,
     compute_actions,
+    derive_horizon_signals,
     format_daily_report,
+    format_horizon_overlay,
     format_option_positions_section,
     load_latest_signals,
 )
@@ -130,6 +132,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-ml-shadow", action="store_true",
         help="Disable shadow-ML scoring in the paper-trading log.",
+    )
+    p.add_argument(
+        "--no-horizon-overlay", action="store_true",
+        help="Disable the informational 20d-horizon action overlay "
+        "(derived from per_horizon_composites.ret_20d).",
     )
     return p.parse_args()
 
@@ -619,6 +626,33 @@ def main() -> None:
         sector_shocks=sector_shocks,
     )
 
+    # Informational 20d-horizon action overlay. Reuses the same sizing
+    # machinery fed the validated 20d composite (per_horizon_composites.ret_20d)
+    # so the user can see what the 20d view would do and where it diverges from
+    # the primary 60d-anchored plan. The primary `actions`/`summary` above are
+    # the production recommendation and are untouched.
+    horizon_actions: list = []
+    n_with_20d = sum(
+        1 for s in signals.values() if s is not None and s.composite_20d is not None
+    )
+    if not getattr(args, "no_horizon_overlay", False) and n_with_20d:
+        print(f"Computing 20d-horizon action overlay ({n_with_20d} signal(s) with a 20d composite)...")
+        horizon_signals = derive_horizon_signals(signals)
+        horizon_actions, _ = compute_actions(
+            signals=horizon_signals,
+            positions=positions,
+            prices=prices,
+            config=sizing_config,
+            cash=cash,
+            as_of=as_of,
+            risk_limits=risk_limits,
+            beta_map=beta_map,
+            correlation_matrix=corr_matrix,
+            sector_shocks=sector_shocks,
+        )
+    elif not n_with_20d:
+        print("Skipping 20d-horizon overlay (no signals carry a 20d composite).")
+
     ml_shadow_by_symbol: dict[str, dict[str, object]] = {}
     ml_shadow_config = getattr(args, "ml_shadow_config", None)
     if (
@@ -675,6 +709,10 @@ def main() -> None:
                 book_greeks_by_symbol[sym] = bg
 
     report_md = format_daily_report(actions, summary, config=sizing_config, as_of=as_of)
+    if horizon_actions:
+        overlay_md = format_horizon_overlay(actions, horizon_actions, as_of=as_of)
+        if overlay_md:
+            report_md = report_md.rstrip() + "\n\n" + overlay_md + "\n"
     options_section = format_option_positions_section(
         options_by_symbol=options_by_symbol,
         enriched_by_symbol=enriched_by_symbol,
@@ -703,6 +741,7 @@ def main() -> None:
                 },
                 "summary": summary,
                 "actions": [a.__dict__ for a in actions],
+                "horizon_overlay_20d": [a.__dict__ for a in horizon_actions],
             },
             indent=2,
             default=str,

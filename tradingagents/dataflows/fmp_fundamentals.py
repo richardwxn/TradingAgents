@@ -10,11 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .fmp_common import filter_statements_by_date, fmp_request
-
-# Number of historical statement periods to request. FMP returns most-recent
-# first; PIT filtering then drops anything published after ``curr_date``.
-_STATEMENT_LIMIT = 12
+from .fmp_common import filter_statements_by_date, fmp_request, statement_limit
 
 
 def _period_for_freq(freq: str | None) -> str:
@@ -38,9 +34,9 @@ def get_fundamentals(ticker: str, curr_date: str | None = None) -> str:
             period-stamped by FMP, so this is accepted for signature parity
             with the other vendors and applied only where a date exists.
     """
-    profile = fmp_request(f"profile/{ticker}")
-    key_metrics = fmp_request(f"key-metrics-ttm/{ticker}")
-    ratios = fmp_request(f"ratios-ttm/{ticker}")
+    profile = fmp_request("profile", {"symbol": ticker})
+    key_metrics = fmp_request("key-metrics-ttm", {"symbol": ticker})
+    ratios = fmp_request("ratios-ttm", {"symbol": ticker})
 
     payload = {
         "symbol": ticker.upper(),
@@ -57,8 +53,8 @@ def get_balance_sheet(
 ) -> str:
     """Balance sheet statements (most-recent first, PIT filtered)."""
     rows = fmp_request(
-        f"balance-sheet-statement/{ticker}",
-        {"period": _period_for_freq(freq), "limit": _STATEMENT_LIMIT},
+        "balance-sheet-statement",
+        {"symbol": ticker, "period": _period_for_freq(freq), "limit": statement_limit()},
     )
     rows = filter_statements_by_date(rows, curr_date)
     return json.dumps(rows, indent=2, default=str)
@@ -69,8 +65,8 @@ def get_cashflow(
 ) -> str:
     """Cash flow statements (most-recent first, PIT filtered)."""
     rows = fmp_request(
-        f"cash-flow-statement/{ticker}",
-        {"period": _period_for_freq(freq), "limit": _STATEMENT_LIMIT},
+        "cash-flow-statement",
+        {"symbol": ticker, "period": _period_for_freq(freq), "limit": statement_limit()},
     )
     rows = filter_statements_by_date(rows, curr_date)
     return json.dumps(rows, indent=2, default=str)
@@ -81,8 +77,8 @@ def get_income_statement(
 ) -> str:
     """Income statements (most-recent first, PIT filtered)."""
     rows = fmp_request(
-        f"income-statement/{ticker}",
-        {"period": _period_for_freq(freq), "limit": _STATEMENT_LIMIT},
+        "income-statement",
+        {"symbol": ticker, "period": _period_for_freq(freq), "limit": statement_limit()},
     )
     rows = filter_statements_by_date(rows, curr_date)
     return json.dumps(rows, indent=2, default=str)

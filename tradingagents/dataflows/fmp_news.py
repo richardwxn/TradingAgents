@@ -19,9 +19,9 @@ def get_news(ticker: str, start_date: str, end_date: str) -> str:
         end_date: Inclusive end date, yyyy-mm-dd.
     """
     rows = fmp_request(
-        "stock_news",
+        "news/stock",
         {
-            "tickers": ticker,
+            "symbols": ticker,
             "from": start_date,
             "to": end_date,
             "limit": _NEWS_LIMIT,

@@ -36,6 +36,7 @@ from portfolio.snapshot import load_positions_payload
 from tradingagents.analysis_only import (
     AnalysisOnlyMVP,
     render_equity_research_markdown,
+    render_html,
     render_markdown,
 )
 from tradingagents.analysis_only.cache import load_report_if_cache_hit, report_file
@@ -160,8 +161,9 @@ def make_handler(output_dir: str):
                 query = parse_qs(parsed.query)
                 path = (query.get("path") or [""])[0]
                 fmt = (query.get("fmt") or ["md"])[0]
+                style = (query.get("style") or ["equity_research"])[0]
                 try:
-                    self._send_report_file(path, fmt)
+                    self._send_report_file(path, fmt, style)
                 except Exception as exc:
                     self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -254,7 +256,9 @@ def make_handler(output_dir: str):
             self.end_headers()
             self.wfile.write(encoded)
 
-        def _send_report_file(self, raw_path: str, fmt: str) -> None:
+        def _send_report_file(
+            self, raw_path: str, fmt: str, style: str = "equity_research"
+        ) -> None:
             path = Path(raw_path).expanduser()
             if not path.is_absolute():
                 path = (Path.cwd() / path).resolve()
@@ -271,8 +275,26 @@ def make_handler(output_dir: str):
             elif fmt == "json":
                 path = path.with_suffix(".json")
                 content_type = "application/json; charset=utf-8"
+            elif fmt == "html":
+                # Rendered on the fly from the JSON (source of truth) so the
+                # chart-embedded report is always current and no extra file is
+                # persisted. `style=standard` uses the full technical layout.
+                json_path = path.with_suffix(".json")
+                if not json_path.exists() or not json_path.is_file():
+                    raise ValueError(f"Report file not found: {json_path}")
+                payload = json.loads(json_path.read_text())
+                html = render_html(
+                    payload, equity_research=(style != "standard")
+                )
+                encoded = html.encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
             else:
-                raise ValueError("fmt must be md or json.")
+                raise ValueError("fmt must be md, json, or html.")
             if not path.exists() or not path.is_file():
                 raise ValueError(f"Report file not found: {path}")
             encoded = path.read_bytes()
@@ -3165,6 +3187,7 @@ def _html_page() -> str:
         </details>
 
         <p class="hint">Saved: ${{escapeHtml(data.json_path)}}<br>${{escapeHtml(data.markdown_path)}}</p>
+        ${{data.json_path ? `<p><a class="data-pill" target="_blank" href="/report?fmt=html&style=${{encodeURIComponent(data.report_style || 'equity_research')}}&path=${{encodeURIComponent(data.json_path)}}">Open HTML report</a></p>` : ''}}
       `;
     }}
     function renderBestBuy(data) {{
