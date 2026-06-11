@@ -29,9 +29,12 @@ from tradingagents.analysis_only.backtest import (  # noqa: E402
     walk_forward_backtest,
 )
 from tradingagents.analysis_only.scoring import (  # noqa: E402
+    PER_HORIZON_WEIGHTS,
     apply_isotonic_calibration,
     brier_score,
+    compute_composite_signed,
     confidence_for,
+    direction_for_composite,
     fit_isotonic_calibration,
     fit_isotonic_calibration_by_direction,
     reliability_diagram,
@@ -83,7 +86,38 @@ def main() -> int:
         "--min-obs", type=int, default=30,
         help="Minimum total observations required to ship a calibration.",
     )
+    parser.add_argument(
+        "--recompute-horizon", default=None,
+        help=(
+            "Fit a PER-HORIZON calibration: recompute each record's composite "
+            "and direction from PER_HORIZON_WEIGHTS[<horizon>] (the fixed, "
+            "gate-validated vector) using stored factor_scores, then fit the "
+            "isotonic map against that horizon's hits. Implies --no-walk-forward "
+            "(the per-horizon vector is fixed, so there is no primary-weight "
+            "refit to do). E.g. --recompute-horizon ret_20d."
+        ),
+    )
     args = parser.parse_args()
+
+    recompute_h = args.recompute_horizon
+    if recompute_h is not None:
+        if recompute_h not in PER_HORIZON_WEIGHTS:
+            print(
+                f"[fail] --recompute-horizon {recompute_h} has no entry in "
+                f"PER_HORIZON_WEIGHTS (have: {sorted(PER_HORIZON_WEIGHTS)})",
+                file=sys.stderr,
+            )
+            return 2
+        # The per-horizon vector is fixed; the walk-forward refit only applies
+        # to the primary global weights and would overwrite the recomputed
+        # composite. Fit the confidence map on the static per-horizon composite.
+        args.walk_forward = False
+        args.horizon = recompute_h
+        print(
+            f"Per-horizon calibration mode: recomputing composite/direction "
+            f"from PER_HORIZON_WEIGHTS[{recompute_h}] ({len(PER_HORIZON_WEIGHTS[recompute_h])} "
+            f"factors); fitting against {recompute_h} hits."
+        )
 
     paths = sorted(glob.glob(args.reports_glob))
     if not paths:
@@ -114,16 +148,28 @@ def main() -> int:
     hits: list[int] = []
     coverages: list[float] = []
     directions: list[str] = []
+    ph_weights = PER_HORIZON_WEIGHTS.get(recompute_h) if recompute_h else None
     for r in records:
-        if r.composite_score is None:
-            continue
+        if recompute_h is not None:
+            # Recompute the composite + direction from the fixed per-horizon
+            # vector using stored factor_scores (no regen needed).
+            if not r.factor_scores:
+                continue
+            ph = compute_composite_signed(r.factor_scores, ph_weights)
+            composite_val = ph["composite_score"]
+            direction = direction_for_composite(composite_val)
+        else:
+            if r.composite_score is None:
+                continue
+            composite_val = float(r.composite_score)
+            direction = str(r.direction or "neutral").lower()
         ret = r.forward_returns.get(args.horizon)
-        hit = _hit_from_direction(r.direction, ret)
+        hit = _hit_from_direction(direction, ret)
         if hit is None:
             continue
-        composites.append(float(r.composite_score))
+        composites.append(float(composite_val))
         hits.append(hit)
-        directions.append(str(r.direction or "neutral").lower())
+        directions.append(direction)
         # Coverage approximation: assume 1.0 unless we can derive it
         # from factor_scores (which we do here for honesty).
         if r.factor_scores:
