@@ -57,9 +57,10 @@ class Signal:
     industry: str | None = None
     tradingagents_review_gate: dict[str, Any] = field(default_factory=dict)
     # Additive 20d-horizon composite (validated per-horizon override). The
-    # primary `composite` is unchanged; this exposes the 20d view for a
-    # future 20d-horizon action surface without altering current sizing.
+    # primary `composite` is unchanged; this exposes the 20d view for the
+    # 20d-horizon action overlay without altering current sizing.
     composite_20d: float | None = None
+    composite_20d_coverage: float | None = None
 
     def to_sizing_input(self) -> dict[str, Any]:
         return {
@@ -154,6 +155,7 @@ def _load_signal_from_json(path: Path) -> Signal | None:
     composite = model_scoring.get("composite_score")
     ph = (model_scoring.get("per_horizon_composites") or {}).get("ret_20d") or {}
     composite_20d = ph.get("composite_score")
+    composite_20d_coverage = ph.get("coverage")
     ec = kf.get("earnings_calendar") or {}
     ind = kf.get("industry_context") or {}
     review_gate = (kf.get("tradingagents_review") or {}).get("gate") or {}
@@ -179,6 +181,10 @@ def _load_signal_from_json(path: Path) -> Signal | None:
         ),
         composite_20d=(
             float(composite_20d) if composite_20d is not None else None
+        ),
+        composite_20d_coverage=(
+            float(composite_20d_coverage)
+            if composite_20d_coverage is not None else None
         ),
     )
 
@@ -729,6 +735,109 @@ def _fmt_money(x: float | None) -> str:
 
 def _fmt_int(x: int | None) -> str:
     return "—" if x is None else f"{x:,}"
+
+
+# ---------- per-horizon (20d) action overlay ----------
+
+
+def derive_horizon_signals(
+    signals: dict[str, "Signal | None"],
+    *,
+    threshold: float = 0.15,
+) -> dict[str, "Signal | None"]:
+    """Project signals onto their 20d-horizon composite.
+
+    Each signal that carries ``composite_20d`` is rewritten so its
+    ``composite`` / ``direction`` / ``confidence`` come from the 20d composite
+    (direction via ``direction_for_composite``; confidence via the heuristic
+    ``confidence_for`` on the 20d coverage — a 20d-specific calibration does
+    not exist yet, so this is intentionally uncalibrated). Signals without a
+    20d composite become ``None`` (no 20d view → treated as neutral by
+    ``compute_actions``). The primary signals are never mutated.
+    """
+    from tradingagents.analysis_only.scoring import (
+        confidence_for,
+        direction_for_composite,
+    )
+
+    out: dict[str, Signal | None] = {}
+    for sym, sig in signals.items():
+        if sig is None or sig.composite_20d is None:
+            out[sym] = None
+            continue
+        c20 = float(sig.composite_20d)
+        cov = sig.composite_20d_coverage
+        cov = float(cov) if cov is not None else 1.0
+        out[sym] = replace(
+            sig,
+            composite=c20,
+            direction=direction_for_composite(c20, threshold=threshold),
+            confidence=confidence_for(c20, cov),
+        )
+    return out
+
+
+def format_horizon_overlay(
+    primary_actions: list[Action],
+    horizon_actions: list[Action],
+    *,
+    horizon_label: str = "20d",
+    as_of: date | None = None,
+) -> str:
+    """Render the 20d action overlay, flagging divergence vs the primary plan.
+
+    Informational, non-production: shows what the per-horizon (20d) model would
+    do per ticker and where it disagrees with the primary (60d-anchored) plan.
+    The primary actions remain the system's recommendation.
+    """
+    primary_by_sym = {a.symbol: a for a in primary_actions}
+    rows = []
+    n_diverge = 0
+    for a in horizon_actions:
+        if a.action == "REVIEW":
+            continue
+        prim = primary_by_sym.get(a.symbol)
+        prim_dir = (prim.direction if prim else None) or "—"
+        prim_act = prim.action if prim else "—"
+        diverges = prim is not None and (
+            a.direction != prim.direction or a.action != prim.action
+        )
+        if diverges:
+            n_diverge += 1
+        rows.append(
+            "| {sym} | {d20} | {c20} | {a20} | {pd} / {pa} | {flag} |".format(
+                sym=a.symbol,
+                d20=(a.direction or "—"),
+                c20=_fmt_signed(a.composite),
+                a20=a.action,
+                pd=prim_dir,
+                pa=prim_act,
+                flag="⚠ diverges" if diverges else "",
+            )
+        )
+    if not rows:
+        return ""
+    header = [
+        f"## {horizon_label} horizon overlay (informational)",
+        "",
+        f"Non-production view from the validated {horizon_label} composite "
+        f"(`per_horizon_composites.ret_20d`). The primary plan above is "
+        f"unchanged; **{n_diverge}** name(s) where the {horizon_label} view "
+        f"disagrees with the primary are flagged. Confidence here is "
+        f"heuristic (no {horizon_label} calibration yet).",
+        "",
+        f"| Ticker | {horizon_label} dir | {horizon_label} composite | "
+        f"{horizon_label} action | primary dir / action | flag |",
+        "|---|---|---|---|---|---|",
+    ]
+    return "\n".join(header + rows)
+
+
+def _fmt_signed(v: Any) -> str:
+    try:
+        return f"{float(v):+.3f}"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def format_daily_report(
