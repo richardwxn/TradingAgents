@@ -56,7 +56,10 @@ class GraphSetup:
         }
 
         # Quant Analyst: grounds the debate in the validated quant signal.
-        quant_analyst_node = create_quant_analyst(self.config)
+        # Toggleable (default on) so an ablation A/B — and production — can run
+        # the debate with or without the quant grounding.
+        enable_quant = self.config.get("enable_quant_analyst", True)
+        quant_analyst_node = create_quant_analyst(self.config) if enable_quant else None
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)
@@ -80,7 +83,8 @@ class GraphSetup:
             workflow.add_node(spec.tool_node, self.tool_nodes[spec.key])
 
         # Add other nodes
-        workflow.add_node("Quant Analyst", quant_analyst_node)
+        if enable_quant:
+            workflow.add_node("Quant Analyst", quant_analyst_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
         workflow.add_node("Research Manager", research_manager_node)
@@ -108,15 +112,20 @@ class GraphSetup:
             )
             workflow.add_edge(current_tools, current_analyst)
 
-            # Connect to next analyst, or to the Quant Analyst (which feeds the
-            # debate) if this is the last analyst.
+            # Connect to next analyst, or to the debate entry point if this is
+            # the last analyst. The Quant Analyst (when enabled) sits between
+            # the analysts and the debate.
             if i < len(plan.specs) - 1:
                 workflow.add_edge(current_clear, plan.specs[i + 1].agent_node)
             else:
-                workflow.add_edge(current_clear, "Quant Analyst")
+                workflow.add_edge(
+                    current_clear,
+                    "Quant Analyst" if enable_quant else "Bull Researcher",
+                )
 
         # Quant Analyst loads the validated signal, then the debate begins.
-        workflow.add_edge("Quant Analyst", "Bull Researcher")
+        if enable_quant:
+            workflow.add_edge("Quant Analyst", "Bull Researcher")
 
         # Add remaining edges
         workflow.add_conditional_edges(
