@@ -102,6 +102,11 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
+    # Directory of analysis-only report JSONs the Quant Analyst node reads to
+    # ground the multi-agent debate in the validated factor-model signal. The
+    # node loads the latest TICKER_YYYY-MM-DD.json on/before the trade date;
+    # when absent it emits an "unavailable" report and the debate proceeds.
+    "analysis_only_reports_dir": "reports/analysis_mvp",
     # Benchmark for alpha calculation in the reflection layer.
     # ``benchmark_ticker`` (when set) overrides the suffix map for all
     # tickers; leave it None to use ``benchmark_map`` for auto-detection

@@ -19,12 +19,18 @@ def create_research_manager(llm):
     def research_manager_node(state) -> dict:
         instrument_context = build_instrument_context(state["company_of_interest"])
         history = state["investment_debate_state"].get("history", "")
+        quant_report = state.get("quant_report", "")
 
         investment_debate_state = state["investment_debate_state"]
 
         prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
 
 {instrument_context}
+
+A backtested quantitative factor model produced the signal below. Weigh it alongside the debate: when your stance agrees with the model, say so; when you override it, justify why the qualitative debate outweighs the validated signal. If the model flags a 20d-vs-60d horizon divergence, state explicitly which horizon your plan targets.
+
+**Quantitative model signal:**
+{quant_report}
 
 ---
 
