@@ -1,14 +1,39 @@
 {
-  "as_of": "2026-06-01",
+  "as_of": "2026-06-11",
   "source": "robinhood_mcp_read_only",
   "account_number_masked": "****9844",
   "account": {
-    "total_equity": 10000.0,
-    "cash": 10000.0,
-    "buying_power": 10000.0,
-    "pending_deposits": 5000.0
+    "total_equity": 10046.66,
+    "cash": 7380.55,
+    "buying_power": 3845.26,
+    "pending_deposits": 0.0
   },
-  "positions": [],
+  "positions": [
+    {
+      "symbol": "NVDA",
+      "name": null,
+      "shares": 5.0,
+      "price": 203.17,
+      "average_cost": 220.4,
+      "equity": 1015.85
+    },
+    {
+      "symbol": "ALAB",
+      "name": null,
+      "shares": 2.0,
+      "price": 353.325,
+      "average_cost": 329.83,
+      "equity": 706.65
+    },
+    {
+      "symbol": "MU",
+      "name": null,
+      "shares": 1.0,
+      "price": 943.98,
+      "average_cost": 859.02,
+      "equity": 943.98
+    }
+  ],
   "raw_meta": {
     "portfolio_keys": [
       "buying_power",
@@ -24,6 +49,7 @@
       "pending_deposits",
       "total_value"
     ],
-    "position_count": 0
+    "position_count": 3,
+    "quote_time_utc": "2026-06-11T17:52:24Z"
   }
 }

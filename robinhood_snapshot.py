@@ -55,6 +55,21 @@ def _items(payload: Any, *keys: str) -> list[dict[str, Any]]:
     return []
 
 
+def _first_float(mapping: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("buying_power", "amount", "value"):
+                parsed = _safe_float(value.get(nested_key))
+                if parsed is not None:
+                    return parsed
+            continue
+        parsed = _safe_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def build_snapshot(raw: dict[str, Any], *, account_number: str | None = None) -> dict[str, Any]:
     portfolio = raw.get("portfolio") if isinstance(raw.get("portfolio"), dict) else raw
     account = raw.get("account") if isinstance(raw.get("account"), dict) else {}
@@ -62,26 +77,24 @@ def build_snapshot(raw: dict[str, Any], *, account_number: str | None = None) ->
     if not positions_raw:
         positions_raw = _items(raw, "positions", "results")
 
-    cash = _safe_float(
-        _first(
-            portfolio,
-            "buying_power",
-            "cash",
-            "withdrawable_cash",
-            "cash_available_for_withdrawal",
-        )
+    cash = _first_float(
+        portfolio,
+        "cash",
+        "withdrawable_cash",
+        "cash_available_for_withdrawal",
     )
-    total_equity = _safe_float(
-        _first(
-            portfolio,
-            "total_equity",
-            "total_value",
-            "equity",
-            "market_value",
-            "portfolio_value",
-            "total_market_value",
-        )
+    if cash is None:
+        cash = _first_float(portfolio, "buying_power")
+    total_equity = _first_float(
+        portfolio,
+        "total_equity",
+        "total_value",
+        "equity",
+        "market_value",
+        "portfolio_value",
+        "total_market_value",
     )
+    buying_power = _first_float(portfolio, "buying_power")
 
     positions: list[dict[str, Any]] = []
     for item in positions_raw:
@@ -121,7 +134,7 @@ def build_snapshot(raw: dict[str, Any], *, account_number: str | None = None) ->
         "account": {
             "total_equity": total_equity,
             "cash": cash or 0.0,
-            "buying_power": _safe_float(_first(portfolio, "buying_power")),
+            "buying_power": buying_power,
         },
         "positions": positions,
         "raw_meta": {
