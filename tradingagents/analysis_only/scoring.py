@@ -1177,6 +1177,118 @@ def reliability_diagram(
     return bins
 
 
+def walk_forward_calibration_reliability(
+    observations: Sequence[tuple[str, float, str, int, float]],
+    *,
+    train_window_days: int = 540,
+    test_window_days: int = 90,
+    step_days: int = 30,
+    min_train_obs: int = 200,
+    min_obs_per_direction: int = 30,
+    n_bins: int = 10,
+) -> dict[str, Any]:
+    """Out-of-sample reliability of an isotonic confidence calibration.
+
+    Designed for a FIXED scoring vector (e.g. a per-horizon weight override):
+    the composites are precomputed, so only the isotonic *curve* is refit per
+    window. For each rolling window the curve is fit on the train slice and
+    applied to the held-out test slice; all test predictions are pooled and
+    scored. This answers "does the calibration hold on data it was never fit
+    on" — the bar your primary calibration already meets via walk-forward.
+
+    ``observations``: ``(as_of_date, composite, direction, hit, coverage)``.
+    Returns Brier (OOS) vs base-rate and heuristic baselines, the pooled
+    reliability diagram, the max |gap| over n>=10 buckets, and gate booleans.
+    """
+    from datetime import datetime, timedelta
+
+    rows: list[tuple[Any, float, str, int, float]] = []
+    for obs in observations:
+        d, comp, dirn, hit, cov = obs
+        if comp is None or hit is None:
+            continue
+        try:
+            dt = datetime.strptime(str(d)[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        rows.append((
+            dt, float(comp), str(dirn or "neutral").lower(), int(hit),
+            float(cov) if cov is not None else 1.0,
+        ))
+    if not rows:
+        return {"status": "no_observations"}
+    rows.sort(key=lambda r: r[0])
+    dmin, dmax = rows[0][0], rows[-1][0]
+
+    oos_pred: list[float] = []
+    oos_hit: list[int] = []
+    oos_comp: list[float] = []
+    oos_cov: list[float] = []
+    n_windows = 0
+    n_skipped = 0
+    t0 = dmin
+    while t0 + timedelta(days=train_window_days) < dmax:
+        train_end = t0 + timedelta(days=train_window_days)
+        test_end = train_end + timedelta(days=test_window_days)
+        train = [r for r in rows if t0 <= r[0] < train_end]
+        test = [r for r in rows if train_end <= r[0] < test_end]
+        t0 = t0 + timedelta(days=step_days)
+        if len(train) < min_train_obs or not test:
+            n_skipped += 1
+            continue
+        n_windows += 1
+        cal = fit_isotonic_calibration_by_direction(
+            [r[1] for r in train], [r[3] for r in train], [r[2] for r in train],
+            min_obs_per_direction=min_obs_per_direction,
+        )
+        train_base = sum(r[3] for r in train) / len(train)
+        for (_dt, comp, dirn, hit, cov) in test:
+            p = apply_isotonic_calibration_directional(comp, dirn, calibration=cal)
+            if p is None:
+                p = train_base  # never let a test point leak its own label
+            oos_pred.append(float(p))
+            oos_hit.append(int(hit))
+            oos_comp.append(float(comp))
+            oos_cov.append(float(cov))
+    if not oos_pred:
+        return {
+            "status": "insufficient_windows",
+            "n_windows": n_windows,
+            "n_skipped_windows": n_skipped,
+        }
+
+    base_rate = sum(oos_hit) / len(oos_hit)
+    brier_oos = brier_score(oos_pred, oos_hit)
+    brier_base = brier_score([base_rate] * len(oos_hit), oos_hit)
+    heuristic = [confidence_for(c, cov) for c, cov in zip(oos_comp, oos_cov)]
+    brier_heur = brier_score(heuristic, oos_hit)
+    rel = reliability_diagram(oos_pred, oos_hit, n_bins=n_bins)
+    max_gap_pp = 0.0
+    for b in rel:
+        if b["n"] >= 10 and b["observed_hit_rate"] is not None:
+            max_gap_pp = max(
+                max_gap_pp,
+                abs(b["observed_hit_rate"] - b["mean_predicted"]) * 100,
+            )
+    return {
+        "status": "ok",
+        "n_windows": n_windows,
+        "n_skipped_windows": n_skipped,
+        "n_oos_obs": len(oos_pred),
+        "oos_base_rate": round(base_rate, 4),
+        "brier_oos": brier_oos,
+        "brier_base_rate": brier_base,
+        "brier_heuristic": brier_heur,
+        "brier_improvement_vs_heuristic": round(
+            (brier_heur or 0.0) - (brier_oos or 0.0), 4
+        ),
+        "max_gap_pp": round(max_gap_pp, 1),
+        "reliability": rel,
+        "gate_brier_beats_heuristic": (brier_oos or 1.0) < (brier_heur or 0.0),
+        "gate_reliability_5pp": max_gap_pp <= 5.0,
+    }
+
+
 # ---------- Phase 4 regime labels ----------
 
 # Regime A (trend_on): SPY above its 50d MA AND VIX < 20 (calm trend).

@@ -29,13 +29,17 @@ from tradingagents.analysis_only.backtest import (  # noqa: E402
     walk_forward_backtest,
 )
 from tradingagents.analysis_only.scoring import (  # noqa: E402
+    PER_HORIZON_WEIGHTS,
     apply_isotonic_calibration,
     brier_score,
+    compute_composite_signed,
     confidence_for,
+    direction_for_composite,
     fit_isotonic_calibration,
     fit_isotonic_calibration_by_direction,
     reliability_diagram,
     save_isotonic_calibration,
+    walk_forward_calibration_reliability,
 )
 
 
@@ -83,7 +87,49 @@ def main() -> int:
         "--min-obs", type=int, default=30,
         help="Minimum total observations required to ship a calibration.",
     )
+    parser.add_argument(
+        "--recompute-horizon", default=None,
+        help=(
+            "Fit a PER-HORIZON calibration: recompute each record's composite "
+            "and direction from PER_HORIZON_WEIGHTS[<horizon>] (the fixed, "
+            "gate-validated vector) using stored factor_scores, then fit the "
+            "isotonic map against that horizon's hits. Implies --no-walk-forward "
+            "(the per-horizon vector is fixed, so there is no primary-weight "
+            "refit to do). E.g. --recompute-horizon ret_20d."
+        ),
+    )
+    parser.add_argument(
+        "--oos-validate", action="store_true",
+        help="After fitting, also run a frozen-vector walk-forward OOS check: "
+        "refit the isotonic curve on each rolling train window, score the "
+        "held-out test window, and report pooled OOS reliability + Brier. The "
+        "honest 'does this calibration generalize' gate.",
+    )
+    parser.add_argument("--oos-train-days", type=int, default=540)
+    parser.add_argument("--oos-test-days", type=int, default=90)
+    parser.add_argument("--oos-step-days", type=int, default=30)
+    parser.add_argument("--oos-min-train-obs", type=int, default=200)
     args = parser.parse_args()
+
+    recompute_h = args.recompute_horizon
+    if recompute_h is not None:
+        if recompute_h not in PER_HORIZON_WEIGHTS:
+            print(
+                f"[fail] --recompute-horizon {recompute_h} has no entry in "
+                f"PER_HORIZON_WEIGHTS (have: {sorted(PER_HORIZON_WEIGHTS)})",
+                file=sys.stderr,
+            )
+            return 2
+        # The per-horizon vector is fixed; the walk-forward refit only applies
+        # to the primary global weights and would overwrite the recomputed
+        # composite. Fit the confidence map on the static per-horizon composite.
+        args.walk_forward = False
+        args.horizon = recompute_h
+        print(
+            f"Per-horizon calibration mode: recomputing composite/direction "
+            f"from PER_HORIZON_WEIGHTS[{recompute_h}] ({len(PER_HORIZON_WEIGHTS[recompute_h])} "
+            f"factors); fitting against {recompute_h} hits."
+        )
 
     paths = sorted(glob.glob(args.reports_glob))
     if not paths:
@@ -114,16 +160,30 @@ def main() -> int:
     hits: list[int] = []
     coverages: list[float] = []
     directions: list[str] = []
+    dates: list[str] = []
+    ph_weights = PER_HORIZON_WEIGHTS.get(recompute_h) if recompute_h else None
     for r in records:
-        if r.composite_score is None:
-            continue
+        if recompute_h is not None:
+            # Recompute the composite + direction from the fixed per-horizon
+            # vector using stored factor_scores (no regen needed).
+            if not r.factor_scores:
+                continue
+            ph = compute_composite_signed(r.factor_scores, ph_weights)
+            composite_val = ph["composite_score"]
+            direction = direction_for_composite(composite_val)
+        else:
+            if r.composite_score is None:
+                continue
+            composite_val = float(r.composite_score)
+            direction = str(r.direction or "neutral").lower()
         ret = r.forward_returns.get(args.horizon)
-        hit = _hit_from_direction(r.direction, ret)
+        hit = _hit_from_direction(direction, ret)
         if hit is None:
             continue
-        composites.append(float(r.composite_score))
+        composites.append(float(composite_val))
         hits.append(hit)
-        directions.append(str(r.direction or "neutral").lower())
+        directions.append(direction)
+        dates.append(str(getattr(r, "as_of_date", "") or ""))
         # Coverage approximation: assume 1.0 unless we can derive it
         # from factor_scores (which we do here for honesty).
         if r.factor_scores:
@@ -222,6 +282,55 @@ def main() -> int:
           f"{'PASS' if gate_brier else 'FAIL'}")
     print(f"Phase 5 gate — reliability +/-5pp:           "
           f"{'PASS' if gate_reliability else 'FAIL'}")
+
+    if args.oos_validate:
+        print()
+        print("=" * 64)
+        print("Out-of-sample reliability (frozen-vector walk-forward)")
+        print("  Curve refit on each rolling train window, scored on the")
+        print("  held-out next window; predictions pooled across windows.")
+        print("=" * 64)
+        observations = list(zip(dates, composites, directions, hits, coverages))
+        oos = walk_forward_calibration_reliability(
+            observations,
+            train_window_days=args.oos_train_days,
+            test_window_days=args.oos_test_days,
+            step_days=args.oos_step_days,
+            min_train_obs=args.oos_min_train_obs,
+        )
+        if oos.get("status") != "ok":
+            print(f"  OOS validation could not run: {oos.get('status')} "
+                  f"(windows={oos.get('n_windows')}, "
+                  f"skipped={oos.get('n_skipped_windows')})")
+        else:
+            print(f"  Windows fit: {oos['n_windows']} "
+                  f"(skipped {oos['n_skipped_windows']}); "
+                  f"pooled OOS obs: {oos['n_oos_obs']}")
+            print(f"  OOS base rate:              {oos['oos_base_rate']:.4f}")
+            print(f"  Brier OOS (isotonic):       {oos['brier_oos']}")
+            print(f"  Brier OOS (heuristic):      {oos['brier_heuristic']}")
+            print(f"  Brier OOS (base-rate):      {oos['brier_base_rate']}")
+            print(f"    improvement vs heuristic: "
+                  f"{oos['brier_improvement_vs_heuristic']:+.4f} "
+                  f"(positive = better)")
+            print()
+            print("  Reliability (OOS isotonic vs realized):")
+            print("    bucket [lo, hi)  n   mean_pred  observed  gap")
+            for b in oos["reliability"]:
+                if b["n"] == 0 or b["observed_hit_rate"] is None:
+                    continue
+                gap = (b["observed_hit_rate"] - b["mean_predicted"]) * 100
+                warn = "  WARN" if abs(gap) > 5 and b["n"] >= 10 else ""
+                print(f"    [{b['lower']:.2f}, {b['upper']:.2f})  "
+                      f"{b['n']:>4}  {b['mean_predicted']:>8.4f}  "
+                      f"{b['observed_hit_rate']:>8.4f}  {gap:+6.1f}pp{warn}")
+            print()
+            print(f"  Max |gap| (n>=10 buckets):  {oos['max_gap_pp']:.1f}pp "
+                  f"(gate: <= 5pp)")
+            print(f"  OOS gate — Brier beats heuristic: "
+                  f"{'PASS' if oos['gate_brier_beats_heuristic'] else 'FAIL'}")
+            print(f"  OOS gate — reliability +/-5pp:    "
+                  f"{'PASS' if oos['gate_reliability_5pp'] else 'FAIL'}")
     return 0
 
 

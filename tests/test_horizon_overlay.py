@@ -62,6 +62,23 @@ def test_lower_coverage_lowers_confidence():
     assert lo.confidence < hi.confidence
 
 
+def test_calibration_overrides_heuristic_confidence():
+    # A bullish 20d calibration that maps high composite -> ~0.9 hit-rate.
+    cal = {
+        "fit": [
+            {"x_lower": -1.0, "x_upper": 0.0, "hit_rate": 0.2},
+            {"x_lower": 0.0, "x_upper": 1.0, "hit_rate": 0.9},
+        ],
+    }
+    sig = {"A": _sig("A", composite=0.3, composite_20d=0.5, coverage=1.0)}
+    heuristic = derive_horizon_signals(sig)["A"].confidence
+    calibrated = derive_horizon_signals(sig, calibration=cal)["A"].confidence
+    # Calibrated bullish high-composite confidence should exceed the heuristic
+    # and reflect the ~0.9 mapped hit-rate.
+    assert calibrated != heuristic
+    assert calibrated > 0.7
+
+
 # ---------- overlay formatter ----------
 
 

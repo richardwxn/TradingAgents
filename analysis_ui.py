@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +33,7 @@ from portfolio.execution import (
     ticket_from_action,
 )
 from portfolio.snapshot import load_positions_payload
+from scripts import ml_gate_shadow_report
 from tradingagents.analysis_only import (
     AnalysisOnlyMVP,
     render_equity_research_markdown,
@@ -58,7 +59,7 @@ DEFAULT_EXECUTION_CONFIG = "configs/execution.yaml"
 DEFAULT_TRADE_TICKETS_DIR = "reports/trade_tickets"
 DEFAULT_TRADE_WORKFLOW_DIR = "reports/trade_workflow"
 DEFAULT_MAX_READY_BUY_TICKETS = 1
-DEFAULT_MAX_REPORT_AGE_DAYS = 3
+DEFAULT_MAX_REPORT_AGE_DAYS = 0
 FORECAST_PRESETS: dict[str, dict[str, int]] = {
     "short_term_1_2_weeks": {"2d": 2, "1w": 5, "2w": 10, "1m": 21},
     "swing_1_4_weeks": {"1w": 5, "2w": 10, "1m": 21, "3m": 63},
@@ -149,6 +150,49 @@ def make_handler(output_dir: str):
                             horizon=(query.get("horizon") or ["ret_60d"])[0],
                             threshold=float((query.get("threshold") or ["0.55"])[0]),
                             base_dir=(query.get("base_dir") or ["reports/paper_trading"])[0],
+                        )
+                    )
+                except Exception as exc:
+                    self._send_json(
+                        {"ok": False, "error": str(exc)},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                return
+            if parsed.path == "/api/ml-gate-shadow-report":
+                query = parse_qs(parsed.query)
+                try:
+                    self._send_json(
+                        _ml_gate_shadow_performance(
+                            {
+                                "from_date": (query.get("from_date") or [""])[0],
+                                "to_date": (query.get("to_date") or [""])[0],
+                                "model": (query.get("model") or ["ridge_return"])[0],
+                                "horizon": (query.get("horizon") or ["ret_60d"])[0],
+                                "threshold": (query.get("threshold") or ["0.55"])[0],
+                                "hybrid_threshold": (query.get("hybrid_threshold") or ["0.55"])[0],
+                                "top_k_per_date": (query.get("top_k_per_date") or ["10"])[0],
+                                "cost_bps": (query.get("cost_bps") or ["10"])[0],
+                                "ml_only_weight": (query.get("ml_only_weight") or ["0.05"])[0],
+                                "benchmark": (query.get("benchmark") or ["SPY"])[0],
+                                "base_dir": (query.get("base_dir") or ["reports/paper_trading"])[0],
+                                "fetch_prices": (query.get("fetch_prices") or ["false"])[0],
+                            }
+                        )
+                    )
+                except Exception as exc:
+                    self._send_json(
+                        {"ok": False, "error": str(exc)},
+                        status=HTTPStatus.BAD_REQUEST,
+                    )
+                return
+            if parsed.path == "/api/portfolio":
+                query = parse_qs(parsed.query)
+                try:
+                    self._send_json(
+                        _run_portfolio_snapshot(
+                            {
+                                "snapshot_path": (query.get("snapshot_path") or [""])[0],
+                            }
                         )
                     )
                 except Exception as exc:
@@ -979,6 +1023,127 @@ def _run_robinhood_sync_request(payload: dict[str, Any]) -> dict[str, Any]:
             "The UI does not call Robinhood MCP directly.",
         ],
     }
+
+
+def _run_portfolio_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    path = Path(str(payload.get("snapshot_path") or DEFAULT_ROBINHOOD_SNAPSHOT_PATH))
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as exc:
+        return {
+            "ok": False,
+            "path": str(path),
+            "source_type": "unavailable",
+            "error": str(exc),
+            "snapshot": None,
+            "positions": [],
+            "summary": {
+                "cash": 0.0,
+                "buying_power": None,
+                "total_equity": None,
+                "position_count": 0,
+                "invested_value": 0.0,
+            },
+        }
+    if not isinstance(raw, dict):
+        raise ValueError("Portfolio snapshot must be a JSON object.")
+
+    loaded = load_positions_payload(raw)
+    account = dict(raw.get("account") or {})
+    if isinstance(raw.get("positions"), list):
+        positions_raw = raw.get("positions") or []
+    else:
+        positions_raw = [
+            {
+                "symbol": symbol,
+                "shares": position.shares,
+                "average_cost": position.avg_cost,
+            }
+            for symbol, position in loaded.positions.items()
+        ]
+    total_equity = _safe_number(account.get("total_equity"), account.get("equity"))
+    cash = _safe_number(account.get("cash"), loaded.cash) or 0.0
+    buying_power = _safe_number(account.get("buying_power"))
+    rows: list[dict[str, Any]] = []
+    invested_value = 0.0
+    cost_basis_total = 0.0
+    unrealized_total = 0.0
+    for pos in positions_raw:
+        if not isinstance(pos, dict):
+            continue
+        symbol = str(pos.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        shares = _safe_number(pos.get("shares"), pos.get("quantity")) or 0.0
+        if shares == 0:
+            continue
+        avg_cost = _safe_number(pos.get("average_cost"), pos.get("avg_cost"), pos.get("average_buy_price"))
+        price = _safe_number(pos.get("price"), pos.get("last_price"), pos.get("mark_price"))
+        equity = _safe_number(pos.get("equity"), pos.get("market_value"))
+        if equity is None and price is not None:
+            equity = shares * price
+        cost_basis = shares * avg_cost if avg_cost is not None else None
+        unrealized = equity - cost_basis if equity is not None and cost_basis is not None else None
+        if equity is not None:
+            invested_value += equity
+        if cost_basis is not None:
+            cost_basis_total += cost_basis
+        if unrealized is not None:
+            unrealized_total += unrealized
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": pos.get("name"),
+                "shares": shares,
+                "price": price,
+                "average_cost": avg_cost,
+                "equity": equity,
+                "cost_basis": cost_basis,
+                "unrealized_pnl": unrealized,
+                "unrealized_pnl_pct": (
+                    unrealized / cost_basis if unrealized is not None and cost_basis else None
+                ),
+                "portfolio_weight": (
+                    equity / total_equity if equity is not None and total_equity else None
+                ),
+            }
+        )
+    rows.sort(key=lambda row: row.get("equity") or 0.0, reverse=True)
+    return {
+        "ok": True,
+        "path": str(path),
+        "source_type": loaded.metadata.get("source_type"),
+        "source": raw.get("source"),
+        "as_of": raw.get("as_of"),
+        "account_number_masked": raw.get("account_number_masked"),
+        "summary": {
+            "cash": cash,
+            "buying_power": buying_power,
+            "total_equity": total_equity,
+            "position_count": len(rows),
+            "invested_value": invested_value,
+            "cash_weight": cash / total_equity if total_equity else None,
+            "invested_weight": invested_value / total_equity if total_equity else None,
+            "cost_basis": cost_basis_total,
+            "unrealized_pnl": unrealized_total,
+            "unrealized_pnl_pct": (
+                unrealized_total / cost_basis_total if cost_basis_total else None
+            ),
+        },
+        "positions": rows,
+        "snapshot": raw,
+    }
+
+
+def _safe_number(*values: Any) -> float | None:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _align_batch_to_best_buy(
@@ -2017,6 +2182,149 @@ def _ml_gate_snapshot(
     }
 
 
+def _parse_query_bool(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_iso_date(value: str, label: str) -> str:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{label} must be YYYY-MM-DD.") from exc
+    return value
+
+
+def _workspace_path(value: str, *, label: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    root = Path.cwd().resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be inside the workspace.") from exc
+    return path
+
+
+def _ml_gate_shadow_performance(payload: dict[str, Any]) -> dict[str, Any]:
+    model = str(payload.get("model") or "ridge_return")
+    horizon = str(payload.get("horizon") or "ret_60d")
+    if model not in _ML_GATE_VALID_MODELS:
+        raise ValueError(
+            f"Unknown ML model {model!r}. Must be one of: "
+            f"{', '.join(_ML_GATE_VALID_MODELS)}"
+        )
+    if horizon not in _ML_GATE_VALID_HORIZONS:
+        raise ValueError(
+            f"Unknown ML horizon {horizon!r}. Must be one of: "
+            f"{', '.join(_ML_GATE_VALID_HORIZONS)}"
+        )
+
+    to_date = _validate_iso_date(
+        str(payload.get("to_date") or datetime.now().strftime("%Y-%m-%d")),
+        "to_date",
+    )
+    from_date_default = (
+        datetime.strptime(to_date, "%Y-%m-%d") - timedelta(days=30)
+    ).strftime("%Y-%m-%d")
+    from_date = _validate_iso_date(
+        str(payload.get("from_date") or from_date_default),
+        "from_date",
+    )
+    if from_date > to_date:
+        raise ValueError("from_date must be <= to_date.")
+
+    threshold = float(payload.get("threshold") or 0.55)
+    hybrid_threshold = float(payload.get("hybrid_threshold") or threshold)
+    top_k_per_date = int(float(payload.get("top_k_per_date") or 10))
+    cost_bps = float(payload.get("cost_bps") or 10.0)
+    ml_only_weight = float(payload.get("ml_only_weight") or 0.05)
+    benchmark = str(payload.get("benchmark") or "SPY").strip().upper() or "SPY"
+    base_dir = _workspace_path(
+        str(payload.get("base_dir") or "reports/paper_trading"),
+        label="Paper-trading base_dir",
+    )
+    fetch_prices = _parse_query_bool(payload.get("fetch_prices"))
+    no_prices = not fetch_prices
+
+    recs_by_date = ml_gate_shadow_report.load_recommendations_range(
+        base_dir,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    provider = None
+    if fetch_prices:
+        provider = ml_gate_shadow_report.make_price_outcome_provider(
+            recs_by_date,
+            horizon=horizon,
+            benchmark=benchmark,
+        )
+    rows = ml_gate_shadow_report.build_shadow_rows(
+        recs_by_date,
+        model=model,
+        horizon=horizon,
+        outcome_provider=provider,
+    )
+    summaries, _decisions = ml_gate_shadow_report.summarize_all_strategies(
+        rows,
+        threshold=threshold,
+        hybrid_threshold=hybrid_threshold,
+        default_ml_weight=ml_only_weight,
+        top_k_per_date=top_k_per_date,
+        cost_bps=cost_bps,
+    )
+    disagreements = ml_gate_shadow_report.disagreement_rows(
+        rows,
+        threshold=threshold,
+    )
+    markdown = ml_gate_shadow_report.render_markdown(
+        from_date=from_date,
+        to_date=to_date,
+        model=model,
+        horizon=horizon,
+        threshold=threshold,
+        hybrid_threshold=hybrid_threshold,
+        benchmark=benchmark,
+        cost_bps=cost_bps,
+        no_prices=no_prices,
+        rows=rows,
+        summaries=summaries,
+        disagreements=disagreements,
+    )
+    rows_with_ml = sum(1 for row in rows if row.ml_score is not None)
+    matured_rows = sum(1 for row in rows if row.outcome.raw_return is not None)
+    return {
+        "ok": True,
+        "from_date": from_date,
+        "to_date": to_date,
+        "base_dir": str(base_dir),
+        "model": model,
+        "horizon": horizon,
+        "threshold": threshold,
+        "hybrid_threshold": hybrid_threshold,
+        "top_k_per_date": top_k_per_date,
+        "cost_bps": cost_bps,
+        "ml_only_weight": ml_only_weight,
+        "benchmark": benchmark,
+        "fetch_prices": fetch_prices,
+        "coverage": {
+            "recommendation_rows": len(rows),
+            "dates": len(recs_by_date),
+            "rows_with_ml_score": rows_with_ml,
+            "rows_with_matured_outcome": matured_rows,
+            "outcome_status": (
+                "prices_skipped"
+                if no_prices else "matured" if matured_rows else "pending"
+            ),
+        },
+        "summaries": summaries,
+        "disagreements": disagreements,
+        "markdown": markdown,
+    }
+
+
 def _clean_factor_weights(raw: dict[str, Any]) -> dict[str, float]:
     cleaned: dict[str, float] = {}
     for key, value in raw.items():
@@ -2062,6 +2370,7 @@ def _html_page() -> str:
     llm_env_json = json.dumps(_llm_env_status(), sort_keys=True)
     watchlist_text = ", ".join(_default_watchlist())
     today = datetime.now().strftime("%Y-%m-%d")
+    audit_from = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     trade_positions_default = (
         DEFAULT_ROBINHOOD_SNAPSHOT_PATH
         if Path(DEFAULT_ROBINHOOD_SNAPSHOT_PATH).exists()
@@ -2076,59 +2385,65 @@ def _html_page() -> str:
   <style>
     :root {{
       color-scheme: light;
-      --ink: #182229;
-      --muted: #65717a;
-      --line: #d9e1e6;
-      --line-strong: #bdc8d0;
-      --panel: #f4f7f8;
-      --panel-soft: #f9fbfb;
+      --ink: #18232f;
+      --muted: #65727f;
+      --line: #d8e0e7;
+      --line-strong: #b8c5cf;
+      --panel: #eef3f6;
+      --panel-soft: #f7fafb;
       --surface: #ffffff;
       --accent: #0b6b5b;
       --accent-soft: #e7f2ef;
+      --accent-2: #2f6fd6;
+      --accent-2-soft: #eaf1fc;
+      --accent-3: #9f4f6f;
+      --accent-3-soft: #f8edf1;
       --warn: #9a5b00;
       --warn-soft: #fff6e6;
       --bad: #a43131;
       --bad-soft: #fbebeb;
       --good: #0b6f45;
       --good-soft: #e8f4ee;
-      --shadow: 0 1px 2px rgba(24, 34, 41, .06), 0 12px 28px rgba(24, 34, 41, .05);
+      --shadow: 0 1px 2px rgba(24, 35, 47, .06), 0 14px 34px rgba(24, 35, 47, .06);
+      --shadow-soft: 0 1px 2px rgba(24, 35, 47, .05), 0 8px 20px rgba(24, 35, 47, .04);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: #eef3f4; color: var(--ink); }}
+    body {{ margin: 0; background: #e9eff3; color: var(--ink); }}
     header {{
-      border-bottom: 1px solid var(--line);
-      padding: 14px 24px;
+      border-bottom: 1px solid rgba(216, 224, 231, .72);
+      padding: 13px 24px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 16px;
-      background: var(--surface);
+      background: rgba(255, 255, 255, .92);
+      backdrop-filter: blur(12px);
       position: sticky;
       top: 0;
       z-index: 4;
     }}
-    h1 {{ margin: 0; font-size: 20px; font-weight: 650; }}
+    h1 {{ margin: 0; font-size: 20px; font-weight: 720; letter-spacing: 0; }}
     main {{
       display: grid;
-      grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
+      grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
       min-height: calc(100vh - 58px);
     }}
     aside {{
       border-right: 1px solid var(--line);
-      padding: 16px;
+      padding: 18px;
       overflow: auto;
       background: var(--panel);
       max-height: calc(100vh - 58px);
       position: sticky;
       top: 58px;
     }}
-    section {{ padding: 18px 22px 28px; overflow: auto; min-width: 0; }}
+    section {{ padding: 20px 24px 30px; overflow: auto; min-width: 0; }}
     fieldset {{
       border: 1px solid var(--line);
       border-radius: 8px;
       margin: 0;
-      padding: 12px;
+      padding: 13px;
       background: var(--surface);
     }}
     legend {{ padding: 0 6px; color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; }}
@@ -2137,11 +2452,12 @@ def _html_page() -> str:
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 8px 9px;
+      padding: 9px 10px;
       font: inherit;
       background: var(--surface);
       color: var(--ink);
       min-width: 0;
+      box-shadow: inset 0 1px 0 rgba(24, 35, 47, .02);
     }}
     input:focus, select:focus, textarea:focus, button:focus-visible, summary:focus-visible {{
       outline: 2px solid rgba(11, 107, 91, .24);
@@ -2158,11 +2474,28 @@ def _html_page() -> str:
     .quick-toggles {{
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 0 12px;
-      margin-top: 8px;
-      padding-top: 8px;
+      gap: 2px 12px;
+      margin-top: 10px;
+      padding-top: 10px;
       border-top: 1px solid var(--line);
     }}
+    .freshness-strip {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin: 0 0 12px;
+    }}
+    .freshness-item {{
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--accent-2);
+      border-radius: 8px;
+      padding: 8px 9px;
+      background: var(--surface);
+      box-shadow: var(--shadow-soft);
+      min-width: 0;
+    }}
+    .freshness-item b {{ display: block; font-size: 13px; font-weight: 800; }}
+    .freshness-item span {{ display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }}
     .quick-toggles .checkrow {{ margin-top: 6px; }}
     .form-stack {{ display: grid; gap: 12px; }}
     .form-section {{
@@ -2210,24 +2543,24 @@ def _html_page() -> str:
     }}
     .side-switch {{
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 6px;
-      margin-bottom: 12px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px;
+      margin-bottom: 14px;
     }}
     .side-tab {{
       width: auto;
       background: var(--surface);
       color: var(--ink);
       border: 1px solid var(--line);
-      padding: 8px 6px;
+      padding: 9px 6px;
       font-size: 12px;
       white-space: nowrap;
       box-shadow: none;
     }}
     .side-tab.active {{
-      background: var(--ink);
+      background: var(--accent);
       color: #fff;
-      border-color: var(--ink);
+      border-color: var(--accent);
     }}
     .side-panel {{ display: none; }}
     .side-panel.active {{ display: block; }}
@@ -2240,15 +2573,17 @@ def _html_page() -> str:
       border-radius: 6px;
       background: var(--accent);
       color: white;
-      padding: 10px 12px;
+      padding: 11px 12px;
       font: inherit;
       font-weight: 700;
       cursor: pointer;
+      box-shadow: 0 1px 1px rgba(0,0,0,.05), 0 8px 18px rgba(11,107,91,.14);
     }}
-    button.secondary {{ background: var(--ink); margin-top: 0; }}
+    button.secondary {{ background: var(--ink); margin-top: 0; box-shadow: 0 1px 1px rgba(0,0,0,.05), 0 8px 18px rgba(24,35,47,.12); }}
+    button:hover:not(:disabled) {{ filter: brightness(.98); transform: translateY(-1px); }}
     button:disabled {{ opacity: .55; cursor: wait; }}
     .toolbar {{ display: flex; gap: 10px; align-items: center; }}
-    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; font-size: 12px; color: var(--muted); background: var(--surface); }}
+    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 5px 10px; font-size: 12px; color: var(--muted); background: var(--surface); box-shadow: var(--shadow-soft); }}
     .summary-grid, .metric-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }}
     .metric {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; background: var(--panel-soft); }}
     .metric b {{ display: block; font-size: 20px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }}
@@ -2260,8 +2595,8 @@ def _html_page() -> str:
       border: 1px solid var(--line);
       border-top: 4px solid var(--accent);
       border-radius: 8px;
-      padding: 16px;
-      margin-bottom: 16px;
+      padding: 18px;
+      margin-bottom: 18px;
       background: var(--surface);
       box-shadow: var(--shadow);
     }}
@@ -2284,8 +2619,8 @@ def _html_page() -> str:
     .hero-copy {{ max-width: 760px; }}
     .hero-copy h2 {{ margin: 0 0 6px; font-size: 24px; }}
     .hero-copy p {{ margin: 0; color: var(--muted); line-height: 1.45; }}
-    .stat-strip {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 16px; }}
-    .stat-item {{ border-left: 3px solid var(--line); padding: 4px 0 4px 10px; min-width: 0; background: transparent; }}
+    .stat-strip {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(138px, 1fr)); gap: 10px; margin-top: 16px; }}
+    .stat-item {{ border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; background: var(--panel-soft); }}
     .stat-item b {{ display: block; font-size: 18px; overflow-wrap: anywhere; }}
     .stat-item span {{ color: var(--muted); font-size: 12px; }}
     .summary-columns {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(280px, .85fr); gap: 18px; align-items: start; }}
@@ -2329,6 +2664,15 @@ def _html_page() -> str:
     .bar span {{ display: block; height: 100%; width: 0; }}
     .bar .positive {{ background: var(--good); }}
     .bar .negative {{ background: var(--bad); }}
+    .bar.indeterminate span {{
+      width: 42%;
+      background: var(--accent-2);
+      animation: progress-sweep 1.1s ease-in-out infinite;
+    }}
+    @keyframes progress-sweep {{
+      0% {{ transform: translateX(-110%); }}
+      100% {{ transform: translateX(250%); }}
+    }}
     .muted-list {{ margin: 0; padding-left: 18px; color: var(--muted); }}
     .muted-list li {{ margin: 4px 0; }}
     .rank-list {{ display: grid; gap: 10px; }}
@@ -2338,6 +2682,7 @@ def _html_page() -> str:
     .rank-meta {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }}
     .pill-row, .chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .data-pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px; font-size: 12px; color: var(--muted); background: var(--surface); max-width: 100%; overflow-wrap: anywhere; }}
+    .data-pill.fresh {{ color: var(--accent-2); border-color: #bdd2f5; background: var(--accent-2-soft); }}
     .artifact-list {{ display: grid; gap: 8px; margin-top: 10px; }}
     .artifact-row {{ display: grid; grid-template-columns: minmax(150px, .45fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; border-top: 1px solid var(--line); padding-top: 8px; }}
     .artifact-row b {{ font-size: 13px; }}
@@ -2377,9 +2722,12 @@ def _html_page() -> str:
     details.details-block {{ border-top: 1px solid var(--line); padding-top: 12px; margin-top: 8px; }}
     details.details-block summary {{ cursor: pointer; font-weight: 700; margin-bottom: 8px; }}
     .table-wrap {{ width: 100%; overflow-x: auto; }}
-    table {{ width: 100%; min-width: 620px; border-collapse: collapse; margin: 12px 0 18px; font-size: 13px; }}
-    th, td {{ border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }}
-    th {{ color: var(--muted); font-size: 12px; }}
+    .portfolio-gain {{ color: var(--good); }}
+    .portfolio-loss {{ color: var(--bad); }}
+    table {{ width: 100%; min-width: 620px; border-collapse: separate; border-spacing: 0; margin: 12px 0 18px; font-size: 13px; }}
+    th, td {{ border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: top; }}
+    th {{ color: var(--muted); font-size: 12px; background: var(--panel-soft); position: sticky; top: 0; z-index: 1; }}
+    tbody tr:hover td {{ background: #fbfdff; }}
     ul {{ padding-left: 20px; }}
     pre {{ white-space: pre-wrap; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--surface); max-height: 620px; overflow: auto; box-shadow: var(--shadow); }}
     .tabs {{
@@ -2410,6 +2758,7 @@ def _html_page() -> str:
       .rank-row {{ grid-template-columns: 1fr; }}
       .rank-score {{ text-align: left; }}
       .artifact-row {{ grid-template-columns: 1fr; }}
+      .freshness-strip {{ grid-template-columns: 1fr; }}
     }}
     @media (max-width: 560px) {{
       header {{ align-items: flex-start; flex-direction: column; padding: 12px 16px; }}
@@ -2434,8 +2783,14 @@ def _html_page() -> str:
     <aside>
       <div class="side-switch" role="tablist" aria-label="Workflow">
         <button class="side-tab active" data-side-panel="analysis-form" type="button">Analyze</button>
+        <button class="side-tab" data-side-panel="portfolio-form" type="button">Portfolio</button>
         <button class="side-tab" data-side-panel="best-buy-form" type="button">Best Buy</button>
         <button class="side-tab" data-side-panel="trade-ticket-form" type="button">Tickets</button>
+      </div>
+      <div class="freshness-strip">
+        <div class="freshness-item"><b>Live prices</b><span>default on</span></div>
+        <div class="freshness-item"><b>Stale gate</b><span>{DEFAULT_MAX_REPORT_AGE_DAYS}d</span></div>
+        <div class="freshness-item"><b>Cache</b><span>refresh first</span></div>
       </div>
 
       <form id="analysis-form" class="side-panel active form-stack">
@@ -2477,7 +2832,7 @@ def _html_page() -> str:
             <label class="checkrow"><input id="enable_narrative" type="checkbox"> Narrative</label>
             <label class="checkrow"><input id="enable_llm_insights" type="checkbox"> Insight Block</label>
             <label class="checkrow"><input id="enable_tradingagents_review" type="checkbox"> TradingAgents Review</label>
-            <label class="checkrow"><input id="force_refresh" type="checkbox"> Refresh cached report</label>
+            <label class="checkrow"><input id="force_refresh" type="checkbox" checked> Refresh cached report</label>
           </div>
         </fieldset>
 
@@ -2539,6 +2894,28 @@ def _html_page() -> str:
         </div>
       </form>
 
+      <form id="portfolio-form" class="side-panel form-stack">
+        <fieldset class="primary-fieldset">
+          <legend>Portfolio</legend>
+          <label for="portfolio_snapshot_path">Snapshot Source</label>
+          <input id="portfolio_snapshot_path" value="{trade_positions_default}">
+          <p class="hint">Displays the latest normalized Robinhood snapshot. Use the sync handoff when the file needs a fresh RH pull.</p>
+          <label for="portfolio_account_hint">Account Hint</label>
+          <input id="portfolio_account_hint" placeholder="optional Robinhood account number">
+        </fieldset>
+
+        <details class="form-section">
+          <summary>Robinhood sync handoff</summary>
+          <div class="form-section-body">
+            <button id="portfolio-sync-request-run" class="secondary" type="button">Request RH Sync</button>
+            <p class="hint">Creates a read-only Codex MCP prompt for refreshing this snapshot.</p>
+          </div>
+        </details>
+        <div class="primary-actions">
+          <button id="portfolio-load-run" class="secondary" type="submit">Refresh Portfolio</button>
+        </div>
+      </form>
+
       <form id="best-buy-form" class="side-panel form-stack">
         <fieldset class="primary-fieldset">
           <legend>Best Buy</legend>
@@ -2557,9 +2934,9 @@ def _html_page() -> str:
           <label for="best_buy_max_report_age_days">Max Report Age</label>
           <input id="best_buy_max_report_age_days" type="number" min="0" step="1" value="{DEFAULT_MAX_REPORT_AGE_DAYS}">
           <div class="quick-toggles">
-            <label class="checkrow"><input id="best_buy_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
-            <label class="checkrow"><input id="best_buy_run_missing" type="checkbox"> Run analysis for missing reports</label>
-            <label class="checkrow"><input id="best_buy_refresh_stale" type="checkbox"> Refresh reports older than max age</label>
+            <label class="checkrow"><input id="best_buy_fetch_prices" type="checkbox" checked> Fetch current yfinance prices</label>
+            <label class="checkrow"><input id="best_buy_run_missing" type="checkbox" checked> Run analysis for missing reports</label>
+            <label class="checkrow"><input id="best_buy_refresh_stale" type="checkbox" checked> Refresh reports older than max age</label>
           </div>
           <p class="hint">Ranks latest reports for the watchlist. With refresh enabled, reports older than this many calendar days are regenerated for the selected as-of date.</p>
           <p class="hint">Generate All LLM Reports refreshes every watchlist ticker with Narrative + Insight Block. Check TradingAgents Review only when you want the slower full-agent review included.</p>
@@ -2602,8 +2979,8 @@ def _html_page() -> str:
           <label for="trade_ticket_account_hint">Account Hint</label>
           <input id="trade_ticket_account_hint" placeholder="optional Robinhood account number">
           <div class="quick-toggles">
-            <label class="checkrow"><input id="trade_ticket_fetch_prices" type="checkbox"> Fetch current yfinance prices</label>
-            <label class="checkrow"><input id="trade_ticket_run_missing" type="checkbox"> Run analysis for missing reports</label>
+            <label class="checkrow"><input id="trade_ticket_fetch_prices" type="checkbox" checked> Fetch current yfinance prices</label>
+            <label class="checkrow"><input id="trade_ticket_run_missing" type="checkbox" checked> Run analysis for missing reports</label>
             <label class="checkrow"><input id="trade_ticket_refresh_stale" type="checkbox" checked> Refresh reports older than max age</label>
           </div>
           <p class="hint">Generates broker-gated tickets and a Codex review prompt. The UI never places Robinhood orders.</p>
@@ -2644,6 +3021,7 @@ def _html_page() -> str:
     <section>
       <div class="tabs">
         <button class="tab active" data-tab="summary" type="button">Summary</button>
+        <button class="tab" data-tab="portfolio" type="button">Portfolio</button>
         <button class="tab" data-tab="best-buy" type="button">Best Buy</button>
         <button class="tab" data-tab="trade-tickets" type="button">Trade Tickets</button>
         <button class="tab" data-tab="ml-gate" type="button">ML Gate</button>
@@ -2651,6 +3029,7 @@ def _html_page() -> str:
         <button class="tab" data-tab="json" type="button">JSON</button>
       </div>
       <div id="summary"></div>
+      <div id="portfolio" class="hidden"></div>
       <div id="best-buy" class="hidden"></div>
       <div id="trade-tickets" class="hidden"></div>
       <div id="ml-gate" class="hidden"></div>
@@ -2663,7 +3042,7 @@ def _html_page() -> str:
     const DATA_PROVIDER_ENV = {data_provider_env_json};
     const LLM_MODELS = {llm_models_json};
     const LLM_ENV = {llm_env_json};
-    const TAB_IDS = ['summary', 'best-buy', 'trade-tickets', 'ml-gate', 'markdown', 'json'];
+    const TAB_IDS = ['summary', 'portfolio', 'best-buy', 'trade-tickets', 'ml-gate', 'markdown', 'json'];
     let bestBuyPoll = null;
     const factors = document.getElementById('factors');
     for (const [name, value] of Object.entries(DEFAULT_WEIGHTS)) {{
@@ -2704,6 +3083,8 @@ def _html_page() -> str:
       }});
     }});
     renderMlGateShell();
+    renderHomeShell();
+    hydrateInitialPortfolio();
 
     document.querySelectorAll('.side-tab').forEach(btn => {{
       btn.addEventListener('click', () => {{
@@ -2713,6 +3094,15 @@ def _html_page() -> str:
           panel.classList.toggle('active', panel.id === btn.dataset.sidePanel);
         }});
       }});
+    }});
+
+    document.getElementById('portfolio-form').addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      await loadPortfolio();
+    }});
+
+    document.getElementById('portfolio-sync-request-run').addEventListener('click', async () => {{
+      await requestPortfolioSync();
     }});
 
     document.getElementById('analysis-form').addEventListener('submit', async (event) => {{
@@ -2975,6 +3365,125 @@ def _html_page() -> str:
         run.disabled = false;
       }}
     }});
+
+    async function loadPortfolio() {{
+      const status = document.getElementById('status');
+      const run = document.getElementById('portfolio-load-run');
+      status.textContent = 'Loading portfolio';
+      run.disabled = true;
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelector('[data-tab="portfolio"]').classList.add('active');
+      for (const id of TAB_IDS) {{
+        document.getElementById(id).classList.toggle('hidden', id !== 'portfolio');
+      }}
+      document.getElementById('portfolio').innerHTML = `
+        <div class="dashboard-panel">
+          <h2>Portfolio</h2>
+          <p class="hint">Loading latest snapshot...</p>
+        </div>
+      `;
+      try {{
+        const params = new URLSearchParams();
+        params.set('snapshot_path', document.getElementById('portfolio_snapshot_path').value);
+        const res = await fetch(`/api/portfolio?${{params.toString()}}`);
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Portfolio snapshot unavailable');
+        renderPortfolio(data);
+        document.getElementById('json').textContent = JSON.stringify(data.snapshot || data, null, 2);
+        status.textContent = 'Portfolio loaded';
+      }} catch (err) {{
+        document.getElementById('portfolio').innerHTML = `<div class="error">${{escapeHtml(err.message)}}</div>`;
+        status.textContent = 'Error';
+      }} finally {{
+        run.disabled = false;
+      }}
+    }}
+
+    async function requestPortfolioSync() {{
+      const status = document.getElementById('status');
+      const run = document.getElementById('portfolio-sync-request-run');
+      status.textContent = 'Preparing sync request';
+      run.disabled = true;
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelector('[data-tab="portfolio"]').classList.add('active');
+      for (const id of TAB_IDS) {{
+        document.getElementById(id).classList.toggle('hidden', id !== 'portfolio');
+      }}
+      const payload = {{
+        workflow_dir: document.getElementById('trade_ticket_workflow_dir').value,
+        output_path: document.getElementById('portfolio_snapshot_path').value || '{DEFAULT_ROBINHOOD_SNAPSHOT_PATH}',
+        account_hint: document.getElementById('portfolio_account_hint').value
+      }};
+      try {{
+        const res = await fetch('/api/robinhood-sync-request', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify(payload)
+        }});
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Sync request failed');
+        renderPortfolioSyncRequest(data);
+        document.getElementById('markdown').textContent = data.codex_prompt || '';
+        document.getElementById('json').textContent = JSON.stringify(data, null, 2);
+        status.textContent = 'Sync request ready';
+      }} catch (err) {{
+        document.getElementById('portfolio').innerHTML = `<div class="error">${{escapeHtml(err.message)}}</div>`;
+        status.textContent = 'Error';
+      }} finally {{
+        run.disabled = false;
+      }}
+    }}
+
+    function renderHomeShell() {{
+      document.getElementById('summary').innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>Freshness console</h2>
+              <p>Latest portfolio context, same-day report gates, and current-price workflows are active by default.</p>
+            </div>
+            <span class="action-badge buy">fresh</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Report age gate', '${DEFAULT_MAX_REPORT_AGE_DAYS}d')}}
+            ${{statItem('Current price fetch', 'on')}}
+            ${{statItem('Missing report generation', 'on')}}
+            ${{statItem('Cached report refresh', 'on')}}
+          </div>
+        </div>
+        <div id="portfolio-snapshot-inline" class="dashboard-panel">
+          <h2>Portfolio snapshot</h2>
+          <p class="hint">Loading account context...</p>
+        </div>
+      `;
+    }}
+    async function hydrateInitialPortfolio() {{
+      const target = document.getElementById('portfolio-snapshot-inline');
+      try {{
+        const params = new URLSearchParams();
+        params.set('snapshot_path', document.getElementById('portfolio_snapshot_path').value);
+        const res = await fetch(`/api/portfolio?${{params.toString()}}`);
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'Portfolio snapshot unavailable');
+        renderPortfolio(data);
+        if (target) {{
+          const summary = data.summary || {{}};
+          target.innerHTML = `
+            <h2>Portfolio snapshot</h2>
+            <div class="stat-strip">
+              ${{statItem('Account value', fmtMoney(summary.total_equity))}}
+              ${{statItem('Cash', fmtMoney(summary.cash))}}
+              ${{statItem('Buying power', fmtMoney(summary.buying_power))}}
+              ${{statItem('Invested', fmtPct(summary.invested_weight))}}
+              ${{statItem('Unrealized P/L', pnlLabel(summary.unrealized_pnl, summary.unrealized_pnl_pct))}}
+            </div>
+            <p class="hint">${{escapeHtml(data.path || '')}}</p>
+          `;
+        }}
+      }} catch (err) {{
+        if (target) target.innerHTML = `<div class="error">${{escapeHtml(err.message)}}</div>`;
+      }}
+    }}
 
     function startBestBuyPolling(jobId, onDone) {{
       stopBestBuyPolling();
@@ -3345,6 +3854,92 @@ def _html_page() -> str:
         </div>
       `;
     }}
+    function renderPortfolio(data) {{
+      const summary = data.summary || {{}};
+      const positions = data.positions || [];
+      document.getElementById('portfolio').innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>Current portfolio</h2>
+              <p>${{escapeHtml(data.source === 'robinhood_mcp_read_only' ? 'Read-only Robinhood snapshot' : 'Portfolio snapshot')}}${{data.account_number_masked ? ` · ${{escapeHtml(data.account_number_masked)}}` : ''}}${{data.as_of ? ` · as of ${{escapeHtml(data.as_of)}}` : ''}}</p>
+            </div>
+            <span class="action-badge watch">live</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Account value', fmtMoney(summary.total_equity))}}
+            ${{statItem('Cash', fmtMoney(summary.cash))}}
+            ${{statItem('Buying power', fmtMoney(summary.buying_power))}}
+            ${{statItem('Invested', `${{fmtMoney(summary.invested_value)}} (${{fmtPct(summary.invested_weight)}})`)}}
+            ${{statItem('Cash weight', fmtPct(summary.cash_weight))}}
+            ${{statItem('Unrealized P/L', pnlLabel(summary.unrealized_pnl, summary.unrealized_pnl_pct))}}
+            ${{statItem('Positions', fmtNum(summary.position_count || 0))}}
+          </div>
+        </div>
+
+        <div class="dashboard-panel">
+          <h2>Holdings</h2>
+          ${{positions.length ? portfolioTable(positions) : '<div class="empty-state">No nonzero equity positions in this snapshot.</div>'}}
+          <p class="hint">${{escapeHtml(data.path || '')}}</p>
+        </div>
+      `;
+    }}
+    function renderPortfolioSyncRequest(data) {{
+      const snap = data.current_snapshot || {{}};
+      document.getElementById('portfolio').innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>Robinhood sync request is ready</h2>
+              <p>This wrote a read-only Codex handoff prompt for refreshing the portfolio snapshot.</p>
+            </div>
+            <span class="action-badge watch">sync</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Current snapshot cash', fmtMoney(snap.cash))}}
+            ${{statItem('Current positions', fmtNum(snap.position_count || 0))}}
+            ${{statItem('Current equity', fmtMoney(snap.total_equity))}}
+            ${{statItem('As of', escapeHtml(snap.as_of || '—'))}}
+          </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Workflow handoff</h2>
+          <div class="artifact-list">
+            ${{artifactRow('Sync request prompt', 'Read-only Codex handoff for Robinhood MCP portfolio and position sync.', data.prompt_path, 'md')}}
+            ${{artifactRow('Snapshot output path', 'Local file the Portfolio view and Tickets workflow will use.', data.output_path, 'json')}}
+          </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Codex sync prompt</h2>
+          <pre>${{escapeHtml(data.codex_prompt || '')}}</pre>
+        </div>
+      `;
+    }}
+    function portfolioTable(positions) {{
+      const rows = positions.map(pos => `
+        <tr>
+          <td><strong>${{escapeHtml(pos.symbol || '')}}</strong></td>
+          <td>${{fmtNum(pos.shares)}}</td>
+          <td>${{fmtMoney(pos.price)}}</td>
+          <td>${{fmtMoney(pos.average_cost)}}</td>
+          <td>${{fmtMoney(pos.equity)}}</td>
+          <td>${{fmtPct(pos.portfolio_weight)}}</td>
+          <td>${{pnlLabel(pos.unrealized_pnl, pos.unrealized_pnl_pct)}}</td>
+        </tr>
+      `).join('');
+      return `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Symbol</th><th>Shares</th><th>Price</th><th>Avg cost</th><th>Value</th><th>Weight</th><th>Unrealized P/L</th></tr></thead>
+            <tbody>${{rows}}</tbody>
+          </table>
+        </div>
+      `;
+    }}
+    function pnlLabel(value, pct) {{
+      const cls = Number(value || 0) >= 0 ? 'portfolio-gain' : 'portfolio-loss';
+      return `<span class="${{cls}}">${{fmtMoney(value)}} (${{fmtPct(pct)}})</span>`;
+    }}
     function renderMlGateShell() {{
       const el = document.getElementById('ml-gate');
       if (!el || el.dataset.ready === '1') return;
@@ -3385,13 +3980,61 @@ def _html_page() -> str:
           <p class="hint">Production action is the non-ML factor result from the paper-trading recommendation log. ML gate is a display-only shadow overlay; it does not change tickets or recommendations.</p>
         </div>
         <div id="ml-gate-result"></div>
+        <div class="dashboard-panel">
+          <h2>Shadow performance</h2>
+          <div class="control-grid">
+            <div>
+              <label for="ml_gate_shadow_from">From</label>
+              <input id="ml_gate_shadow_from" type="date" value="{audit_from}">
+            </div>
+            <div>
+              <label for="ml_gate_shadow_to">To</label>
+              <input id="ml_gate_shadow_to" type="date" value="{today}">
+            </div>
+            <div>
+              <label for="ml_gate_shadow_hybrid_threshold">Hybrid Threshold</label>
+              <input id="ml_gate_shadow_hybrid_threshold" type="number" min="0" max="1" step="0.01" value="0.55">
+            </div>
+            <div>
+              <label for="ml_gate_shadow_top_k">Top K / Date</label>
+              <input id="ml_gate_shadow_top_k" type="number" min="0" step="1" value="10">
+            </div>
+            <div>
+              <label for="ml_gate_shadow_cost_bps">Cost Bps</label>
+              <input id="ml_gate_shadow_cost_bps" type="number" min="0" step="1" value="10">
+            </div>
+            <div>
+              <label for="ml_gate_shadow_benchmark">Benchmark</label>
+              <input id="ml_gate_shadow_benchmark" value="SPY">
+            </div>
+            <div>
+              <label class="checkrow"><input id="ml_gate_shadow_fetch_prices" type="checkbox"> Fetch matured price outcomes</label>
+            </div>
+            <div>
+              <button id="ml_gate_shadow_refresh" class="secondary" type="button">Run Shadow Audit</button>
+            </div>
+          </div>
+          <p class="hint">Read-only audit of factor production, ML-gated factor, ML-only, and hybrid proxy selections. Prices are off by default so current 60d windows show pending outcomes instead of blocking on market data.</p>
+        </div>
+        <div id="ml-gate-shadow-result"></div>
       `;
       document.getElementById('ml_gate_refresh').addEventListener('click', loadMlGate);
+      document.getElementById('ml_gate_shadow_refresh').addEventListener('click', loadMlGateShadowPerformance);
     }}
     async function loadMlGate() {{
       renderMlGateShell();
       const result = document.getElementById('ml-gate-result');
-      result.innerHTML = '<div class="dashboard-panel"><p class="hint">Loading ML gate snapshot...</p></div>';
+      const status = document.getElementById('status');
+      const run = document.getElementById('ml_gate_refresh');
+      status.textContent = 'Loading ML gate';
+      run.disabled = true;
+      result.innerHTML = `
+        <div class="dashboard-panel" role="status" aria-live="polite">
+          <h2>ML gate loading</h2>
+          <p class="hint">Loading ML gate snapshot...</p>
+          <div id="ml-gate-progress" class="bar indeterminate" aria-label="ML gate refresh in progress"><span></span></div>
+        </div>
+      `;
       const params = new URLSearchParams();
       const date = document.getElementById('ml_gate_date').value.trim();
       if (date) params.set('date', date);
@@ -3403,8 +4046,52 @@ def _html_page() -> str:
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || 'ML gate snapshot failed');
         renderMlGate(data);
+        status.textContent = 'ML gate loaded';
       }} catch (err) {{
         result.innerHTML = `<div class="error">${{escapeHtml(err.message)}}</div>`;
+        status.textContent = 'Error';
+      }} finally {{
+        run.disabled = false;
+      }}
+    }}
+    async function loadMlGateShadowPerformance() {{
+      renderMlGateShell();
+      const result = document.getElementById('ml-gate-shadow-result');
+      const status = document.getElementById('status');
+      const run = document.getElementById('ml_gate_shadow_refresh');
+      status.textContent = 'Running ML shadow audit';
+      run.disabled = true;
+      result.innerHTML = `
+        <div class="dashboard-panel" role="status" aria-live="polite">
+          <h2>Shadow audit running</h2>
+          <p class="hint">Building strategy comparison...</p>
+          <div class="bar indeterminate" aria-label="ML gate shadow audit in progress"><span></span></div>
+        </div>
+      `;
+      const params = new URLSearchParams();
+      params.set('from_date', document.getElementById('ml_gate_shadow_from').value);
+      params.set('to_date', document.getElementById('ml_gate_shadow_to').value);
+      params.set('model', document.getElementById('ml_gate_model').value);
+      params.set('horizon', document.getElementById('ml_gate_horizon').value);
+      params.set('threshold', document.getElementById('ml_gate_threshold').value || '0.55');
+      params.set('hybrid_threshold', document.getElementById('ml_gate_shadow_hybrid_threshold').value || '0.55');
+      params.set('top_k_per_date', document.getElementById('ml_gate_shadow_top_k').value || '10');
+      params.set('cost_bps', document.getElementById('ml_gate_shadow_cost_bps').value || '10');
+      params.set('benchmark', document.getElementById('ml_gate_shadow_benchmark').value || 'SPY');
+      params.set('fetch_prices', document.getElementById('ml_gate_shadow_fetch_prices').checked ? 'true' : 'false');
+      try {{
+        const res = await fetch(`/api/ml-gate-shadow-report?${{params.toString()}}`);
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || 'ML shadow audit failed');
+        renderMlGateShadowPerformance(data);
+        document.getElementById('markdown').textContent = data.markdown || '';
+        document.getElementById('json').textContent = JSON.stringify(data, null, 2);
+        status.textContent = 'ML shadow audit ready';
+      }} catch (err) {{
+        result.innerHTML = `<div class="error">${{escapeHtml(err.message)}}</div>`;
+        status.textContent = 'Error';
+      }} finally {{
+        run.disabled = false;
       }}
     }}
     function renderMlGate(data) {{
@@ -3482,6 +4169,111 @@ def _html_page() -> str:
           <td>${{escapeHtml(mlGateComparison(row))}}</td>
         </tr>
       `;
+    }}
+    function renderMlGateShadowPerformance(data) {{
+      const coverage = data.coverage || {{}};
+      const summaries = data.summaries || [];
+      const disagreements = data.disagreements || [];
+      const result = document.getElementById('ml-gate-shadow-result');
+      const outcomeText = coverage.outcome_status === 'prices_skipped'
+        ? 'prices skipped'
+        : (coverage.outcome_status === 'matured' ? 'outcomes loaded' : 'outcomes pending');
+      result.innerHTML = `
+        <div class="dashboard-hero">
+          <div class="hero-line">
+            <div class="hero-copy">
+              <h2>Shadow performance audit</h2>
+              <p>${{escapeHtml(data.model)}} / ${{escapeHtml(data.horizon)}} from ${{escapeHtml(data.from_date)}} to ${{escapeHtml(data.to_date)}}. Validation status: do not promote.</p>
+            </div>
+            <span class="action-badge watch">inspection</span>
+          </div>
+          <div class="stat-strip">
+            ${{statItem('Recommendation rows', fmtNum(coverage.recommendation_rows || 0))}}
+            ${{statItem('Dates', fmtNum(coverage.dates || 0))}}
+            ${{statItem('Rows with ML', fmtNum(coverage.rows_with_ml_score || 0))}}
+            ${{statItem('Matured outcomes', fmtNum(coverage.rows_with_matured_outcome || 0))}}
+            ${{statItem('Outcome status', escapeHtml(outcomeText))}}
+            ${{statItem('Benchmark', escapeHtml(data.benchmark || 'SPY'))}}
+          </div>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Strategy comparison</h2>
+          ${{summaries.length ? mlGateShadowSummaryTable(summaries) : '<div class="empty-state">No strategy rows in this range.</div>'}}
+          <p class="hint">Proxy net return is only computed for dates where every selected row has a matured outcome. This is still audit evidence, not a trading signal.</p>
+        </div>
+        <div class="dashboard-panel">
+          <h2>Disagreement ledger</h2>
+          ${{disagreements.length ? mlGateShadowDisagreementTable(disagreements.slice(0, 100)) : '<div class="empty-state">No factor-vs-ML buy-side disagreements in this window.</div>'}}
+          ${{disagreements.length > 100 ? `<p class="hint">Showing first 100 of ${{fmtNum(disagreements.length)}} disagreements. Full ledger is in the JSON/Markdown tabs.</p>` : ''}}
+        </div>
+      `;
+    }}
+    function mlGateShadowSummaryTable(rows) {{
+      return `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Selected</th>
+                <th>Dates</th>
+                <th>Exposure</th>
+                <th>Pending</th>
+                <th>Alpha hit</th>
+                <th>Avg alpha</th>
+                <th>Proxy net</th>
+                <th>Drawdown</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${{rows.map(row => `
+                <tr>
+                  <td><strong>${{escapeHtml(mlGateStrategyLabel(row.strategy))}}</strong></td>
+                  <td>${{fmtNum(row.selected || 0)}}</td>
+                  <td>${{fmtNum(row.dates || 0)}}</td>
+                  <td>${{fmtPct(row.avg_exposure)}}</td>
+                  <td>${{fmtNum(row.pending_rows || 0)}}</td>
+                  <td>${{fmtPct(row.alpha_hit_rate)}}</td>
+                  <td>${{fmtPct(row.avg_alpha_return)}}</td>
+                  <td>${{fmtPct(row.proxy_net_return)}}</td>
+                  <td>${{fmtPct(row.max_drawdown)}}</td>
+                </tr>
+              `).join('')}}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }}
+    function mlGateShadowDisagreementTable(rows) {{
+      return `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Date</th><th>Symbol</th><th>Action</th><th>Factor</th><th>ML</th><th>Result</th><th>Alpha</th></tr></thead>
+            <tbody>
+              ${{rows.map(row => `
+                <tr>
+                  <td>${{escapeHtml(row.date || '')}}</td>
+                  <td><strong>${{escapeHtml(row.symbol || '')}}</strong></td>
+                  <td>${{escapeHtml(row.action || '')}}</td>
+                  <td>${{fmtPct(row.factor_score)}}</td>
+                  <td>${{fmtPct(row.ml_score)}}</td>
+                  <td>${{escapeHtml(row.reason || '')}}</td>
+                  <td>${{fmtPct(row.alpha_return)}}</td>
+                </tr>
+              `).join('')}}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }}
+    function mlGateStrategyLabel(strategy) {{
+      const labels = {{
+        factor_production: 'Factor production',
+        ml_gated_factor: 'ML-gated factor',
+        ml_only: 'ML-only',
+        hybrid: 'Hybrid proxy'
+      }};
+      return labels[strategy] || strategy || '';
     }}
     function mlGateBadge(gate) {{
       const label = String(gate || 'unknown').replaceAll('_', ' ');

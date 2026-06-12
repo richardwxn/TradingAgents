@@ -744,16 +744,19 @@ def derive_horizon_signals(
     signals: dict[str, "Signal | None"],
     *,
     threshold: float = 0.15,
+    calibration: dict[str, Any] | None = None,
 ) -> dict[str, "Signal | None"]:
     """Project signals onto their 20d-horizon composite.
 
     Each signal that carries ``composite_20d`` is rewritten so its
     ``composite`` / ``direction`` / ``confidence`` come from the 20d composite
-    (direction via ``direction_for_composite``; confidence via the heuristic
-    ``confidence_for`` on the 20d coverage — a 20d-specific calibration does
-    not exist yet, so this is intentionally uncalibrated). Signals without a
-    20d composite become ``None`` (no 20d view → treated as neutral by
-    ``compute_actions``). The primary signals are never mutated.
+    (direction via ``direction_for_composite``). Confidence uses
+    ``confidence_for`` on the 20d coverage: when ``calibration`` (the 20d
+    isotonic map from ``fit_confidence_calibration.py --recompute-horizon
+    ret_20d``) is supplied it is used direction-conditionally; otherwise it
+    falls back to the heuristic. Signals without a 20d composite become
+    ``None`` (treated as neutral by ``compute_actions``). Primary signals are
+    never mutated.
     """
     from tradingagents.analysis_only.scoring import (
         confidence_for,
@@ -768,11 +771,14 @@ def derive_horizon_signals(
         c20 = float(sig.composite_20d)
         cov = sig.composite_20d_coverage
         cov = float(cov) if cov is not None else 1.0
+        direction = direction_for_composite(c20, threshold=threshold)
         out[sym] = replace(
             sig,
             composite=c20,
-            direction=direction_for_composite(c20, threshold=threshold),
-            confidence=confidence_for(c20, cov),
+            direction=direction,
+            confidence=confidence_for(
+                c20, cov, calibration=calibration, direction=direction,
+            ),
         )
     return out
 

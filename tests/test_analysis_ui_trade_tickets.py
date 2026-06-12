@@ -7,6 +7,7 @@ import analysis_ui
 from analysis_ui import (
     _annotate_option_strategy_scores,
     _run_best_buy,
+    _run_portfolio_snapshot,
     _run_robinhood_sync_request,
     _run_trade_tickets,
 )
@@ -18,9 +19,11 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
 
     for marker in [
         'id="analysis-form"',
+        'id="portfolio-form"',
         'id="best-buy-form"',
         'id="trade-ticket-form"',
         'data-tab="summary"',
+        'data-tab="portfolio"',
         'data-tab="best-buy"',
         'data-tab="trade-tickets"',
         'data-tab="ml-gate"',
@@ -29,9 +32,18 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
         'id="ticker"',
         'id="report_style"',
         'id="watchlist"',
+        'id="portfolio_snapshot_path"',
+        'id="portfolio-load-run"',
         'id="best_buy_max_report_age_days"',
+        'id="best_buy_fetch_prices" type="checkbox" checked',
+        'id="best_buy_run_missing" type="checkbox" checked',
+        'id="best_buy_refresh_stale" type="checkbox" checked',
         'id="trade_ticket_max_report_age_days"',
+        'id="trade_ticket_fetch_prices" type="checkbox" checked',
+        'id="trade_ticket_run_missing" type="checkbox" checked',
         'id="trade_ticket_positions_path"',
+        'id="force_refresh" type="checkbox" checked',
+        "Freshness console",
         'id="run"',
         'id="best-buy-run"',
         'id="best-buy-llm-run"',
@@ -41,12 +53,56 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
         'class="table-wrap"',
         'class="empty-state"',
         "optionContractLabel",
+        "portfolioTable",
         "strategyScore",
     ]:
         assert marker in html
 
-    assert html.count('<button class="side-tab') == 3
-    assert html.count('<button class="tab') == 6
+    assert html.count('<button class="side-tab') == 4
+    assert html.count('<button class="tab') == 7
+
+
+def test_run_portfolio_snapshot_summarizes_robinhood_snapshot(tmp_path):
+    snapshot = tmp_path / "robinhood_snapshot.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "as_of": "2026-06-11",
+                "source": "robinhood_mcp_read_only",
+                "account_number_masked": "****9844",
+                "account": {
+                    "total_equity": 10046.66,
+                    "cash": 7380.55,
+                    "buying_power": 3845.26,
+                },
+                "positions": [
+                    {
+                        "symbol": "MU",
+                        "shares": 1.0,
+                        "price": 943.98,
+                        "average_cost": 859.02,
+                        "equity": 943.98,
+                    },
+                    {
+                        "symbol": "ASML",
+                        "shares": 0.0,
+                        "average_cost": 0.0,
+                    },
+                ],
+            }
+        )
+    )
+
+    out = _run_portfolio_snapshot({"snapshot_path": str(snapshot)})
+
+    assert out["ok"] is True
+    assert out["source"] == "robinhood_mcp_read_only"
+    assert out["summary"]["cash"] == 7380.55
+    assert out["summary"]["buying_power"] == 3845.26
+    assert out["summary"]["position_count"] == 1
+    assert out["summary"]["invested_value"] == 943.98
+    assert out["positions"][0]["symbol"] == "MU"
+    assert round(out["positions"][0]["unrealized_pnl"], 2) == 84.96
 
 
 def test_run_analysis_uses_selected_report_style(tmp_path, monkeypatch):

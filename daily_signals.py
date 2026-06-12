@@ -138,6 +138,13 @@ def _parse_args() -> argparse.Namespace:
         help="Disable the informational 20d-horizon action overlay "
         "(derived from per_horizon_composites.ret_20d).",
     )
+    p.add_argument(
+        "--calibration-20d-path",
+        default="configs/confidence_calibration_20d.json",
+        help="Path to the 20d isotonic calibration (fit_confidence_calibration.py "
+        "--recompute-horizon ret_20d). When the file exists, the 20d overlay "
+        "uses calibrated confidence; otherwise it falls back to heuristic.",
+    )
     return p.parse_args()
 
 
@@ -637,7 +644,15 @@ def main() -> None:
     )
     if not getattr(args, "no_horizon_overlay", False) and n_with_20d:
         print(f"Computing 20d-horizon action overlay ({n_with_20d} signal(s) with a 20d composite)...")
-        horizon_signals = derive_horizon_signals(signals)
+        cal_20d = None
+        cal_20d_path = getattr(args, "calibration_20d_path", None)
+        if cal_20d_path and Path(cal_20d_path).exists():
+            try:
+                cal_20d = json.loads(Path(cal_20d_path).read_text())
+                print(f"  20d confidence calibrated via {cal_20d_path}")
+            except Exception:
+                cal_20d = None
+        horizon_signals = derive_horizon_signals(signals, calibration=cal_20d)
         horizon_actions, _ = compute_actions(
             signals=horizon_signals,
             positions=positions,
