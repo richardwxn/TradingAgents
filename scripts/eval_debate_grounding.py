@@ -135,15 +135,17 @@ def main() -> int:
     if not paths:
         print(f"[fail] no reports matched {args.reports_glob}", file=sys.stderr)
         return 2
+    # Evenly sample the FILE LIST to the cap BEFORE loading, so we only fetch
+    # forward returns for the pairs we'll actually evaluate (load_records over
+    # the full corpus would fetch thousands of yfinance series needlessly).
+    if args.max_pairs and len(paths) > args.max_pairs:
+        step = len(paths) / args.max_pairs
+        paths = [paths[int(i * step)] for i in range(args.max_pairs)]
     print(f"Loading {len(paths)} reports + forward returns...")
     records = load_records(
         paths, horizons=args.horizons, capture_factor_scores=False,
         capture_market_context=False, benchmark_symbol=None,
     )
-    # Evenly sample to the requested cap so the slice spans the corpus.
-    if args.max_pairs and len(records) > args.max_pairs:
-        step = len(records) / args.max_pairs
-        records = [records[int(i * step)] for i in range(args.max_pairs)]
     print(f"Running ablation over {len(records)} (ticker, date) pairs "
           f"(2 debates each) at horizon {args.horizon}...")
 
