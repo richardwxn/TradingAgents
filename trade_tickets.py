@@ -533,6 +533,13 @@ def _format_batch_markdown(batch: ExecutionBatch) -> str:
     for t in [*batch.tickets, *batch.blocked_tickets]:
         lines.append(f"### {t.ticket_id} - {t.symbol}")
         lines.append(f"- Status: `{t.status}`")
+        final_signal = (t.details or {}).get("final_signal") or {}
+        if final_signal:
+            from tradingagents.analysis_only.agent_review import render_final_signal_line
+
+            bottom_line = render_final_signal_line(final_signal)
+            if bottom_line:
+                lines.append(f"- {bottom_line}")
         lines.append(f"- Rationale: {t.rationale}")
         if t.risk_notes:
             for note in t.risk_notes:

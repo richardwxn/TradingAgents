@@ -55,6 +55,9 @@ def test_analysis_ui_html_keeps_workflows_and_primary_controls():
         "optionContractLabel",
         "portfolioTable",
         "strategyScore",
+        "analysis-progress",
+        "Analysis running for",
+        "startAnalysisProgress(payload);",
     ]:
         assert marker in html
 
