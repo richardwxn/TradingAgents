@@ -427,6 +427,13 @@ def _run_analysis(payload: dict[str, Any], output_dir: str) -> dict[str, Any]:
     else:
         json_path = report_file(out_dir, ticker, as_of_date)
     data = report.to_json_dict()
+    # Ensure the consolidated bottom-line signal is present even for reports
+    # generated before this field existed (derived, deterministic, cheap).
+    kf = data.setdefault("key_features", {})
+    if not kf.get("final_signal"):
+        from tradingagents.analysis_only.agent_review import summarize_final_signal
+
+        kf["final_signal"] = summarize_final_signal(data)
     _annotate_option_strategy_scores(data)
     markdown = _render_analysis_markdown(data, report_style)
     md_path = json_path.with_suffix(".md")
@@ -2616,6 +2623,19 @@ def _html_page() -> str:
     .action-badge.buy {{ background: var(--good); }}
     .action-badge.sell {{ background: var(--bad); }}
     .action-badge.hold, .action-badge.watch {{ background: var(--warn); }}
+    .final-signal-banner {{
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      border: 1px solid var(--line); border-left: 6px solid var(--accent);
+      border-radius: 8px; padding: 12px 16px; margin-bottom: 14px;
+      background: var(--surface); box-shadow: var(--shadow);
+    }}
+    .final-signal-banner.aligned {{ border-left-color: var(--good); }}
+    .final-signal-banner.agents_cautious {{ border-left-color: var(--warn); }}
+    .final-signal-banner.conflict {{ border-left-color: var(--bad); }}
+    .final-signal-banner .fs-call {{ font-size: 20px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; }}
+    .final-signal-banner .fs-meta {{ color: var(--muted); font-size: 13px; }}
+    .final-signal-banner .fs-why {{ flex-basis: 100%; color: var(--muted); font-size: 13px; line-height: 1.4; }}
+    .final-signal-banner .fs-tag {{ border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--muted); }}
     .hero-copy {{ max-width: 760px; }}
     .hero-copy h2 {{ margin: 0 0 6px; font-size: 24px; }}
     .hero-copy p {{ margin: 0; color: var(--muted); line-height: 1.45; }}
@@ -3044,6 +3064,7 @@ def _html_page() -> str:
     const LLM_ENV = {llm_env_json};
     const TAB_IDS = ['summary', 'portfolio', 'best-buy', 'trade-tickets', 'ml-gate', 'markdown', 'json'];
     let bestBuyPoll = null;
+    let analysisProgressTimer = null;
     const factors = document.getElementById('factors');
     for (const [name, value] of Object.entries(DEFAULT_WEIGHTS)) {{
       const row = document.createElement('div');
@@ -3111,7 +3132,12 @@ def _html_page() -> str:
       const run = document.getElementById('run');
       status.textContent = 'Running';
       run.disabled = true;
-      document.getElementById('summary').innerHTML = '';
+      run.textContent = 'Running...';
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+      document.querySelector('[data-tab="summary"]').classList.add('active');
+      for (const id of TAB_IDS) {{
+        document.getElementById(id).classList.toggle('hidden', id !== 'summary');
+      }}
       document.getElementById('markdown').textContent = '';
       document.getElementById('json').textContent = '';
       const factorWeights = {{}};
@@ -3137,6 +3163,7 @@ def _html_page() -> str:
         portfolio_path: document.getElementById('portfolio_path').value,
         factor_weights: factorWeights
       }};
+      startAnalysisProgress(payload);
       try {{
         const res = await fetch('/api/analyze', {{
           method: 'POST',
@@ -3153,7 +3180,9 @@ def _html_page() -> str:
         document.getElementById('summary').innerHTML = `<div class="error">${{err.message}}</div>`;
         status.textContent = 'Error';
       }} finally {{
+        stopAnalysisProgress();
         run.disabled = false;
+        run.textContent = 'Run Analysis';
       }}
     }});
 
@@ -3485,6 +3514,44 @@ def _html_page() -> str:
       }}
     }}
 
+    function startAnalysisProgress(payload) {{
+      stopAnalysisProgress();
+      const started = Date.now();
+      const ticker = String(payload.ticker || '').trim().toUpperCase() || 'ticker';
+      const phases = [
+        'Loading market data and indicators',
+        'Checking cache and prior state',
+        'Scanning options and volatility context',
+        'Building factor score and decision plan',
+        payload.enable_narrative || payload.enable_llm_insights || payload.enable_tradingagents_review
+          ? 'Waiting on selected LLM review blocks'
+          : 'Rendering report artifacts'
+      ];
+      const render = () => {{
+        const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
+        const phase = phases[Math.min(phases.length - 1, Math.floor(elapsed / 8))];
+        document.getElementById('summary').innerHTML = `
+          <div class="dashboard-panel" role="status" aria-live="polite">
+            <h2>Analysis running for ${{escapeHtml(ticker)}}</h2>
+            <p class="hint">This can take a few minutes when data refreshes, options scans, or LLM blocks are enabled.</p>
+            <div id="analysis-progress" class="bar indeterminate" aria-label="Analysis in progress"><span></span></div>
+            <div class="pill-row" style="margin-top:10px">
+              <span class="data-pill">Phase: ${{escapeHtml(phase)}}</span>
+              <span class="data-pill">Elapsed: ${{fmtNum(elapsed)}}s</span>
+              <span class="data-pill">Provider: ${{escapeHtml(payload.data_provider || 'auto')}}</span>
+              <span class="data-pill">As of ${{escapeHtml(payload.date || '')}}</span>
+            </div>
+          </div>
+        `;
+      }};
+      render();
+      analysisProgressTimer = setInterval(render, 1000);
+    }}
+    function stopAnalysisProgress() {{
+      if (analysisProgressTimer) clearInterval(analysisProgressTimer);
+      analysisProgressTimer = null;
+    }}
+
     function startBestBuyPolling(jobId, onDone) {{
       stopBestBuyPolling();
       let doneHandled = false;
@@ -3573,7 +3640,9 @@ def _html_page() -> str:
       }};
       const action = String(decision.action || r.direction || 'watch').toLowerCase();
       const actionClass = actionBucket(action);
+      const finalSignal = kf.final_signal || {{}};
       document.getElementById('summary').innerHTML = `
+        ${{renderFinalSignalBanner(finalSignal)}}
         <div class="dashboard-hero">
           <div class="hero-line">
             <div class="hero-copy">
@@ -4682,6 +4751,21 @@ def _html_page() -> str:
     }}
     function firstRiskFlag(reportContext) {{
       return String(((reportContext.riskFlags || [])[0]) || '');
+    }}
+    function renderFinalSignalBanner(fs) {{
+      if (!fs || !fs.headline) return '';
+      const agreement = String(fs.agreement || 'quant_only');
+      const caveats = (fs.caveats || []).filter(Boolean);
+      const sizeTag = fs.size_hint && fs.size_hint !== 'full'
+        ? `<span class="fs-tag">size: ${{escapeHtml(fs.size_hint)}}</span>` : '';
+      return `
+        <div class="final-signal-banner ${{escapeHtml(agreement)}}" title="Derived roll-up of the quant verdict and the TradingAgents review gate. See panels below for detail.">
+          <span class="fs-call">${{escapeHtml(fs.call || '—')}}</span>
+          <span class="fs-meta">${{escapeHtml(fs.conviction || '')}} conviction · ${{escapeHtml(fs.agreement_label || '')}}</span>
+          ${{sizeTag}}
+          ${{fs.why ? `<span class="fs-why">${{escapeHtml(fs.why)}}${{caveats.length ? ` · watch: ${{escapeHtml(caveats.join('; '))}}` : ''}}</span>` : ''}}
+        </div>
+      `;
     }}
     function renderAgentRoom(graphContext) {{
       if (!graphContext || !Object.keys(graphContext).length) return '';

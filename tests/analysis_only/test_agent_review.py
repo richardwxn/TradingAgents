@@ -443,3 +443,144 @@ def test_markdown_renderer_handles_tradingagents_review_block():
     assert "**Disagreement highlights**" in md
     assert "### TradingAgents room" in md
     assert "Market analyst text" in md
+
+
+def _report(
+    *,
+    direction: str,
+    confidence: float | None,
+    composite: float | None,
+    action: str | None = None,
+    gate: dict | None = None,
+    graph_decision: str | None = None,
+    risk_flags: list[str] | None = None,
+) -> dict:
+    review: dict = {}
+    if gate is not None or graph_decision is not None:
+        review = {
+            "status": "ok",
+            "graph_contexts": [{"processed_decision": graph_decision}],
+            "gate": gate or {},
+        }
+    return {
+        "symbol": "T",
+        "direction": direction,
+        "confidence": confidence,
+        "risk_flags": risk_flags or [],
+        "key_features": {
+            "model_scoring": {"composite_score": composite},
+            "decision_summary": {"action": action} if action else {},
+            "tradingagents_review": review,
+        },
+    }
+
+
+def test_summarize_final_signal_aligned_bullish():
+    fs = agent_review.summarize_final_signal(
+        _report(
+            direction="bullish",
+            confidence=0.72,
+            composite=0.34,
+            action="buy",
+            graph_decision="Buy",
+            gate={
+                "status": "ok",
+                "agree_with_signal": True,
+                "risk_veto": False,
+                "sizing_multiplier": 1.0,
+                "ticket_gate": "allow",
+                "reason": "Agents agree.",
+            },
+        )
+    )
+    assert fs["call"] == "BUY"
+    assert fs["conviction"] == "High"
+    assert fs["agreement"] == "aligned"
+    assert fs["size_hint"] == "full"
+    assert fs["inputs"]["agents_decision"] == "Buy"
+
+
+def test_summarize_final_signal_risk_veto_demotes_buy_to_hold():
+    fs = agent_review.summarize_final_signal(
+        _report(
+            direction="bullish",
+            confidence=0.6,
+            composite=0.2,
+            action="buy",
+            graph_decision="Sell",
+            risk_flags=["Earnings in 3d"],
+            gate={
+                "status": "ok",
+                "agree_with_signal": False,
+                "risk_veto": True,
+                "sizing_multiplier": 0.0,
+                "ticket_gate": "block_buy_add",
+                "reason": "Risk veto.",
+                "execution_caveats": ["Liquidity thin"],
+            },
+        )
+    )
+    assert fs["call"] == "HOLD"
+    assert fs["agreement"] == "conflict"
+    assert fs["conviction"] == "Low"
+    assert fs["size_hint"] == "blocked"
+    assert fs["caveats"][0] == "Liquidity thin"
+
+
+def test_summarize_final_signal_manual_review_reduces_size():
+    fs = agent_review.summarize_final_signal(
+        _report(
+            direction="bullish",
+            confidence=0.8,
+            composite=0.3,
+            action="buy",
+            graph_decision="Buy",
+            gate={
+                "status": "ok",
+                "agree_with_signal": True,
+                "risk_veto": False,
+                "sizing_multiplier": 0.5,
+                "ticket_gate": "manual_review",
+                "reason": "Manual confirm.",
+            },
+        )
+    )
+    assert fs["agreement"] == "agents_cautious"
+    assert fs["conviction"] == "Medium"  # demoted one level from High
+    assert fs["size_hint"] == "reduced"
+
+
+def test_summarize_final_signal_quant_only_when_no_review():
+    fs = agent_review.summarize_final_signal(
+        _report(direction="neutral", confidence=0.3, composite=0.02, action="hold")
+    )
+    assert fs["agreement"] == "quant_only"
+    assert fs["call"] == "HOLD"
+    assert fs["inputs"]["agents_decision"] is None
+
+
+def test_summarize_final_signal_derives_gate_when_absent():
+    # No gate attached: function recomputes it from the review payload.
+    report = _report(
+        direction="bullish", confidence=0.7, composite=0.3, action="buy",
+        graph_decision="Buy",
+    )
+    report["key_features"]["tradingagents_review"]["gate"] = {}
+    fs = agent_review.summarize_final_signal(report)
+    assert fs["call"] == "BUY"
+    assert fs["agreement"] in {"aligned", "agents_cautious", "conflict"}
+
+
+def test_summarize_final_signal_is_exception_safe():
+    fs = agent_review.summarize_final_signal({"direction": "bullish"})
+    assert fs["call"]
+    assert "headline" in fs
+
+
+def test_render_final_signal_line():
+    fs = agent_review.summarize_final_signal(
+        _report(direction="neutral", confidence=0.3, composite=0.02, action="hold")
+    )
+    line = agent_review.render_final_signal_line(fs)
+    assert line.startswith("**Bottom line:**")
+    assert agent_review.render_final_signal_line({}) == ""

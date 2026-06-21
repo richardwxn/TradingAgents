@@ -287,6 +287,10 @@ def ticket_from_action(
             "atr14": action.atr14,
             "price_source": action.price_source,
             "tradingagents_review": review_meta,
+            "final_signal": (
+                dict(action.final_signal)
+                if getattr(action, "final_signal", None) else {}
+            ),
         },
     )
 

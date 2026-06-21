@@ -56,6 +56,10 @@ class Signal:
     sector: str | None = None
     industry: str | None = None
     tradingagents_review_gate: dict[str, Any] = field(default_factory=dict)
+    # Consolidated plain-language "bottom line" (derived label, not a new
+    # score) so the daily report and tickets can echo the same headline the
+    # portal shows. See agent_review.summarize_final_signal.
+    final_signal: dict[str, Any] = field(default_factory=dict)
     # Additive 20d-horizon composite (validated per-horizon override). The
     # primary `composite` is unchanged; this exposes the 20d view for the
     # 20d-horizon action overlay without altering current sizing.
@@ -115,6 +119,7 @@ class Action:
     review_gate_reason: str | None = None
     review_execution_caveats: list[str] = field(default_factory=list)
     tradingagents_review: dict[str, Any] = field(default_factory=dict)
+    final_signal: dict[str, Any] = field(default_factory=dict)
 
 
 # Action precedence for the report ordering (BUY first, then EXIT, etc.).
@@ -159,6 +164,12 @@ def _load_signal_from_json(path: Path) -> Signal | None:
     ec = kf.get("earnings_calendar") or {}
     ind = kf.get("industry_context") or {}
     review_gate = (kf.get("tradingagents_review") or {}).get("gate") or {}
+    final_signal = kf.get("final_signal")
+    if not isinstance(final_signal, dict) or not final_signal:
+        # Derive on read for reports generated before the field existed.
+        from tradingagents.analysis_only.agent_review import summarize_final_signal
+
+        final_signal = summarize_final_signal(payload)
     return Signal(
         symbol=symbol,
         as_of_date=as_of,
@@ -179,6 +190,7 @@ def _load_signal_from_json(path: Path) -> Signal | None:
         tradingagents_review_gate=(
             dict(review_gate) if isinstance(review_gate, dict) else {}
         ),
+        final_signal=dict(final_signal) if isinstance(final_signal, dict) else {},
         composite_20d=(
             float(composite_20d) if composite_20d is not None else None
         ),
@@ -632,6 +644,9 @@ def compute_actions(
                 if str(x).strip()
             ],
             tradingagents_review={},
+            final_signal=(
+                dict(sig.final_signal) if sig and sig.final_signal else {}
+            ),
         ))
 
     for sym in positions:
@@ -939,6 +954,12 @@ def _render_action_block(a: Action) -> list[str]:
         f"Δ {_fmt_pct(a.delta_pp)}"
     )
     pieces.append(f"### {a.action} {a.symbol}  ({title_meta})")
+    if a.final_signal:
+        from tradingagents.analysis_only.agent_review import render_final_signal_line
+
+        bottom_line = render_final_signal_line(a.final_signal)
+        if bottom_line:
+            pieces.append(f"- {bottom_line}")
     sig_bits = []
     if a.direction:
         sig_bits.append(f"direction `{a.direction}`")

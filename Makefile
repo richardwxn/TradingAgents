@@ -1,9 +1,20 @@
-.PHONY: test test-analysis test-portfolio test-all model-acceptance model-backtest model-backtest-override model-backtest-train model-backtest-test portfolio-sim
+.PHONY: test test-analysis test-portfolio test-all model-acceptance model-backtest model-backtest-override model-backtest-train model-backtest-test portfolio-sim morning morning-dry
 
 PYTHON ?= .venv/bin/python
 
 test:
 	$(PYTHON) -m pytest tests
+
+# Run the full morning report pipeline (trading-day gated). Mirrors what the
+# launchd agent (deploy/launchd/com.tradingagent.morning.plist) runs each
+# weekday morning.
+morning:
+	PYTHON=$(PYTHON) scripts/morning_report.sh
+
+# Manual dry run: ignore the trading-day gate and skip notifications. Add
+# ARGS="--no-llm --skip-refresh" etc. to go faster.
+morning-dry:
+	PYTHON=$(PYTHON) scripts/morning_report.sh --force --no-notify $(ARGS)
 
 test-analysis:
 	$(PYTHON) -m pytest tests/analysis_only

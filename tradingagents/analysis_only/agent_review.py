@@ -147,6 +147,211 @@ def _gate_stance(value: Any) -> str | None:
     return None
 
 
+# ---------- final consolidated signal ("bottom line") ----------
+#
+# This is deliberately a DERIVED label, not a new blended score. The quant
+# composite/direction/confidence and the TradingAgents review gate each
+# already reduce to their own verdict; this collapses them into one
+# plain-language line so the portal, daily signals, and ticket packet can
+# show the same headline. The underlying numbers are never overwritten —
+# `inputs` carries them through so the detailed panels remain the source of
+# truth for reference.
+
+# Base recommendation derived from the human-facing decision_summary action
+# (which already folds in portfolio constraints), falling back to direction.
+_CALL_FROM_ACTION = {
+    "buy": "BUY",
+    "add": "ADD",
+    "sell": "SELL",
+    "exit": "SELL",
+    "trim": "TRIM",
+    "hold": "HOLD",
+    "watch": "WATCH",
+    "avoid": "AVOID",
+}
+_CALL_FROM_DIRECTION = {
+    "bullish": "BUY",
+    "bearish": "SELL",
+    "neutral": "HOLD",
+}
+
+_AGREEMENT_LABELS = {
+    "aligned": "model & agents aligned",
+    "agents_cautious": "agents flag caution",
+    "conflict": "model vs agents conflict",
+    "quant_only": "quant model only",
+}
+
+_CONVICTION_LABELS = {3: "High", 2: "Medium", 1: "Low"}
+
+
+def _confidence_conviction(confidence: float | None) -> int:
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return 1
+    if c >= 0.66:
+        return 3
+    if c >= 0.40:
+        return 2
+    return 1
+
+
+def summarize_final_signal(report: dict[str, Any]) -> dict[str, Any]:
+    """Roll the quant verdict and the TradingAgents review gate into one
+    plain-language "bottom line" signal.
+
+    Deterministic, additive, and exception-safe. Operates on a saved report
+    payload (``AnalysisReport.to_json_dict()``) so the portal server, the
+    daily-signals loader, and the ticket builder can all derive the SAME
+    headline from any report JSON — even ones generated before this field
+    existed. The review gate is recomputed when absent.
+    """
+    try:
+        kf = report.get("key_features") or {}
+        scoring = kf.get("model_scoring") or {}
+        decision = kf.get("decision_summary") or {}
+        review = kf.get("tradingagents_review") or {}
+
+        direction = str(report.get("direction") or "neutral").lower()
+        try:
+            confidence = float(report.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = None
+        try:
+            composite = float(scoring.get("composite_score"))
+        except (TypeError, ValueError):
+            composite = None
+
+        action = str(decision.get("action") or "").strip().lower()
+        base_call = _CALL_FROM_ACTION.get(action) or _CALL_FROM_DIRECTION.get(
+            direction, "HOLD"
+        )
+
+        gate = review.get("gate")
+        if not isinstance(gate, dict) or not gate:
+            gate = normalize_review_gate(
+                review, report_context=report_context_from_payload(report)
+            )
+        review_ran = gate.get("status") == "ok"
+        agree = gate.get("agree_with_signal")
+        risk_veto = bool(gate.get("risk_veto"))
+        ticket_gate = str(gate.get("ticket_gate") or "allow")
+        try:
+            sizing = float(gate.get("sizing_multiplier", 1.0))
+        except (TypeError, ValueError):
+            sizing = 1.0
+
+        call = base_call
+        conviction = _confidence_conviction(confidence)
+
+        if not review_ran:
+            agreement = "quant_only"
+        elif risk_veto:
+            if call in {"BUY", "ADD"}:
+                call = "HOLD"
+            agreement = "conflict"
+            conviction = 1
+        elif ticket_gate == "manual_review":
+            agreement = "conflict" if agree is False else "agents_cautious"
+            conviction = max(1, conviction - 1)
+        elif agree is True:
+            agreement = "aligned"
+        else:
+            agreement = "aligned"
+
+        if sizing <= 0:
+            size_hint = "blocked"
+        elif sizing < 1.0:
+            size_hint = "reduced"
+        else:
+            size_hint = "full"
+
+        agreement_label = _AGREEMENT_LABELS[agreement]
+        conviction_label = _CONVICTION_LABELS[conviction]
+        headline = f"{call} · {conviction_label} conviction · {agreement_label}"
+
+        why_bits: list[str] = []
+        if composite is not None:
+            why_bits.append(f"Composite {composite:+.2f} ({direction})")
+        if confidence is not None:
+            why_bits.append(f"confidence {confidence:.0%}")
+        gate_reason = str(gate.get("reason") or "").strip()
+        if review_ran and gate_reason:
+            why_bits.append(gate_reason.rstrip("."))
+        why = "; ".join(why_bits) + ("." if why_bits else "")
+
+        caveats: list[str] = []
+        for c in (gate.get("execution_caveats") or [])[:2]:
+            c = str(c).strip()
+            if c and c not in caveats:
+                caveats.append(c)
+        for rf in (report.get("risk_flags") or []):
+            if len(caveats) >= 2:
+                break
+            rf = str(rf).strip()
+            if rf and rf not in caveats:
+                caveats.append(rf)
+
+        return {
+            "call": call,
+            "conviction": conviction_label,
+            "agreement": agreement,
+            "agreement_label": agreement_label,
+            "size_hint": size_hint,
+            "headline": headline,
+            "why": why,
+            "caveats": caveats[:2],
+            "sizing_multiplier": sizing,
+            # Traceability back to the detailed panels — never a new score.
+            "inputs": {
+                "quant_direction": direction,
+                "quant_action": action or None,
+                "confidence": confidence,
+                "composite": composite,
+                "agents_decision": (
+                    (review.get("graph_contexts") or [{}])[0].get(
+                        "processed_decision"
+                    )
+                    if review_ran else None
+                ),
+                "ticket_gate": ticket_gate,
+            },
+        }
+    except Exception as exc:  # never break report generation over a label
+        return {
+            "call": str(report.get("direction") or "—").upper(),
+            "conviction": "Low",
+            "agreement": "quant_only",
+            "agreement_label": _AGREEMENT_LABELS["quant_only"],
+            "size_hint": "full",
+            "headline": "Signal unavailable",
+            "why": "",
+            "caveats": [],
+            "sizing_multiplier": 1.0,
+            "error": str(exc),
+            "inputs": {},
+        }
+
+
+def render_final_signal_line(final_signal: dict[str, Any] | None) -> str:
+    """One-line markdown rendering of a final signal, for daily reports and
+    ticket packets. Returns an empty string when no signal is available."""
+    if not isinstance(final_signal, dict) or not final_signal:
+        return ""
+    headline = str(final_signal.get("headline") or "").strip()
+    if not headline:
+        return ""
+    line = f"**Bottom line:** {headline}"
+    why = str(final_signal.get("why") or "").strip()
+    if why:
+        line += f" — {why}"
+    caveats = [str(c).strip() for c in (final_signal.get("caveats") or []) if str(c).strip()]
+    if caveats:
+        line += f" _(watch: {'; '.join(caveats)})_"
+    return line
+
+
 def _build_review_schema():
     from pydantic import BaseModel, Field, field_validator
 

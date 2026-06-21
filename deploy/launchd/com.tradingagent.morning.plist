@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for the morning trading report.
+
+  Install:
+    cp deploy/launchd/com.tradingagent.morning.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.tradingagent.morning.plist
+
+  Uninstall:
+    launchctl unload -w ~/Library/LaunchAgents/com.tradingagent.morning.plist
+    rm ~/Library/LaunchAgents/com.tradingagent.morning.plist
+
+  Notes:
+    - Times are in the machine's LOCAL timezone. The Hour/Minute below assume
+      you want a pre-open run; adjust so it lands before the 09:30 ET open in
+      your timezone (e.g. 06:00 for US/Pacific).
+    - launchd cannot wake a sleeping Mac. If the Mac may be asleep at this time,
+      schedule a hardware wake too, e.g.:
+        sudo pmset repeat wake MTWRF 05:55:00
+      (the Mac must be on AC power for scheduled wake to be reliable).
+    - morning_report.sh re-execs itself under `caffeinate -i -s`, so once it
+      starts it holds off idle/system sleep until the run finishes (prevents a
+      scheduled "dark wake" from dozing back to sleep mid-pipeline).
+    - A passcode lock screen is fine as long as you remain logged in; the agent
+      runs in your GUI session. A full logout or pre-login FileVault screen will
+      defer the run until you log in.
+    - Weekend/holiday skipping is handled inside morning_report.sh via
+      scripts/is_trading_day.py, so the schedule only needs weekdays.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradingagent.morning</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/xinnan/tradingagent/scripts/morning_report.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/xinnan/tradingagent</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/xinnan/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/xinnan</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/xinnan/tradingagent/reports/morning/launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/xinnan/tradingagent/reports/morning/launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Standard</string>
+</dict>
+</plist>

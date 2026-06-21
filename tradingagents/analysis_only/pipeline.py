@@ -5239,7 +5239,7 @@ class AnalysisOnlyMVP:
             data_quality=data_quality,
         )
 
-        return AnalysisReport(
+        report = AnalysisReport(
             symbol=symbol,
             horizon=self.horizon,
             as_of_date=as_of_date,
@@ -5303,6 +5303,15 @@ class AnalysisOnlyMVP:
             ),
             llm_critic=critic_block,
         )
+        # Consolidated plain-language "bottom line" — a derived label over
+        # the quant verdict + review gate, not a new blended score. Attached
+        # last so it can read the fully-assembled report.
+        from tradingagents.analysis_only.agent_review import summarize_final_signal
+
+        report.key_features["final_signal"] = summarize_final_signal(
+            report.to_json_dict()
+        )
+        return report
 
     def _resolve_factor_weights(
         self,
