@@ -2849,9 +2849,9 @@ def _html_page() -> str:
           <label for="competitors">Competitors</label>
           <input id="competitors" name="competitors" placeholder="AMD,INTC,AVGO">
           <div class="quick-toggles">
-            <label class="checkrow"><input id="enable_narrative" type="checkbox"> Narrative</label>
-            <label class="checkrow"><input id="enable_llm_insights" type="checkbox"> Insight Block</label>
-            <label class="checkrow"><input id="enable_tradingagents_review" type="checkbox"> TradingAgents Review</label>
+            <label class="checkrow"><input id="enable_narrative" type="checkbox" checked> Narrative</label>
+            <label class="checkrow"><input id="enable_llm_insights" type="checkbox" checked> Insight Block</label>
+            <label class="checkrow"><input id="enable_tradingagents_review" type="checkbox" checked> TradingAgents Review</label>
             <label class="checkrow"><input id="force_refresh" type="checkbox" checked> Refresh cached report</label>
           </div>
         </fieldset>
