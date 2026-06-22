@@ -45,11 +45,13 @@ core:
   - ASML   # Semi equipment monopoly
   - KLAC   # Semi metrology / process control
   - ANET   # Hyperscaler-driven networking
-  - PLTR   # AI software
   - CRWD   # Cyber + AI
   - MRVL   # Custom silicon / hyperscaler
   - LITE   # Lumentum — optical components, AI datacenter
   - AAOI   # Applied Optoelectronics — fiber optics / datacom
+  - SPCX   # Space / aerospace ETF
+  - INTC   # Integrated device manufacturer
+  - SNDK   # Flash storage / memory
 
 # Cross-sector diagnostic cohort. These are NOT for trading; they're a
 # control group to detect when a factor's IC is sector-specific.
@@ -83,7 +85,6 @@ sectors:
   GOOGL: Tech-MegaCap
   META:  Tech-MegaCap
   ORCL:  Tech-MegaCap
-  PLTR:  Software
   CRWD:  Software
   # Networking + infra
   ANET:  Networking
@@ -97,6 +98,9 @@ sectors:
   # Other
   FIG:   Financial-Data
   RKLB:  Aerospace
+  SPCX:  Aerospace
+  INTC:  Semiconductors
+  SNDK:  Semiconductors
   # --- canaries ---
   JPM:   Financials
   XOM:   Energy

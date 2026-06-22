@@ -110,6 +110,24 @@ exec > >(tee -a "$LOG") 2>&1
 
 log() { printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
+# --- Failure notification ---------------------------------------------------
+# Steps 2-3 (daily_signals / trade_workflow) run under `set -e`; an unguarded
+# failure there would otherwise abort BEFORE the success notification, leaving
+# the operator with no signal at all. This EXIT trap fires a macOS failure
+# notification on any non-zero exit. The clean "not a trading day" path exits 0
+# and the happy path ends with rc=0, so neither double-notifies.
+FAIL_LINE=""
+trap 'FAIL_LINE="$LINENO"' ERR
+on_exit() {
+  local rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  log "==== morning_report FAILED (rc=$rc${FAIL_LINE:+ at line $FAIL_LINE}) ===="
+  if [ "${DO_NOTIFY:-1}" -eq 1 ] && command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"Morning run FAILED (rc=$rc) — see ${LOG##*/}\" with title \"Morning Trading Report\" sound name \"Basso\"" 2>/dev/null || true
+  fi
+}
+trap on_exit EXIT
+
 log "==== morning_report start (run_date=$RUN_DATE) ===="
 log "root=$ROOT python=$PYTHON llm=$USE_LLM provider=$LLM_PROVIDER model=$LLM_MODEL"
 
@@ -140,7 +158,13 @@ PY
 
 FAILED_TICKERS=()
 if [ "$DO_REFRESH" -eq 1 ]; then
-  mapfile -t UNIVERSE < <(read_universe)
+  # 3.2-safe `mapfile` replacement: the launchd plist invokes /bin/bash, which
+  # on macOS is 3.2 (no `mapfile` builtin). Read the universe line-by-line.
+  UNIVERSE=()
+  while IFS= read -r _t; do
+    [ -z "$_t" ] && continue
+    UNIVERSE+=("$_t")
+  done < <(read_universe)
   if [ "${#UNIVERSE[@]}" -eq 0 ]; then
     log "WARN: could not read universe from configs/sizing.yaml; skipping refresh"
   else
@@ -154,8 +178,10 @@ if [ "$DO_REFRESH" -eq 1 ]; then
       [ -z "$T" ] && continue
       log "  analysis_mvp $T ..."
       # One bad ticker must not abort the whole morning run.
+      # ${arr[@]+...} guard: expanding an empty array under `set -u` aborts in
+      # bash 3.2 (the launchd interpreter). With --no-llm, LLM_FLAGS is empty.
       if ! "$PYTHON" analysis_mvp.py --ticker "$T" --date "$RUN_DATE" \
-            --no-json-stdout "${LLM_FLAGS[@]}"; then
+            --no-json-stdout ${LLM_FLAGS[@]+"${LLM_FLAGS[@]}"}; then
         log "  WARN: analysis_mvp failed for $T"
         FAILED_TICKERS+=("$T")
       fi
