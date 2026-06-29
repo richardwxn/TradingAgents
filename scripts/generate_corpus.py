@@ -330,6 +330,42 @@ def main() -> int:
             "File doesn't need to exist — pipeline silently falls back."
         ),
     )
+    parser.add_argument(
+        "--refit-confidence-calibration",
+        action="store_true",
+        default=False,
+        help=(
+            "OPT-IN (default OFF): after the regen loop completes, shell out "
+            "to scripts/fit_confidence_calibration.py to re-fit the Phase-5 "
+            "isotonic confidence calibration on the FRESH corpus (plan B-8). "
+            "Writes to a REVIEW path (--refit-calibration-output) and NEVER "
+            "clobbers the live configs/confidence_calibration.json, so the "
+            "operator diffs before promoting. No-op when the regen has "
+            "errors. Note the chicken-and-egg ordering: this regen baked the "
+            "EXISTING calibration into report confidence, so the re-fit reads "
+            "a corpus whose frozen confidence values are one generation stale "
+            "— the calibration MAP itself is fit fresh from composites/hits, "
+            "which is what matters for the signal layer."
+        ),
+    )
+    parser.add_argument(
+        "--refit-calibration-output",
+        default="configs/confidence_calibration.regen.json",
+        help=(
+            "Review path the --refit-confidence-calibration step writes the "
+            "fresh calibration to. Defaults to a .regen.json sidecar so the "
+            "live file is never overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--refit-calibration-horizon",
+        default="ret_20d",
+        help=(
+            "Forward-return horizon for the --refit-confidence-calibration "
+            "step. Default ret_20d matches the live primary file; pass "
+            "ret_60d to target the plan's stated primary horizon."
+        ),
+    )
     args = parser.parse_args()
     # `--minimal-context` is the legacy bundled flag — expand it into the
     # individual skip flags so the rest of the code only checks the
@@ -465,8 +501,54 @@ def main() -> int:
     )
     if errors:
         print(f"See {errors_log} for error details.")
+        if args.refit_confidence_calibration:
+            print(
+                "Skipping --refit-confidence-calibration: regen had errors; "
+                "fit the calibration only on a clean corpus.",
+                file=sys.stderr,
+            )
         return 1
+
+    if args.refit_confidence_calibration:
+        return _refit_confidence_calibration(
+            reports_glob=str(output_dir / "*.json"),
+            output_path=args.refit_calibration_output,
+            horizon=args.refit_calibration_horizon,
+        )
     return 0
+
+
+def _refit_confidence_calibration(
+    reports_glob: str, output_path: str, horizon: str,
+) -> int:
+    """Shell out to scripts/fit_confidence_calibration.py after a clean regen.
+
+    Writes to the REVIEW path only; the live configs/confidence_calibration.json
+    is never touched here. Returns the fit script's exit code. Additive /
+    default-off: only reached when --refit-confidence-calibration is passed.
+    """
+    import subprocess
+
+    fit_script = _REPO_ROOT / "scripts" / "fit_confidence_calibration.py"
+    cmd = [
+        sys.executable,
+        str(fit_script),
+        "--reports-glob", reports_glob,
+        "--horizon", horizon,
+        "--output", output_path,
+    ]
+    print(
+        f"\n[refit-calibration] Re-fitting confidence calibration on fresh "
+        f"corpus -> REVIEW path {output_path} (live file untouched)."
+    )
+    print(f"[refit-calibration] {' '.join(cmd)}")
+    proc = subprocess.run(cmd)
+    print(
+        f"[refit-calibration] done (exit {proc.returncode}). Diff against the "
+        f"live file and promote manually (e.g. `make model-recal-promote`) "
+        f"only if the Phase-5 gates PASS."
+    )
+    return proc.returncode
 
 
 if __name__ == "__main__":
