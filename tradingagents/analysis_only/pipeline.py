@@ -5261,10 +5261,11 @@ class AnalysisOnlyMVP:
                     "factor_scores": factor_scores,
                     "pillar_scores": pillar_scores,
                     "composite_score": round(composite_score, 4),
-                    # Additive per-horizon composites. ret_5d/ret_60d use the
-                    # global vector (== composite_score); ret_20d uses the
-                    # validated IC-signed override. Consumers may read the 20d
-                    # composite for a 20d-horizon view; the primary is unchanged.
+                    # Additive per-horizon composites. ret_5d uses the global
+                    # vector (== composite_score); ret_20d and ret_60d use
+                    # validated IC-signed overrides (see PER_HORIZON_WEIGHTS).
+                    # Consumers may read the per-horizon composite for a
+                    # horizon-specific view; the primary composite is unchanged.
                     "per_horizon_composites": compute_per_horizon_composites(
                         factor_scores, weights,
                         global_composite=round(composite_score, 4),

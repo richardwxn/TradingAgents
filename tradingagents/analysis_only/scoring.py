@@ -1641,18 +1641,28 @@ def _first_finite(*values: float | None) -> float | None:
 
 # Per-horizon composite weight overrides (per-horizon emission).
 #
-# Only ret_20d is overridden, with the IC-signed sparse vector fit at
-# min_abs_ic=0.04 and validated +9.9pp median bullish test-hit under strict
-# rolling-OOS walk-forward vs the v1.5 global vector (see
-# `backtest/results/per_horizon_ic_sweep_findings.md`). ret_5d / ret_60d are
-# intentionally ABSENT, so they fall back to the global DEFAULT_FACTOR_WEIGHTS
-# — the primary (60d-anchored) composite is therefore unchanged, and per-horizon
-# emission is purely additive.
+# ret_20d and ret_60d are overridden with IC-signed sparse vectors fit at
+# min_abs_ic=0.04 and gated under strict rolling-OOS walk-forward vs the v1.5
+# global vector (the same protocol used for every prior commit):
+#
+#   - ret_20d: validated +9.9pp median bullish test-hit (original commit).
+#   - ret_60d: fit on the 3,678-report corpus (2023-07 → 2026-06); strict
+#     rolling-OOS (18mo train / 3mo test / 1mo step, 15 windows) median
+#     bullish test-hit 80.85% vs v1.5 75.69% = +5.16pp, overfit gap +4.17pp
+#     (test does not overfit train). 60d is the calibration anchor horizon
+#     (Section 13), so this is the highest-value per-horizon vector. See
+#     `backtest/results/per_horizon_ic_sweep_findings.md`.
+#
+# ret_5d is intentionally ABSENT: the same gate showed only +0.98pp bullish
+# test-hit (within noise), so it falls back to the global
+# DEFAULT_FACTOR_WEIGHTS. The primary (60d-anchored) composite is unchanged —
+# direction/confidence still use `compute_composite` on the global vector —
+# so per-horizon emission remains purely additive.
 #
 # These are SIGNED weights (sign = IC sign), consumed by
 # `compute_composite_signed`'s abs-normalized form — the same math the
 # walk-forward gate (`backtest.rebuild_records_with_weights`) used, so an
-# emitted composite_20d matches the gated recipe.
+# emitted composite_<h> matches the gated recipe.
 PER_HORIZON_WEIGHTS: dict[str, dict[str, float]] = {
     "ret_20d": {
         "market_vix_regime": -0.0794,
@@ -1660,6 +1670,23 @@ PER_HORIZON_WEIGHTS: dict[str, dict[str, float]] = {
         "market_fear_greed_regime": 0.0614,
         "peer_relative_valuation": 0.0577,
         "momentum_rsi": -0.0426,
+    },
+    "ret_60d": {
+        "trend_sma50_vs_sma200": -0.1008,
+        "momentum_rsi": -0.0551,
+        "fund_revenue_growth": 0.0987,
+        "fund_earnings_growth": -0.0485,
+        "fund_profit_margins": -0.0775,
+        "valuation_sales_multiple_vs_growth": 0.2421,
+        "industry_relative_strength": -0.0885,
+        "peer_relative_momentum": 0.0443,
+        "market_spy_trend": 0.1535,
+        "market_vix_regime": -0.2168,
+        "market_fear_greed_regime": 0.0920,
+        "options_iv_term_structure": 0.1324,
+        "options_iv_skew": -0.0920,
+        "options_iv_rank": -0.0654,
+        "ticker_fear_greed_regime": 0.1084,
     },
 }
 
