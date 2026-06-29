@@ -38,10 +38,15 @@ def _factor_scores():
     ]
 
 
-def test_signed_composite_matches_gate_rebuild():
-    """compute_composite_signed must equal rebuild_records_with_weights."""
+@pytest.mark.parametrize("horizon", ["ret_20d", "ret_60d"])
+def test_signed_composite_matches_gate_rebuild(horizon):
+    """compute_composite_signed must equal rebuild_records_with_weights.
+
+    Runs for every committed per-horizon override so an emitted
+    composite_<h> always matches the recipe the walk-forward gate scored.
+    """
     fs = _factor_scores()
-    weights = PER_HORIZON_WEIGHTS["ret_20d"]
+    weights = PER_HORIZON_WEIGHTS[horizon]
     mine = compute_composite_signed(fs, weights)["composite_score"]
 
     rec = BacktestRecord(
@@ -88,11 +93,11 @@ def test_per_horizon_fallback_reuses_primary_verbatim():
     primary = 0.1234
     out = compute_per_horizon_composites(fs, gw, global_composite=primary)
     assert set(out) == {"ret_5d", "ret_20d", "ret_60d"}
-    # 5d / 60d reuse the primary exactly; 20d is the override.
+    # Only 5d reuses the primary exactly; 20d and 60d are overrides.
     assert out["ret_5d"]["composite_score"] == primary
-    assert out["ret_60d"]["composite_score"] == primary
     assert out["ret_5d"]["weight_source"] == "global"
     assert out["ret_20d"]["weight_source"] == "per_horizon"
+    assert out["ret_60d"]["weight_source"] == "per_horizon"
 
 
 def test_per_horizon_20d_differs_from_primary():
@@ -108,6 +113,7 @@ def test_per_horizon_without_global_composite_computes_fallback():
     fs = _factor_scores()
     gw = {f["factor"]: abs(f["weight"]) for f in fs if f["weight"]}
     out = compute_per_horizon_composites(fs, gw)  # no global_composite
-    # Falls back to computing via signed form; equals positive-weight aggregate.
+    # ret_5d has no override -> falls back to computing via signed form;
+    # equals positive-weight aggregate over the global vector.
     expected = compute_composite_signed(fs, gw)["composite_score"]
-    assert out["ret_60d"]["composite_score"] == expected
+    assert out["ret_5d"]["composite_score"] == expected
