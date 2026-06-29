@@ -135,10 +135,16 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 #      trend_price_vs_sma20, trend_sma20_vs_sma50,
 #      valuation_forward_vs_trailing_pe.
 # Every name MUST be a key in `DEFAULT_FACTOR_WEIGHTS` — verified by
-# `test_universal_factor_names_subset_of_default_weights`. Unit-1 corpus
+# `test_universal_factor_names_are_all_in_default_weights`. Unit-1 corpus
 # regen may shift the (1) list at 20d/60d; re-verify against
 # `backtest/results/phase2_v1_4_cohort/cohort_20d.md` post-Unit-1.
-# TODO(unit5): re-verify against post-Unit-1 cohort IC.
+# TODO(unit5): re-verify the (1) sign-agreed membership above against the
+# post-Unit-1 cohort IC in `backtest/results/phase2_v1_4_cohort/cohort_20d.md`
+# BEFORE editing this set. The current membership — and every value in
+# `DEFAULT_FACTOR_WEIGHTS` — is pinned as a golden snapshot by
+# `tests/analysis_only/test_factor_weights_golden.py`; any change here will
+# fail that characterization test until the snapshot is deliberately updated
+# with backtest evidence (weight changes are out of scope for unit edits).
 UNIVERSAL_FACTOR_NAMES: frozenset[str] = frozenset({
     # Cohort sign-agreed (Section 22):
     "market_vix_regime",

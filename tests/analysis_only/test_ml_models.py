@@ -7,6 +7,7 @@ import pytest
 from tradingagents.analysis_only.ml_dataset import MLFeatureRow
 from tradingagents.analysis_only.ml_models import (
     brier_score,
+    fit_isotonic_calibrator,
     fit_model,
     precision_at_top_k_by_week,
     spearman_ic,
@@ -58,3 +59,61 @@ def test_elastic_logit_adapter_if_sklearn_available():
     scores = model.predict_scores(X)
     assert len(scores) == 4
     assert all(0.0 <= s <= 1.0 for s in scores)
+
+
+def test_elastic_logit_predict_scores_monotonic_with_signal():
+    """Classification probabilities should rise with the informative feature."""
+    pytest.importorskip("sklearn")
+    # Deterministic, linearly separable single-feature dataset: label flips at 0.
+    X = [[float(i)] for i in range(-10, 10)]
+    y = [0 if i < 0 else 1 for i in range(-10, 10)]
+    model = fit_model("elastic_logit", X, y, config={"C": 1.0, "l1_ratio": 0.1})
+    scores = model.predict_scores(X)
+    # Correct shape and probability range.
+    assert len(scores) == len(X)
+    assert all(0.0 <= s <= 1.0 for s in scores)
+    # Probability of the positive class must be non-decreasing in the feature
+    # (ascending X), and strictly higher at the top than the bottom.
+    assert all(scores[i] <= scores[i + 1] + 1e-9 for i in range(len(scores) - 1))
+    assert scores[-1] > scores[0]
+
+
+def test_ridge_return_predict_scores_monotonic_and_shaped():
+    """Regression predictions should track the target and have correct shape."""
+    pytest.importorskip("sklearn")
+    X = [[float(i)] for i in range(-10, 10)]
+    y = [float(i) for i in range(-10, 10)]
+    model = fit_model("ridge_return", X, y)
+    preds = model.predict_scores(X)
+    assert len(preds) == len(X)
+    assert all(isinstance(p, float) for p in preds)
+    # Predictions increase monotonically with the (ascending) feature.
+    assert all(preds[i] <= preds[i + 1] + 1e-9 for i in range(len(preds) - 1))
+    assert preds[-1] > preds[0]
+
+
+def test_isotonic_calibrator_is_monotonic_and_bounded():
+    """Calibrated probabilities are non-decreasing in the raw score and in [0, 1]."""
+    pytest.importorskip("sklearn")
+    # Raw scores ascending in [0, 1]; low scores are negatives, high are positives.
+    n = 40
+    raw = [i / (n - 1) for i in range(n)]
+    labels = [0] * (n // 2) + [1] * (n // 2)
+    calibrator = fit_isotonic_calibrator(raw, labels)
+    assert calibrator is not None
+    grid = [0.0, 0.25, 0.5, 0.75, 1.0]
+    calibrated = calibrator.predict(grid)
+    assert len(calibrated) == len(grid)
+    assert all(0.0 <= p <= 1.0 for p in calibrated)
+    assert all(calibrated[i] <= calibrated[i + 1] + 1e-9 for i in range(len(calibrated) - 1))
+
+
+def test_isotonic_calibrator_degenerate_inputs_return_none_without_crashing():
+    """Single-class or tiny-n inputs are handled gracefully (None, no exception)."""
+    pytest.importorskip("sklearn")
+    # Single class across enough samples -> cannot calibrate -> None.
+    single_class = fit_isotonic_calibrator([0.1 * i for i in range(40)], [1] * 40)
+    assert single_class is None
+    # Too few samples (< 20) even with both classes -> None.
+    tiny = fit_isotonic_calibrator([0.1, 0.2, 0.3, 0.4, 0.5], [0, 0, 1, 1, 1])
+    assert tiny is None

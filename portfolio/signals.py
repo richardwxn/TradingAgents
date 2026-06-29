@@ -11,6 +11,7 @@ plain dicts into these helpers.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
@@ -33,6 +34,8 @@ from portfolio.risk import (
     compute_portfolio_beta,
     compute_sector_exposure,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- data shapes ----------
@@ -260,6 +263,7 @@ def load_latest_signals(
     universe: Iterable[str],
     as_of: date | None = None,
     calibration_path: str | Path | None = None,
+    require_calibration: bool = False,
 ) -> dict[str, Signal | None]:
     """For each ticker in `universe`, return the most recent Signal whose
     `as_of_date <= as_of` (defaults to today). Missing tickers map to None.
@@ -272,13 +276,36 @@ def load_latest_signals(
     each report is REPLACED with the calibrated value derived from the
     isotonic curve. This corrects for reports generated before the
     calibration plumbing fix (no corpus regen needed).
+
+    When ``calibration_path`` is provided but the file is missing or
+    invalid, a ``logging.warning`` is emitted and the run falls back to the
+    baked-in heuristic confidence (which silently degrades position sizing,
+    since sizing weights by ``composite * confidence``). The "no path given"
+    case stays silent — that is a supported configuration, not a failure.
+    Pass ``require_calibration=True`` to turn the fallback into a raised
+    ``ValueError`` instead.
     """
     cutoff = as_of or date.today()
     calibration: dict[str, Any] | None = None
     if calibration_path:
         try:
             calibration = json.loads(Path(calibration_path).read_text())
-        except Exception:
+        except Exception as exc:
+            # A calibration path was explicitly provided but could not be
+            # read or parsed. Keep daily ops alive by falling back to the
+            # baked-in heuristic confidence, but make the degradation LOUD:
+            # a silent fallback here silently mis-sizes positions because
+            # sizing weights by composite * confidence. require_calibration
+            # upgrades this to a hard failure for callers that must not
+            # degrade silently.
+            msg = (
+                f"Calibration load failed for {str(calibration_path)!r}: "
+                f"{exc}. Falling back to heuristic (baked-in) confidence; "
+                "position sizing will use uncalibrated confidence."
+            )
+            if require_calibration:
+                raise ValueError(msg) from exc
+            logger.warning(msg)
             calibration = None
 
     by_symbol: dict[str, Signal] = {}

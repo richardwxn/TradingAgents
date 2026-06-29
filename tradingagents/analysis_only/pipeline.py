@@ -90,6 +90,95 @@ class AnalysisReport:
         return asdict(self)
 
 
+class PitLeakError(RuntimeError):
+    """Raised by the opt-in strict PIT gate.
+
+    Signals that a *historical* analysis run pulled live (realtime) data into
+    one or more sections stamped ``pit_status == "non_pit_live_snapshot"``. Such
+    a report is a silent point-in-time leak: it would validate a strategy on a
+    backtest that cannot be reproduced live. Surfaced only when strict mode is
+    explicitly enabled (default OFF) so live trading behavior is unchanged.
+    """
+
+    def __init__(self, as_of_date: str | None, sections: list[str]):
+        self.as_of_date = as_of_date
+        self.sections = list(sections)
+        super().__init__(
+            "non_pit_live_snapshot section(s) present for historical "
+            f"as_of {as_of_date}: {', '.join(self.sections)}"
+        )
+
+
+def _pit_strict_from_env() -> bool:
+    """Whether the strict PIT gate is force-enabled via env var (default OFF)."""
+    return os.getenv("TRADINGAGENTS_PIT_STRICT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _pit_report_dict(report: Any) -> dict[str, Any]:
+    """Normalize an AnalysisReport / its json form / a raw dict to a dict."""
+    if isinstance(report, AnalysisReport):
+        return report.to_json_dict()
+    if hasattr(report, "to_json_dict"):
+        return report.to_json_dict()
+    if isinstance(report, dict):
+        return report
+    return {}
+
+
+def collect_pit_warnings(report: Any) -> list[str]:
+    """Return sorted section names stamped ``non_pit_live_snapshot``.
+
+    Pure and offline. Accepts an :class:`AnalysisReport`, its ``to_json_dict``
+    form, or any persisted report dict, so downstream consumers (trade tickets,
+    daily signals, portfolio sizing) can audit a loaded report JSON without
+    re-running the pipeline. Reads ``key_features.pit_status`` (the section ->
+    status map) and falls back to the precomputed ``data_quality.pit_warnings``
+    list when the status map is absent.
+    """
+    data = _pit_report_dict(report)
+    key_features = data.get("key_features") or {}
+    pit_status = key_features.get("pit_status") or {}
+    sections = {
+        section
+        for section, status in pit_status.items()
+        if status == "non_pit_live_snapshot"
+    }
+    data_quality = data.get("data_quality") or {}
+    for section in data_quality.get("pit_warnings") or []:
+        sections.add(section)
+    return sorted(sections)
+
+
+def pit_as_of_mode(report: Any) -> str | None:
+    """Return the report's recorded ``as_of_mode`` ('live' | 'historical')."""
+    data = _pit_report_dict(report)
+    data_quality = data.get("data_quality") or {}
+    return data_quality.get("as_of_mode")
+
+
+def enforce_pit_strict(report: Any, *, strict: bool = False) -> list[str]:
+    """Opt-in strict PIT gate. Default OFF -> no-op (returns warnings).
+
+    When ``strict`` is True and ``report`` is a *historical* run that contains
+    ``non_pit_live_snapshot`` sections, raise :class:`PitLeakError`. Live runs
+    never raise (a live snapshot is point-in-time by definition). Returns the
+    collected pit warnings either way so callers can also log/branch on them.
+    """
+    warnings = collect_pit_warnings(report)
+    if not strict or not warnings:
+        return warnings
+    if pit_as_of_mode(report) == "live":
+        return warnings
+    data = _pit_report_dict(report)
+    as_of = data.get("as_of_date")
+    raise PitLeakError(as_of, warnings)
+
+
 class AnalysisOnlyMVP:
     def __init__(
         self,
@@ -121,8 +210,10 @@ class AnalysisOnlyMVP:
         enable_filings_fetching: bool = True,
         enable_intraday_context: bool = True,
         enable_peer_competitor_analysis: bool = True,
+        pit_strict: bool = False,
         verbose: bool = False,
         logger: logging.Logger | None = None,
+        max_degraded_sections: int | None = None,
     ):
         self.horizon = horizon
         self.data_provider = data_provider.lower()
@@ -144,6 +235,11 @@ class AnalysisOnlyMVP:
         # ~10-20s of network time. Live runs keep both on.
         self.enable_intraday_context = enable_intraday_context
         self.enable_peer_competitor_analysis = enable_peer_competitor_analysis
+        # Opt-in strict PIT gate (default OFF). When enabled here or via the
+        # TRADINGAGENTS_PIT_STRICT env var, a historical run that pulled live
+        # (non_pit_live_snapshot) data raises PitLeakError instead of silently
+        # producing a backtest-leaky report. Live runs are never affected.
+        self.pit_strict = bool(pit_strict)
         self.min_unusual_option_notional = min_unusual_option_notional
         self.min_option_volume_oi_ratio = min_option_volume_oi_ratio
         self.factor_weights = factor_weights or {}
@@ -205,6 +301,15 @@ class AnalysisOnlyMVP:
         # Section -> pit_status. Populated by each loader, surfaced via the
         # report's `key_features.pit_status` and `data_quality.pit_warnings`.
         self._pit_status: dict[str, str] = {}
+        # Section -> reason for sections that degraded to an empty/fallback
+        # payload (typically inside a caught-exception path) instead of
+        # producing real data. Auto-populated from `_set_pit` for known
+        # degraded statuses (see `_DEGRADED_PIT_STATUSES`) and from explicit
+        # `_mark_degraded` calls. Read via `degraded_sections()`. Purely
+        # diagnostic by default; the opt-in `max_degraded_sections` gate
+        # (default None = DISABLED) can flag/block when too many degrade.
+        self._degraded_sections: dict[str, str] = {}
+        self.max_degraded_sections = max_degraded_sections
         self.state_store_path = state_store_path
         self._state_store: StateStore | None = (
             StateStore(state_store_path) if state_store_path else None
@@ -219,6 +324,7 @@ class AnalysisOnlyMVP:
         symbol = symbol.upper()
         self._active_report_cache_key = self.report_cache_key(symbol, as_of_date)
         self._pit_status = {}
+        self._degraded_sections = {}
         self._prev_state = (
             self._state_store.get_symbol_state(symbol)
             if self._state_store
@@ -5178,6 +5284,15 @@ class AnalysisOnlyMVP:
         )
         pit_mode = self._resolve_pit_mode(as_of_date)
         pit_warnings = self._pit_warnings()
+        # Opt-in strict PIT gate. Default OFF -> never triggers (live behavior
+        # unchanged). When enabled, fail fast on a historical run that leaked
+        # live data rather than emitting a silently non-reproducible report.
+        if (
+            (self.pit_strict or _pit_strict_from_env())
+            and pit_warnings
+            and pit_mode != "live"
+        ):
+            raise PitLeakError(as_of_date, pit_warnings)
         data_quality = {
             "price_rows": price_rows,
             "news_items": int(news_summary.get("count", 0)),
@@ -6047,12 +6162,24 @@ class AnalysisOnlyMVP:
         return ref
 
     def _resolve_pit_mode(self, as_of_date: str) -> str:
-        """Return 'live' for the current market reference date or newer."""
+        """Return 'live' for the current market reference date or newer.
+
+        A falsy ``as_of_date`` (None / empty string) is treated as a live run
+        by design -- callers default to today's date and some internal
+        helpers omit it entirely. A *non-empty* but unparseable value is a
+        bug in the caller: silently treating it as live would leak realtime
+        data into what is supposed to be a point-in-time historical run, so
+        raise loudly instead.
+        """
         reference_date = self._current_market_reference_date()
+        if not as_of_date:
+            return "live"
         try:
             target = datetime.strptime(as_of_date, "%Y-%m-%d").date()
-        except ValueError:
-            return "live"
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"as_of_date must be YYYY-MM-DD, got {as_of_date!r}"
+            ) from exc
         return "live" if target >= reference_date else "historical"
 
     def _live_or_leak(self, as_of_date: str) -> str:
@@ -6063,8 +6190,60 @@ class AnalysisOnlyMVP:
             else "non_pit_live_snapshot"
         )
 
+    # Pit statuses that signal a section degraded to an empty/fallback payload
+    # (typically inside a caught-exception path) rather than producing real
+    # data. "disabled"/"disabled_historical" are intentional config and are
+    # therefore NOT treated as degraded.
+    _DEGRADED_PIT_STATUSES = frozenset({"unavailable", "error"})
+
     def _set_pit(self, section: str, status: str) -> None:
         self._pit_status[section] = status
+        if status in self._DEGRADED_PIT_STATUSES:
+            self._mark_degraded(section, status)
+
+    def _mark_degraded(self, section: str, reason: str = "") -> None:
+        """Record that ``section`` fell back to an empty/fallback payload.
+
+        Additive and side-effect-free w.r.t. report contents: it only appends
+        to an in-memory registry read by :meth:`degraded_sections` and the
+        opt-in :meth:`degraded_guard_status` gate. Never raises.
+        """
+        existing = self._degraded_sections.get(section)
+        self._degraded_sections[section] = reason or existing or ""
+
+    def degraded_sections(self) -> dict[str, str]:
+        """Read-only snapshot of sections that degraded during the last run."""
+        return dict(self._degraded_sections)
+
+    def degraded_guard_status(
+        self, max_degraded: int | None = None
+    ) -> dict[str, Any]:
+        """Opt-in degraded-section aggregate guard (default DISABLED).
+
+        Returns ``{enabled, count, threshold, sections, breached}``. The
+        threshold is ``max_degraded`` if provided, else
+        ``self.max_degraded_sections``; when both are ``None`` the guard is
+        disabled and ``breached`` is always ``False`` so current default
+        behavior is unchanged. ``breached`` is ``True`` only when the guard is
+        enabled and ``count > threshold`` -- callers may use it to flag or
+        block a downstream ticket. This method never raises or blocks.
+        """
+        threshold = (
+            max_degraded
+            if max_degraded is not None
+            else self.max_degraded_sections
+        )
+        sections = sorted(self._degraded_sections)
+        count = len(sections)
+        enabled = threshold is not None
+        breached = bool(enabled and count > threshold)
+        return {
+            "enabled": enabled,
+            "count": count,
+            "threshold": threshold,
+            "sections": sections,
+            "breached": breached,
+        }
 
     def _pit_warnings(self) -> list[str]:
         return sorted(

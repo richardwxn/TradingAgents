@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -152,6 +153,76 @@ def test_load_latest_signals_calibration_handles_missing_file(tmp_path):
     )
     # Falls through cleanly to heuristic.
     assert signals["NVDA"].confidence == 0.77
+
+
+def test_load_latest_signals_valid_calibration_loads_without_warning(tmp_path, caplog):
+    """(a) A valid calibration file loads cleanly: confidence is replaced
+    and no calibration-load warning is emitted."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    cal = _write_calibration(tmp_path)
+    paths = [p for p in tmp_path.glob("*.json") if p.name != cal.name]
+    with caplog.at_level(logging.WARNING, logger="portfolio.signals"):
+        signals = load_latest_signals(
+            paths, universe=["NVDA"], calibration_path=cal,
+        )
+    assert signals["NVDA"].confidence == 1.0
+    assert not any(
+        "Calibration load failed" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_load_latest_signals_unreadable_calibration_warns_and_falls_back(tmp_path, caplog):
+    """(b) A provided-but-missing calibration path must WARN (not silently
+    degrade) while still falling back to the heuristic confidence."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    paths = list(tmp_path.glob("*.json"))
+    with caplog.at_level(logging.WARNING, logger="portfolio.signals"):
+        signals = load_latest_signals(
+            paths, universe=["NVDA"],
+            calibration_path=tmp_path / "no_such_file.json",
+        )
+    # Fail-safe: heuristic confidence is preserved (daily ops not crashed).
+    assert signals["NVDA"].confidence == 0.77
+    assert any(
+        "Calibration load failed" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_load_latest_signals_no_calibration_path_does_not_warn(tmp_path, caplog):
+    """The 'no path given' case is a supported config and must stay silent."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    paths = list(tmp_path.glob("*.json"))
+    with caplog.at_level(logging.WARNING, logger="portfolio.signals"):
+        signals = load_latest_signals(paths, universe=["NVDA"])
+    assert signals["NVDA"].confidence == 0.77
+    assert not any(
+        "Calibration load failed" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_load_latest_signals_require_calibration_raises_on_bad_path(tmp_path):
+    """(c) require_calibration=True turns a broken calibration path into a
+    hard failure instead of a silent sizing degradation."""
+    _write_report(
+        tmp_path, symbol="NVDA", as_of="2026-05-22",
+        direction="bullish", confidence=0.77, composite=0.6,
+    )
+    paths = list(tmp_path.glob("*.json"))
+    with pytest.raises(ValueError):
+        load_latest_signals(
+            paths, universe=["NVDA"],
+            calibration_path=tmp_path / "no_such_file.json",
+            require_calibration=True,
+        )
 
 
 # ---------- classify_action ----------
