@@ -639,6 +639,7 @@ def main() -> None:
     # the primary 60d-anchored plan. The primary `actions`/`summary` above are
     # the production recommendation and are untouched.
     horizon_actions: list = []
+    cal_20d_loaded = False
     n_with_20d = sum(
         1 for s in signals.values() if s is not None and s.composite_20d is not None
     )
@@ -649,6 +650,7 @@ def main() -> None:
         if cal_20d_path and Path(cal_20d_path).exists():
             try:
                 cal_20d = json.loads(Path(cal_20d_path).read_text())
+                cal_20d_loaded = True
                 print(f"  20d confidence calibrated via {cal_20d_path}")
             except Exception:
                 cal_20d = None
@@ -725,7 +727,9 @@ def main() -> None:
 
     report_md = format_daily_report(actions, summary, config=sizing_config, as_of=as_of)
     if horizon_actions:
-        overlay_md = format_horizon_overlay(actions, horizon_actions, as_of=as_of)
+        overlay_md = format_horizon_overlay(
+            actions, horizon_actions, as_of=as_of, calibrated=cal_20d_loaded
+        )
         if overlay_md:
             report_md = report_md.rstrip() + "\n\n" + overlay_md + "\n"
     options_section = format_option_positions_section(

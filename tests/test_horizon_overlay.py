@@ -104,6 +104,20 @@ def test_overlay_flags_divergence():
     assert "**1** name" in md
 
 
+def test_overlay_confidence_note_reflects_calibration_flag():
+    primary = [_action("NVDA", "bullish", "BUY")]
+    horizon = [_action("NVDA", "bearish", "TRIM")]
+    # Default (no calibration applied): must say heuristic, not claim calibrated.
+    uncal = format_horizon_overlay(primary, horizon)
+    assert "heuristic (no 20d calibration applied)" in uncal
+    assert "isotonic map" not in uncal
+    # When a calibration was loaded and applied, the note must say so — not
+    # misreport it as heuristic (the prior bug printed heuristic unconditionally).
+    cal = format_horizon_overlay(primary, horizon, calibrated=True)
+    assert "calibrated via the 20d isotonic map" in cal
+    assert "heuristic" not in cal
+
+
 def test_overlay_empty_when_no_actions():
     assert format_horizon_overlay([], []) == ""
 

@@ -831,12 +831,20 @@ def format_horizon_overlay(
     *,
     horizon_label: str = "20d",
     as_of: date | None = None,
+    calibrated: bool = False,
 ) -> str:
     """Render the 20d action overlay, flagging divergence vs the primary plan.
 
     Informational, non-production: shows what the per-horizon (20d) model would
     do per ticker and where it disagrees with the primary (60d-anchored) plan.
     The primary actions remain the system's recommendation.
+
+    ``calibrated`` controls the confidence-provenance note in the header: pass
+    True when the caller actually loaded and applied a ``{horizon}`` isotonic
+    calibration map (``derive_horizon_signals(calibration=...)``), False when
+    the overlay fell back to the heuristic confidence. The note used to claim
+    "heuristic (no calibration)" unconditionally even when a calibration was in
+    effect, which misreported the confidence basis to the operator.
     """
     primary_by_sym = {a.symbol: a for a in primary_actions}
     rows = []
@@ -865,14 +873,19 @@ def format_horizon_overlay(
         )
     if not rows:
         return ""
+    conf_note = (
+        f"Confidence here is direction-conditionally calibrated via the "
+        f"{horizon_label} isotonic map."
+        if calibrated
+        else f"Confidence here is heuristic (no {horizon_label} calibration applied)."
+    )
     header = [
         f"## {horizon_label} horizon overlay (informational)",
         "",
         f"Non-production view from the validated {horizon_label} composite "
         f"(`per_horizon_composites.ret_20d`). The primary plan above is "
         f"unchanged; **{n_diverge}** name(s) where the {horizon_label} view "
-        f"disagrees with the primary are flagged. Confidence here is "
-        f"heuristic (no {horizon_label} calibration yet).",
+        f"disagrees with the primary are flagged. {conf_note}",
         "",
         f"| Ticker | {horizon_label} dir | {horizon_label} composite | "
         f"{horizon_label} action | primary dir / action | flag |",
