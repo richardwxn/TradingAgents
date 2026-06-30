@@ -37,6 +37,35 @@ def test_sizing_config_rejects_bad_per_name():
         SizingConfig(max_per_name=1.5)
 
 
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"max_long_exposure": 0.0}, "max_long_exposure"),
+        ({"max_long_exposure": 1.5}, "max_long_exposure"),
+        ({"min_position_weight": -0.01}, "min_position_weight"),
+        ({"stale_signal_decay": -0.1}, "stale_signal_decay"),
+        ({"stale_signal_decay": 1.1}, "stale_signal_decay"),
+        ({"pre_earnings_trim_days": -1}, "pre_earnings_trim_days"),
+        ({"pre_earnings_size_factor": -0.1}, "pre_earnings_size_factor"),
+        ({"pre_earnings_size_factor": 1.1}, "pre_earnings_size_factor"),
+        ({"tradingagents_review_top_screener_n": -1}, "tradingagents_review_top_screener_n"),
+        ({"sector_shock_drop_pct": 0.0}, "sector_shock_drop_pct"),
+        ({"sector_shock_drop_pct": -0.05}, "sector_shock_drop_pct"),
+        ({"sector_shock_new_buy_size_factor": -0.1}, "sector_shock_new_buy_size_factor"),
+        ({"sector_shock_new_buy_size_factor": 1.1}, "sector_shock_new_buy_size_factor"),
+        ({"sector_shock_existing_position_size_factor": -0.1},
+         "sector_shock_existing_position_size_factor"),
+        ({"sector_shock_existing_position_size_factor": 1.1},
+         "sector_shock_existing_position_size_factor"),
+    ],
+)
+def test_sizing_config_validation_guards_reject_out_of_range(kwargs, match):
+    """Every __post_init__ guard must reject its out-of-range value — these
+    protect ticket generation from unsafe misconfiguration."""
+    with pytest.raises(ValueError, match=match):
+        SizingConfig(**kwargs)
+
+
 def test_sizing_config_from_dict_ignores_unknown_keys():
     cfg = sizing_config_from_dict({
         "policy": "equal_weight_bullish",
