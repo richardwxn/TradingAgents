@@ -23,9 +23,8 @@ class GoogleClient(BaseLLMClient):
     def __init__(self, model: str, base_url: Optional[str] = None, **kwargs):
         super().__init__(model, base_url, **kwargs)
 
-    def get_llm(self) -> Any:
+    def _build_llm(self) -> Any:
         """Return configured ChatGoogleGenerativeAI instance."""
-        self.warn_if_unknown_model()
         llm_kwargs = {"model": self.model}
 
         if self.base_url:

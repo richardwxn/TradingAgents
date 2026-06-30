@@ -51,10 +51,21 @@ class BaseLLMClient(ABC):
             stacklevel=2,
         )
 
-    @abstractmethod
     def get_llm(self) -> Any:
-        """Return the configured LLM instance."""
-        pass
+        """Return the configured LLM instance.
+
+        Validates the model name first. Validation is intentionally
+        warn-and-continue (not an error) for unknown models so that
+        forward-compat / preview model ids still work — see
+        ``warn_if_unknown_model``. Provider-specific construction lives in
+        each subclass's ``_build_llm`` hook.
+        """
+        self.warn_if_unknown_model()
+        return self._build_llm()
+
+    def _build_llm(self) -> Any:
+        """Construct the provider-specific LLM instance (subclass hook)."""
+        raise NotImplementedError
 
     @abstractmethod
     def validate_model(self) -> bool:

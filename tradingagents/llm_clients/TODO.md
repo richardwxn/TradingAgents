@@ -2,8 +2,12 @@
 
 ## Issues to Fix
 
-### 1. `validate_model()` is never called
-- Add validation call in `get_llm()` with warning (not error) for unknown models
+### 1. ~~`validate_model()` is never called~~ (Fixed)
+- `BaseLLMClient.get_llm()` now calls `warn_if_unknown_model()` (which calls
+  `validate_model()`) before delegating to each client's `_build_llm()` hook.
+  Unknown models warn-and-continue (not an error) so forward-compat / preview
+  model ids keep working. Centralized in the base class so every provider
+  inherits it instead of duplicating the call.
 
 ### 2. ~~Inconsistent parameter handling~~ (Fixed)
 - GoogleClient now accepts unified `api_key` and maps it to `google_api_key`
