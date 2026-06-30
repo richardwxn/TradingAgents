@@ -618,3 +618,133 @@ def test_render_handles_missing_chain_gracefully():
     assert "Short | put" in out
     # Em-dashes for missing market data
     assert "—" in out
+
+
+# ---------- fetch_current_chain ----------
+
+
+from portfolio import options as _options_mod
+
+
+class _FakeResp:
+    def __init__(self, payload, raise_exc=None):
+        self._payload = payload
+        self._raise_exc = raise_exc
+
+    def raise_for_status(self):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+
+    def json(self):
+        return self._payload
+
+
+def _contract_row(**over):
+    row = {
+        "details": {
+            "ticker": "O:NVDA260619C00200000",
+            "contract_type": "call",
+            "expiration_date": "2026-06-19",
+            "strike_price": 200.0,
+        },
+        "day": {"close": 5.0, "vwap": 4.8, "volume": 12},
+        "last_quote": {"bid": 4.8, "ask": 5.2},
+        "greeks": {"delta": 0.5, "gamma": 0.01, "theta": -0.02, "vega": 0.1},
+        "open_interest": 300,
+        "implied_volatility": 0.45,
+    }
+    row.update(over)
+    return row
+
+
+def test_fetch_snapshot_returns_empty_without_key(monkeypatch):
+    monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+    assert _options_mod.fetch_current_chain("NVDA") == []
+
+
+def test_fetch_snapshot_normalizes_contracts(monkeypatch):
+    def _fake_get(url, params=None, timeout=None):
+        return _FakeResp({"results": [_contract_row()], "next_url": None})
+
+    monkeypatch.setattr(_options_mod.requests, "get", _fake_get)
+    out = _options_mod.fetch_current_chain("nvda", api_key="k")
+
+    assert len(out) == 1
+    c = out[0]
+    assert c["type"] == "call"
+    assert c["strike"] == 200.0
+    assert c["mid"] == pytest.approx(5.0)  # (4.8 + 5.2) / 2
+    assert c["open_interest"] == 300
+    assert c["delta"] == 0.5
+
+
+def test_fetch_snapshot_mid_falls_back_to_last_without_quote(monkeypatch):
+    row = _contract_row(last_quote={})  # no bid/ask → mid uses day close
+    monkeypatch.setattr(
+        _options_mod.requests, "get",
+        lambda *a, **k: _FakeResp({"results": [row], "next_url": None}),
+    )
+    out = _options_mod.fetch_current_chain("NVDA", api_key="k")
+    assert out[0]["mid"] == pytest.approx(5.0)  # day close fallback
+
+
+def test_fetch_snapshot_filters_invalid_contracts(monkeypatch):
+    bad_type = _contract_row(details={
+        "contract_type": "warrant", "expiration_date": "2026-06-19",
+        "strike_price": 10.0, "ticker": "X",
+    })
+    no_strike = _contract_row(details={
+        "contract_type": "put", "expiration_date": "2026-06-19",
+        "strike_price": None, "ticker": "Y",
+    })
+    good = _contract_row()
+    monkeypatch.setattr(
+        _options_mod.requests, "get",
+        lambda *a, **k: _FakeResp(
+            {"results": [bad_type, no_strike, good], "next_url": None}
+        ),
+    )
+    out = _options_mod.fetch_current_chain("NVDA", api_key="k")
+    assert len(out) == 1  # only the well-formed call survives
+
+
+def test_fetch_snapshot_paginates_and_injects_api_key(monkeypatch):
+    calls: list[str] = []
+
+    def _fake_get(url, params=None, timeout=None):
+        calls.append(url)
+        if len(calls) == 1:
+            # next_url lacks apiKey -> the fetcher must append it.
+            return _FakeResp({
+                "results": [_contract_row()],
+                "next_url": "https://api.polygon.io/next?cursor=abc",
+            })
+        return _FakeResp({"results": [_contract_row()], "next_url": None})
+
+    monkeypatch.setattr(_options_mod.requests, "get", _fake_get)
+    out = _options_mod.fetch_current_chain("NVDA", api_key="secret")
+
+    assert len(out) == 2  # both pages aggregated
+    assert len(calls) == 2
+    assert "apiKey=secret" in calls[1]  # key re-injected on the next_url
+
+
+def test_fetch_snapshot_returns_empty_on_http_error(monkeypatch):
+    def _boom(*a, **k):
+        return _FakeResp({}, raise_exc=RuntimeError("HTTP 500"))
+
+    monkeypatch.setattr(_options_mod.requests, "get", _boom)
+    assert _options_mod.fetch_current_chain("NVDA", api_key="k") == []
+
+
+def test_fetch_snapshot_respects_max_pages(monkeypatch):
+    # Always returns a next_url → would loop forever without the max_pages cap.
+    monkeypatch.setattr(
+        _options_mod.requests, "get",
+        lambda *a, **k: _FakeResp({
+            "results": [_contract_row()],
+            "next_url": "https://api.polygon.io/next?apiKey=k",
+        }),
+    )
+    out = _options_mod.fetch_current_chain("NVDA", api_key="k", max_pages=3)
+    assert len(out) == 3  # exactly max_pages contracts, then stops
