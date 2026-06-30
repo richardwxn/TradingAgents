@@ -37,6 +37,20 @@ def test_risk_limits_rejects_bad_correlation():
         RiskLimits(max_pair_correlation=1.5)
 
 
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"max_sector_exposure": 1.5}, "max_sector_exposure"),
+        ({"max_portfolio_beta": 0.0}, "max_portfolio_beta"),
+        ({"max_portfolio_beta": -1.0}, "max_portfolio_beta"),
+        ({"max_pair_correlation": -1.5}, "max_pair_correlation"),
+    ],
+)
+def test_risk_limits_guards_reject_out_of_range(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        RiskLimits(**kwargs)
+
+
 # ---------- compute_sector_exposure ----------
 
 
