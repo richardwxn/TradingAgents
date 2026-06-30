@@ -21,7 +21,9 @@ from typing import Any, Iterable, Sequence
 # v1 was set after the Tier-1 backtest in Section 11 + per-ticker IC
 # stratification:
 #   - dropped weight on factors with broken or sparse data
-#     (`filings_recency_signal` n=0; `intraday_breakout_signal` n=10)
+#     (`filings_recency_signal` n=0 at the time — now data-present but
+#     non-stationary, see the dedicated note at its weight entry below;
+#     `intraday_breakout_signal` n=10)
 #   - cut `options_net_flow` from 0.15 → 0.05: was the heaviest single
 #     factor but headline IC ≈ 0 / 60d ≈ -0.02; kept some weight to
 #     preserve the signal for re-eval after the Polygon Options decision
@@ -70,6 +72,21 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
     "market_fear_greed_regime": 0.05,
     "intraday_momentum_rsi": 0.04,
     "intraday_breakout_signal": 0.00,
+    # Weight 0 — KEEP IT THERE. The Section 12 "n=0" rationale is stale:
+    # the factor now HAS data (≈3.1k/3.7k corpus records carry a latest
+    # filing form → score +0.4 for 10-Q/10-K, -0.2 for 8-K). The real
+    # reason it stays at 0 is that its IC is NON-STATIONARY — it sign-flips
+    # across regimes, so the full-corpus IC is ~0 (ret_20d +0.002, ret_60d
+    # -0.008; per-ticker sign-consistency ~50% = noise). Measured by time
+    # slice on the 2023-07→2026-06 corpus:
+    #     <=2025-03        ret_20d IC +0.102 / ret_60d +0.119
+    #     2025-04..2025-09 ret_20d IC +0.029 / ret_60d +0.013
+    #     >2025-09         ret_20d IC -0.120 / ret_60d -0.163  (FLIPPED)
+    # A single train-slice IC fit (e.g. the per-horizon sweeps) will pick
+    # up the transient +0.10 and look like free alpha — it is not; the
+    # most recent regime has the OPPOSITE sign. Do not bump this weight off
+    # a subset IC without a leakage-free chronological-holdout win
+    # (`scripts/compare_static_weights_oos.py`).
     "filings_recency_signal": 0.00,
     "options_net_flow": 0.05,
     # IV-derived factors (added in Section 18). v1.5 (Section 27) commits
@@ -135,16 +152,27 @@ DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
 #      trend_price_vs_sma20, trend_sma20_vs_sma50,
 #      valuation_forward_vs_trailing_pe.
 # Every name MUST be a key in `DEFAULT_FACTOR_WEIGHTS` — verified by
-# `test_universal_factor_names_are_all_in_default_weights`. Unit-1 corpus
-# regen may shift the (1) list at 20d/60d; re-verify against
-# `backtest/results/phase2_v1_4_cohort/cohort_20d.md` post-Unit-1.
-# TODO(unit5): re-verify the (1) sign-agreed membership above against the
-# post-Unit-1 cohort IC in `backtest/results/phase2_v1_4_cohort/cohort_20d.md`
-# BEFORE editing this set. The current membership — and every value in
-# `DEFAULT_FACTOR_WEIGHTS` — is pinned as a golden snapshot by
-# `tests/analysis_only/test_factor_weights_golden.py`; any change here will
-# fail that characterization test until the snapshot is deliberately updated
-# with backtest evidence (weight changes are out of scope for unit edits).
+# `test_universal_factor_names_are_all_in_default_weights`. The current
+# membership — and every value in `DEFAULT_FACTOR_WEIGHTS` — is pinned as a
+# golden snapshot by `tests/analysis_only/test_factor_weights_golden.py`; any
+# change here fails that characterization test until the snapshot is updated
+# with backtest evidence.
+#
+# Re-verified 2026-06-29 on the 2023-07→2026-06 corpus (core vs canary
+# per-ticker median IC, ≥3 tickers/cohort), resolving the prior unit-5 TODO:
+#   peer_relative_valuation     20d core +0.015 / can +0.200 (Y); 60d +0.099 / +0.167 (Y)  ✓
+#   options_iv_term_structure   20d +0.011 / +0.031 (Y);          60d +0.093 / +0.081 (Y)  ✓
+#   momentum_rsi                20d -0.034 / -0.049 (Y);          60d -0.046 / -0.036 (Y)  ✓
+#   market_vix_regime           20d -0.262 / -0.032 (Y);          60d -0.312 / +0.020 (✗)  borderline
+# market_vix_regime now fails strict 60d cohort agreement, but only by a
+# noise-level canary reading (+0.020 on 6 tickers vs a strong, consistent
+# core -0.312). Kept in the set: dropping a factor on a +0.02 noise flip
+# would itself be a noise-driven change, and VIX regime is a market-wide
+# value so it's a constant offset in the screener's cross-sectional non-tech
+# ranking (membership barely affects ordering). Reproduce with
+# `scripts/cohort_ic_split.py --horizon ret_60d` after `backtest.py
+# --by-ticker`. Re-examine market_vix_regime if the canary 60d IC moves
+# materially positive on a future regen.
 UNIVERSAL_FACTOR_NAMES: frozenset[str] = frozenset({
     # Cohort sign-agreed (Section 22):
     "market_vix_regime",

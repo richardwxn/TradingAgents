@@ -95,6 +95,27 @@ global's ~74%. **Decision: ret_60d commit stands.**
   Note: in-sample bullish-hit (~92%) overstates the ~77% honest OOS
   level — size expectations off the OOS number.
 
+## Per-horizon confidence calibration (2026-06-29) — NOT deployed
+
+Attempted to (re)fit per-horizon isotonic confidence calibrations for the
+committed vectors via
+`fit_confidence_calibration.py --recompute-horizon <h> --oos-validate`:
+
+| Horizon | OOS Brier vs heuristic | OOS reliability max-gap (gate ≤5pp) | Deploy? |
+|---------|------------------------|-------------------------------------|---------|
+| ret_20d | +0.088 (PASS)          | 36.7pp (FAIL)                       | no |
+| ret_60d | beats heuristic (PASS) | 16.9pp (FAIL)                       | no |
+
+Both improve Brier but **fail the ±5pp OOS reliability gate** — the
+emitted confidence would not match realized hit-rates (large gaps in the
+low and high probability buckets). This is the same regime
+non-stationarity seen in `filings_recency_signal`: 2025–2026 data shifted
+enough that an isotonic map fit across the corpus is locally miscalibrated
+out of sample. **Decision: do not deploy refreshed per-horizon
+calibration; the deployed `configs/confidence_calibration_20d.json` is left
+unchanged.** Revisit after the next corpus regen / when the reliability
+gate passes OOS.
+
 ## Reproduce the head-to-head
 
 ```bash
