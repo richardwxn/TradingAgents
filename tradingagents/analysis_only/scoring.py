@@ -1443,16 +1443,17 @@ def apply_regime_to_factor_scores(
     for f in factor_scores:
         name = f.get("factor")
         if name in flips and f.get("data_available", True) and f.get("score") is not None:
-            flipped = dict(f)
             try:
-                new_score = -float(f["score"]) * flips[name] / abs(flips[name])
+                base_score = float(f["score"])
             except (TypeError, ValueError):
+                # Non-numeric score (malformed record): leave untouched.
                 out.append(f)
                 continue
+            flipped = dict(f)
             # The sign multiplier is ±1; equivalent to: new_score = -score
             # when flip=-1. Kept arithmetic explicit so future +1 entries
             # (no-op safeguards) work without special-casing.
-            new_score = float(f["score"]) * flips[name]
+            new_score = base_score * flips[name]
             flipped["score"] = round(new_score, 6)
             weight = float(weights.get(name, 0.0))
             flipped["weighted_score"] = round(new_score * weight, 6)

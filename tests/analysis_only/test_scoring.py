@@ -66,6 +66,16 @@ def test_unknown_keys_ignored():
     assert math.isclose(sum(weights.values()), 1.0, abs_tol=1e-4)
 
 
+def test_resolve_factor_weights_all_zero_returns_unnormalized():
+    # Degenerate case: every factor overridden to 0 → total is 0, so there
+    # is nothing to renormalize against. The function returns the all-zero
+    # vector unchanged rather than dividing by zero.
+    zeroed = {name: 0.0 for name in DEFAULT_FACTOR_WEIGHTS}
+    weights = resolve_factor_weights(zeroed)
+    assert all(value == 0.0 for value in weights.values())
+    assert sum(weights.values()) == 0.0
+
+
 # ---------- UNIVERSAL_FACTOR_NAMES + cohort-aware resolve_factor_weights ----------
 
 
@@ -215,6 +225,71 @@ def test_score_sales_multiple_vs_growth_handles_missing_data():
     assert available is False
     assert raw is None
     assert rationale
+
+
+def test_score_sales_multiple_vs_growth_nonpositive_multiple_unavailable():
+    score, rationale, available, raw = score_sales_multiple_vs_growth(
+        price_to_sales=0.0,
+        revenue_growth=0.2,
+    )
+    assert score == 0.0
+    assert available is False
+    assert raw is None
+    assert "non-positive" in rationale
+
+
+def test_score_sales_multiple_vs_growth_moderate_growth_scores_partial():
+    # growth 0.20 (≥0.15 but <0.30), growth-adjusted multiple = 20/(0.2*100)=1.0
+    # → the second tier (+0.4), not the top tier.
+    score, _, available, raw = score_sales_multiple_vs_growth(
+        price_to_sales=20.0,
+        revenue_growth=0.2,
+    )
+    assert score == pytest.approx(0.4)
+    assert available is True
+    assert raw == pytest.approx(1.0)
+
+
+def test_score_sales_multiple_vs_growth_stretched_multiple_penalized():
+    # growth-adjusted multiple = 40/(0.2*100)=2.0 > 1.8 → -0.6 tier.
+    score, _, available, raw = score_sales_multiple_vs_growth(
+        price_to_sales=40.0,
+        revenue_growth=0.2,
+    )
+    assert score == pytest.approx(-0.6)
+    assert raw == pytest.approx(2.0)
+
+
+def test_score_sales_multiple_vs_growth_in_line_is_neutral():
+    # growth-adjusted multiple = 30/(0.2*100)=1.5 → between tiers → 0.0.
+    score, rationale, _, _ = score_sales_multiple_vs_growth(
+        price_to_sales=30.0,
+        revenue_growth=0.2,
+    )
+    assert score == 0.0
+    assert "in line" in rationale
+
+
+def test_score_sales_multiple_vs_growth_peer_premium_subtracts():
+    # High growth top tier (+0.8) but trades 50% above peer EV/revenue → -0.25.
+    score, rationale, _, _ = score_sales_multiple_vs_growth(
+        price_to_sales=12.0,
+        revenue_growth=0.5,
+        peer_ev_to_revenue_median=8.0,
+    )
+    assert score == pytest.approx(0.55)
+    assert "above peer" in rationale
+
+
+def test_score_sales_multiple_vs_growth_peer_discount_adds_and_clamps():
+    # High growth top tier (+0.8) and 40% below peer (+0.25) → 1.05 clamped to 1.0.
+    score, rationale, _, _ = score_sales_multiple_vs_growth(
+        price_to_sales=12.0,
+        revenue_growth=0.5,
+        peer_ev_to_revenue_median=20.0,
+    )
+    assert score == pytest.approx(1.0)
+    assert "below peer" in rationale
 
 
 # ---------- direction_for_composite ----------
@@ -734,6 +809,23 @@ def test_apply_regime_chop_skips_unavailable_factors():
     ]
     out = apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_CHOP)
     assert out == fs
+
+
+def test_apply_regime_chop_passes_through_non_numeric_score():
+    """A flip-target with a malformed (non-numeric) score must be passed
+    through untouched rather than raising — the float() guard catches it."""
+    from tradingagents.analysis_only.scoring import apply_regime_to_factor_scores
+    fs = [
+        {
+            "factor": "market_fear_greed_regime", "pillar": "context",
+            "score": "not-a-number", "weight": 0.05, "weighted_score": 0.0,
+            "data_available": True, "rationale": "Malformed score.",
+        },
+    ]
+    out = apply_regime_to_factor_scores(fs, _flip_test_weights(), REGIME_CHOP)
+    assert out == fs
+    assert out[0]["score"] == "not-a-number"  # untouched, no flip annotation
+    assert "sign flipped" not in out[0]["rationale"]
 
 
 def test_apply_regime_chop_rationale_annotated():
